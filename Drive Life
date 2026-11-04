@@ -629,7 +629,7 @@ end)
 -- ======================================================================
 -- BUSINESS AUTOMATION SUITE (CONTRACTS, CUSTOMERS, AUCTIONS & RESTORE)
 -- ======================================================================
-local bizAutoCard = createCard(pageBusiness, "🤖 Business Automation Suite", 420)
+local bizAutoCard = createCard(pageBusiness, "🤖 Business Automation Suite", 585)
 
 local autoStatusLabel = Instance.new("TextLabel")
 autoStatusLabel.Text = "System: Ready • Toggles operate independently"
@@ -652,13 +652,32 @@ local autoContractsActive = false
 local autoCustomersActive = false
 local autoAuctionsActive  = false
 local autoRestoreActive   = false
+local autoEjectOwnedActive = true
 local missionBusy = false
+local slotSellCooldown = {}
+
+-- Contract Rarity Filter State (Common, Rare, Epic, Legendary)
+local contractRarityAllowed = {
+    common = false,
+    rare = true,
+    epic = true,
+    legendary = true
+}
+
+-- Auction Rarity Filter State (Common, Rare, Epic, Legendary)
+local auctionRarityAllowed = {
+    common = false,
+    rare = true,
+    epic = true,
+    legendary = true
+}
 
 -- Forward declarations of toggle controls
 local contractsToggle
 local customersToggle
 local auctionsToggle
 local restoreToggle
+local autoEjectToggle
 
 -- ======================================================================
 -- AUTOMATIC DISTANCE-BASED SPEED CALIBRATION & SAFE SKY CRUISE
@@ -930,11 +949,15 @@ local function runOneCustomer()
     local m = s.mission
     if m and m.dest then
         local dest = Vector3.new(m.dest[1], m.dest[2] + 2, m.dest[3])
-        local car = workspace.Vehicles:FindFirstChild(player.Name .. " - Business")
+        local car = getBusinessCar()
         local seat = car and car:FindFirstChild("DriveSeat", true)
         local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 
         if seat and hum and seat.Occupant ~= hum then
+            if hum.Sit then
+                hum.Sit = false
+                task.wait(0.1)
+            end
             seat:Sit(hum)
             task.wait(0.5)
         end
@@ -959,8 +982,211 @@ local function runOneCustomer()
 end
 
 -- ======================================================================
--- VEHICLE & BAY ACTION HELPERS
+-- VEHICLE & BAY ACTION HELPERS (AUTO-EJECT & SAFE MISSION CAR SELECTOR)
 -- ======================================================================
+local function isMissionOrRaceCar(model)
+    if not model or not model:IsA("Model") then return false end
+    if model:GetAttribute("DLBizCar") or model:GetAttribute("DLJobVehicle") then
+        return true
+    end
+    local name = model.Name
+    if name:find("%- Business$") or name:find("%- Service$") or name:find("%- Project$") or name:find("%- Auction$") then
+        return true
+    end
+    if model:FindFirstAncestor("Track") or model:FindFirstAncestor("Races") or workspace:FindFirstChild("DLTrackRace") then
+        return true
+    end
+    return false
+end
+
+local function isOwnedPersonalCar(model)
+    if not model or not model:IsA("Model") then return false end
+    if isMissionOrRaceCar(model) then
+        return false
+    end
+    local name = model.Name
+    if name == player.Name .. " - Vehicle" or name == player.Name or name:find(player.Name, 1, true) then
+        return true
+    end
+    if model:GetAttribute("Owner") == player.Name then
+        return true
+    end
+    return false
+end
+
+local isEjecting = false
+local function ejectFromPersonalCar(seat, model)
+    if isEjecting then return end
+    isEjecting = true
+
+    local carName = (model and model.Name) or "Personal Vehicle"
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+
+    -- 1. Unbind driving inputs & destroy A-Chassis Interface in PlayerGui so WASD doesn't control the car!
+    pcall(function()
+        local CAS = game:GetService("ContextActionService")
+        local actions = {
+            "Throttle", "Brake", "Steer", "Left", "Right", "Accelerate", "Decelerate",
+            "PBrake", "Handbrake", "Clutch", "ShiftUp", "ShiftDown", "MouseSteer", "MouseThrottle"
+        }
+        for _, act in ipairs(actions) do
+            CAS:UnbindAction(act)
+        end
+    end)
+
+    local pgui = player:FindFirstChild("PlayerGui")
+    if pgui then
+        for _, g in ipairs(pgui:GetChildren()) do
+            if g.Name == "A-Chassis Interface" or g.Name:find("A%-Chassis") then
+                pcall(function() g:Destroy() end)
+            end
+        end
+    end
+
+    -- 2. Zero out vehicle seat throttles & steering
+    if seat and seat:IsA("VehicleSeat") then
+        pcall(function()
+            seat.Throttle = 0
+            seat.Steer = 0
+            seat.ThrottleFloat = 0
+            seat.SteerFloat = 0
+            seat.Disabled = true
+        end)
+    end
+
+    -- 3. Sever any SeatWeld connecting character to seat
+    if seat then
+        for _, c in ipairs(seat:GetChildren()) do
+            if c:IsA("Weld") or c:IsA("WeldConstraint") or c.Name == "SeatWeld" then
+                if (c.Part0 and c.Part0:IsDescendantOf(char)) or (c.Part1 and c.Part1:IsDescendantOf(char)) then
+                    pcall(function() c:Destroy() end)
+                end
+            end
+        end
+    end
+    if char then
+        for _, c in ipairs(char:GetDescendants()) do
+            if c:IsA("Weld") or c:IsA("WeldConstraint") then
+                if c.Part0 == seat or c.Part1 == seat then
+                    pcall(function() c:Destroy() end)
+                end
+            end
+        end
+    end
+
+    -- 4. Trigger standard Roblox seat dismount (Jump state) then stand up
+    if hum then
+        hum.Jump = true
+        hum:ChangeState(Enum.HumanoidStateType.Jumping)
+        task.wait(0.05)
+        hum.Sit = false
+        hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+    end
+
+    -- 5. Restore camera subject to Humanoid
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        if cam and hum then
+            cam.CameraSubject = hum
+            cam.CameraType = Enum.CameraType.Custom
+        end
+    end)
+
+    -- 6. Reposition character safely outside the car so proximity/collision doesn't re-seat
+    if root then
+        local rightOffset = (root.CFrame.RightVector * 6) + Vector3.new(0, 3, 0)
+        root.CFrame = root.CFrame + rightOffset
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end
+
+    setAutoStatus("Auto-Ejected from personal vehicle (" .. carName .. ") to prevent script breakage!", Color3.fromRGB(241, 196, 15))
+
+    task.delay(0.8, function()
+        if seat and seat.Parent then
+            pcall(function()
+                seat.Disabled = false
+            end)
+        end
+        isEjecting = false
+    end)
+end
+
+local function checkPlayerSeat()
+    if not autoEjectOwnedActive then return end
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+
+    if not hum.Sit or not hum.SeatPart then
+        -- Character is standing on foot! Clean up any lingering vehicle driving interfaces so WASD controls only character!
+        local pgui = player:FindFirstChild("PlayerGui")
+        if pgui then
+            local aci = pgui:FindFirstChild("A-Chassis Interface")
+            if aci then
+                pcall(function() aci:Destroy() end)
+                pcall(function()
+                    local CAS = game:GetService("ContextActionService")
+                    CAS:UnbindAction("Throttle")
+                    CAS:UnbindAction("Brake")
+                    CAS:UnbindAction("Steer")
+                    CAS:UnbindAction("Left")
+                    CAS:UnbindAction("Right")
+                    CAS:UnbindAction("Accelerate")
+                    CAS:UnbindAction("Decelerate")
+                    CAS:UnbindAction("PBrake")
+                    CAS:UnbindAction("Handbrake")
+                    CAS:UnbindAction("Clutch")
+                    CAS:UnbindAction("ShiftUp")
+                    CAS:UnbindAction("ShiftDown")
+                end)
+            end
+        end
+        return
+    end
+
+    local seat = hum.SeatPart
+    if not seat or not seat:IsA("VehicleSeat") then return end
+
+    local model = seat:FindFirstAncestorOfClass("Model")
+    if model and isOwnedPersonalCar(model) then
+        ejectFromPersonalCar(seat, model)
+    end
+end
+
+local function setupAutoEjectChar(char)
+    if not char then return end
+    local hum = char:WaitForChild("Humanoid", 5)
+    if not hum then return end
+
+    hum:GetPropertyChangedSignal("SeatPart"):Connect(checkPlayerSeat)
+    hum.Seated:Connect(function(active)
+        if active then
+            checkPlayerSeat()
+        end
+    end)
+    checkPlayerSeat()
+end
+
+if player.Character then
+    task.spawn(setupAutoEjectChar, player.Character)
+end
+player.CharacterAdded:Connect(function(c)
+    task.spawn(setupAutoEjectChar, c)
+end)
+
+-- Continuous background safety loop (every 0.3s)
+task.spawn(function()
+    while true do
+        task.wait(0.3)
+        if autoEjectOwnedActive then
+            pcall(checkPlayerSeat)
+        end
+    end
+end)
+
 local function getBusinessCar()
     local vehFolder = workspace:FindFirstChild("Vehicles")
     if not vehFolder then return nil end
@@ -968,15 +1194,19 @@ local function getBusinessCar()
         or vehFolder:FindFirstChild(player.Name .. " - Service")
         or vehFolder:FindFirstChild(player.Name .. " - Project")
         or vehFolder:FindFirstChild(player.Name .. " - Auction")
-        or vehFolder:FindFirstChild(player.Name)
     if car then return car end
+
     local char = player.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if hum and hum.SeatPart and hum.SeatPart:IsA("VehicleSeat") then
-        return hum.SeatPart:FindFirstAncestorOfClass("Model")
+        local m = hum.SeatPart:FindFirstAncestorOfClass("Model")
+        if m and isMissionOrRaceCar(m) then
+            return m
+        end
     end
+
     for _, v in ipairs(vehFolder:GetChildren()) do
-        if v.Name:find(player.Name) then
+        if isMissionOrRaceCar(v) and (v.Name:find(player.Name, 1, true) or v:GetAttribute("Owner") == player.Name) then
             return v
         end
     end
@@ -1135,28 +1365,131 @@ local function getWantedPicks(slot, bayData)
     return picks, spec
 end
 
--- Detects any deliverable car in the business bays (contract, repo, lease, project)
-local function getDeliverableBayCar(s)
-    if not s or not s.bays then return nil end
-    local maxBays = tonumber(s.bayCount) or 6
-    for i = 1, maxBays do
-        local slotCandidates = { "B" .. i, i, tostring(i) }
-        for _, candidate in ipairs(slotCandidates) do
-            local bayData = s.bays[candidate]
-            if bayData and (bayData.car or bayData.display or bayData.model or bayData.state or bayData.kind) then
-                if bayData.kind ~= "service" then
-                    return candidate, bayData
+-- Multi-Bay Deliverable Car Detection & Readiness Evaluator
+-- Supports targetKind: "contract" (strictly contract cars, ignores auction/project), "project" (only project cars), or nil (all deliverable)
+local function getAllDeliverableBayCars(s, targetKind)
+    if not s or not s.bays then return {} end
+    local maxBays = tonumber(s.bayCount) or (s.garage and s.garage.bays and #s.garage.bays) or 6
+    local candidates = {}
+    local now = os.clock()
+
+    local leaderstats = player:FindFirstChild("leaderstats")
+    local cashObj = leaderstats and (leaderstats:FindFirstChild("Cash") or leaderstats:FindFirstChild("Money"))
+    local cash = cashObj and cashObj.Value or 0
+
+    local checkedSlots = {}
+    local function checkSlot(slotKey)
+        if checkedSlots[slotKey] then return end
+        checkedSlots[slotKey] = true
+
+        local bayData = s.bays[slotKey]
+        if not bayData or type(bayData) ~= "table" then return end
+        if not (bayData.car or bayData.display or bayData.model or bayData.state or bayData.kind) then return end
+        if bayData.kind == "service" then return end -- Service cars belong to client order flow
+
+        -- Target kind filtering
+        if targetKind == "contract" then
+            if bayData.kind == "project" then return end -- Strictly ignore auction project cars
+        elseif targetKind == "project" then
+            if bayData.kind ~= "project" then return end -- Strictly only auction project cars
+        end
+
+        local faultCount = 0
+        local totalFixCost = 0
+        if bayData.faults and type(bayData.faults) == "table" then
+            for _, f in ipairs(bayData.faults) do
+                if type(f) == "table" and f.state ~= "fixed" and f.fixed ~= true then
+                    faultCount = faultCount + 1
+                    totalFixCost = totalFixCost + (tonumber(f.cost) or 0)
                 end
             end
         end
+
+        local isReady = (faultCount == 0)
+        local canAffordFix = isReady or (cash >= totalFixCost)
+        local onCooldown = (slotSellCooldown[tostring(slotKey)] and slotSellCooldown[tostring(slotKey)] > now)
+
+        table.insert(candidates, {
+            slot = slotKey,
+            data = bayData,
+            isReady = isReady,
+            faultCount = faultCount,
+            totalFixCost = totalFixCost,
+            canAffordFix = canAffordFix,
+            onCooldown = onCooldown,
+            cooldownUntil = slotSellCooldown[tostring(slotKey)] or 0
+        })
     end
-    -- Fallback: iterate all keys in s.bays
-    for slotKey, bayData in pairs(s.bays) do
-        if type(bayData) == "table" and (bayData.car or bayData.display or bayData.model or bayData.state or bayData.kind) then
-            if bayData.kind ~= "service" then
-                return slotKey, bayData
-            end
+
+    -- Check numbered bays 1 .. maxBays
+    for i = 1, maxBays do
+        checkSlot("B" .. i)
+    end
+    -- Fallback for any other keys in s.bays
+    for k, _ in pairs(s.bays) do
+        checkSlot(k)
+    end
+
+    -- Sort candidates:
+    -- 1. Not on cooldown > on cooldown
+    -- 2. Fully ready (0 faults / restored) > Needs fix
+    -- 3. Can afford fix > cannot afford fix
+    -- 4. Fewer faults
+    table.sort(candidates, function(a, b)
+        if a.onCooldown ~= b.onCooldown then
+            return not a.onCooldown
         end
+        if a.isReady ~= b.isReady then
+            return a.isReady
+        end
+        if a.canAffordFix ~= b.canAffordFix then
+            return a.canAffordFix
+        end
+        if a.faultCount ~= b.faultCount then
+            return a.faultCount < b.faultCount
+        end
+        return tostring(a.slot) < tostring(b.slot)
+    end)
+
+    return candidates
+end
+
+local function getDeliverableContractCar(s)
+    local candidates = getAllDeliverableBayCars(s, "contract")
+    for _, c in ipairs(candidates) do
+        if not c.onCooldown then
+            return c.slot, c.data
+        end
+    end
+    if candidates[1] then
+        return candidates[1].slot, candidates[1].data
+    end
+    return nil
+end
+
+local function getDeliverableAuctionCar(s)
+    local candidates = getAllDeliverableBayCars(s, "project")
+    for _, c in ipairs(candidates) do
+        if not c.onCooldown then
+            return c.slot, c.data
+        end
+    end
+    if candidates[1] then
+        return candidates[1].slot, candidates[1].data
+    end
+    return nil
+end
+
+local function getDeliverableBayCar(s)
+    local filter = (autoContractsActive and not autoAuctionsActive) and "contract" or nil
+    local candidates = getAllDeliverableBayCars(s, filter)
+    for _, c in ipairs(candidates) do
+        if not c.onCooldown then
+            return c.slot, c.data
+        end
+    end
+    if candidates[1] then
+        return candidates[1].slot, candidates[1].data
     end
     return nil
 end
@@ -1251,6 +1584,10 @@ local function sellAndDeliverToCollector(slot)
         local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 
         if seat and hum and seat.Occupant ~= hum then
+            if hum.Sit and hum.SeatPart ~= seat then
+                hum.Sit = false
+                task.wait(0.1)
+            end
             seat:Sit(hum)
             task.wait(0.5)
         end
@@ -1316,8 +1653,16 @@ local function sellAndDeliverToCollector(slot)
     end
 
     if not sellRes or not sellRes.ok then
-        return false, (type(sellRes) == "table" and sellRes.message) or "Could not start sale"
+        local errMsg = (type(sellRes) == "table" and sellRes.message) or "Could not start sale"
+        slotSellCooldown[tostring(slot)] = os.clock() + 25
+        local num = tonumber(tostring(slot):match("%d+"))
+        if num then slotSellCooldown["B" .. num] = os.clock() + 25 end
+        return false, errMsg
     end
+
+    slotSellCooldown[tostring(slot)] = nil
+    local num = tonumber(tostring(slot):match("%d+"))
+    if num then slotSellCooldown["B" .. num] = nil end
 
     task.wait(1.0)
     s = Net.State()
@@ -1333,6 +1678,10 @@ local function sellAndDeliverToCollector(slot)
     local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 
     if seat and hum and seat.Occupant ~= hum then
+        if hum.Sit and hum.SeatPart ~= seat then
+            hum.Sit = false
+            task.wait(0.1)
+        end
         seat:Sit(hum)
         task.wait(0.5)
     end
@@ -1385,10 +1734,13 @@ local function checkContractBoard(force)
     for _, o in ipairs(offers) do
         if not o.taken then
             untaken = untaken + 1
-            local profit = (type(o.fee) == "table" and tonumber(o.fee[2])) or tonumber(o.fee) or 0
-            if profit > maxProfit then
-                maxProfit = profit
-                best = o
+            local tier = tostring(o.tier or o.rarity or "common"):lower()
+            if contractRarityAllowed[tier] ~= false then
+                local profit = (type(o.fee) == "table" and tonumber(o.fee[2])) or tonumber(o.fee) or 0
+                if profit > maxProfit then
+                    maxProfit = profit
+                    best = o
+                end
             end
         end
     end
@@ -1432,10 +1784,13 @@ local function runOneContract()
         for _, o in ipairs(offers) do
             if not o.taken then
                 untakenCount = untakenCount + 1
-                local profit = (type(o.fee) == "table" and tonumber(o.fee[2])) or tonumber(o.fee) or 0
-                if profit > maxProfit then
-                    maxProfit = profit
-                    best = o
+                local tier = tostring(o.tier or o.rarity or "common"):lower()
+                if contractRarityAllowed[tier] ~= false then
+                    local profit = (type(o.fee) == "table" and tonumber(o.fee[2])) or tonumber(o.fee) or 0
+                    if profit > maxProfit then
+                        maxProfit = profit
+                        best = o
+                    end
                 end
             end
         end
@@ -1446,6 +1801,9 @@ local function runOneContract()
         boardCache.bestOffer = best
 
         if untakenCount == 0 or not best then
+            if untakenCount > 0 and not best then
+                contractsToggle.SetStatus("No offers matching allowed contract rarities", Color3.fromRGB(241, 196, 15))
+            end
             return false, "board_empty", nextRefresh
         end
 
@@ -1483,20 +1841,28 @@ local function runOneContract()
             root.Anchored = false
         end
 
-        local car = workspace.Vehicles:FindFirstChild(player.Name .. " - Business")
+        local car = getBusinessCar()
         local seat = car and car:FindFirstChild("DriveSeat", true)
         if seat and hum then
+            if hum.Sit and hum.SeatPart ~= seat then
+                hum.Sit = false
+                task.wait(0.1)
+            end
             seat:Sit(hum)
             task.wait(0.6)
         end
     end
 
     if dest then
-        local car = workspace.Vehicles:FindFirstChild(player.Name .. " - Business")
+        local car = getBusinessCar()
         local seat = car and car:FindFirstChild("DriveSeat", true)
         local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 
         if seat and hum and seat.Occupant ~= hum then
+            if hum.Sit and hum.SeatPart ~= seat then
+                hum.Sit = false
+                task.wait(0.1)
+            end
             seat:Sit(hum)
             task.wait(0.5)
         end
@@ -1552,6 +1918,12 @@ local function runAuctionCycle()
     local unaffordableCandidate = nil
 
     for _, lot in ipairs(lots) do
+        -- Check rarity filter (Common, Rare, Epic, Legendary)
+        local tier = tostring(lot.tier or lot.rarity or "common"):lower()
+        if auctionRarityAllowed[tier] == false then
+            continue
+        end
+
         -- Skip if we are currently the leading bidder
         local amLeading = (lot.you == true) or (lot.leader == player.Name) or (lot.aiLeads == false and lot.you == true)
         if not amLeading then
@@ -1663,23 +2035,25 @@ local function fixAllBays()
         if bay and bay.car then
             local carName = tostring(bay.display or bay.car or slot)
             if bay.kind == "project" then
-                -- Try restoring all faults on project car
-                local resAll = Net.Call("restore", slot, "all")
-                if resAll and resAll.ok then
-                    fixedAny = true
-                    table.insert(actions, carName .. " (Restored)")
-                else
-                    -- Restore individual faults player can afford
-                    if bay.faults then
-                        for _, fault in ipairs(bay.faults) do
-                            if not fault.fixed then
-                                local cost = tonumber(fault.cost) or 0
-                                if cash >= cost then
-                                    local resOne = Net.Call("restore", slot, fault.id)
-                                    if resOne and resOne.ok then
-                                        fixedAny = true
-                                        cash = cash - cost
-                                        table.insert(actions, carName .. " (" .. tostring(fault.label or fault.id) .. ")")
+                -- Only restore auction project cars if Auto Auctions is actively toggled ON!
+                if autoAuctionsActive then
+                    local resAll = Net.Call("restore", slot, "all")
+                    if resAll and resAll.ok then
+                        fixedAny = true
+                        table.insert(actions, carName .. " (Restored)")
+                    else
+                        -- Restore individual faults player can afford
+                        if bay.faults then
+                            for _, fault in ipairs(bay.faults) do
+                                if not fault.fixed then
+                                    local cost = tonumber(fault.cost) or 0
+                                    if cash >= cost then
+                                        local resOne = Net.Call("restore", slot, fault.id)
+                                        if resOne and resOne.ok then
+                                            fixedAny = true
+                                            cash = cash - cost
+                                            table.insert(actions, carName .. " (" .. tostring(fault.label or fault.id) .. ")")
+                                        end
                                     end
                                 end
                             end
@@ -1739,12 +2113,62 @@ contractsToggle = createToggle(
     end
 )
 
+-- Contract Rarity Filter Header & Buttons
+local contractRarityHeader = Instance.new("TextLabel")
+contractRarityHeader.Text = "Contract Rarity Filter (Allowed Contracts):"
+contractRarityHeader.Font = Enum.Font.GothamMedium
+contractRarityHeader.TextSize = 10
+contractRarityHeader.TextColor3 = C_MUTED
+contractRarityHeader.TextXAlignment = Enum.TextXAlignment.Left
+contractRarityHeader.Position = UDim2.new(0, 16, 0, 96)
+contractRarityHeader.Size = UDim2.new(1, -32, 0, 14)
+contractRarityHeader.BackgroundTransparency = 1
+contractRarityHeader.Parent = bizAutoCard
+
+local rarityTiers = {
+    { key = "common", name = "⚪ Common", col = Color3.fromRGB(130, 140, 155), x = 14, w = 108 },
+    { key = "rare", name = "🔵 Rare", col = Color3.fromRGB(52, 152, 219), x = 126, w = 108 },
+    { key = "epic", name = "🟣 Epic", col = Color3.fromRGB(155, 89, 182), x = 238, w = 108 },
+    { key = "legendary", name = "🟡 Legendary", col = Color3.fromRGB(241, 196, 15), x = 350, w = 126 }
+}
+
+for _, r in ipairs(rarityTiers) do
+    local key = r.key
+    local isAllowed = (contractRarityAllowed[key] == true)
+    local btn
+    btn = createButton(
+        bizAutoCard,
+        r.name .. (isAllowed and ": ON" or ": OFF"),
+        isAllowed and r.col or Color3.fromRGB(30, 34, 42),
+        UDim2.new(0, r.x, 0, 112),
+        UDim2.new(0, r.w, 0, 24),
+        function()
+            contractRarityAllowed[key] = not contractRarityAllowed[key]
+            local newState = contractRarityAllowed[key]
+            if newState then
+                btn.Text = r.name .. ": ON"
+                btn.BackgroundColor3 = r.col
+                btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            else
+                btn.Text = r.name .. ": OFF"
+                btn.BackgroundColor3 = Color3.fromRGB(30, 34, 42)
+                btn.TextColor3 = Color3.fromRGB(140, 145, 155)
+            end
+        end
+    )
+    btn.TextSize = 10
+    btn.Font = Enum.Font.GothamBold
+    if not isAllowed then
+        btn.TextColor3 = Color3.fromRGB(140, 145, 155)
+    end
+end
+
 customersToggle = createToggle(
     bizAutoCard,
     "👥 Auto Customers",
     "Auto-accepts waiting clients, fulfills order specs & returns car",
     false,
-    UDim2.new(0, 14, 0, 98),
+    UDim2.new(0, 14, 0, 142),
     UDim2.new(1, -28, 0, 44),
     function(state)
         autoCustomersActive = state
@@ -1761,7 +2185,7 @@ auctionsToggle = createToggle(
     "🏷️ Auto Auctions",
     "Bids on lots, auto-restores won cars & delivers to Collector (+30%)",
     false,
-    UDim2.new(0, 14, 0, 148),
+    UDim2.new(0, 14, 0, 192),
     UDim2.new(1, -28, 0, 44),
     function(state)
         autoAuctionsActive = state
@@ -1773,12 +2197,55 @@ auctionsToggle = createToggle(
     end
 )
 
+-- Auction Rarity Filter Header & Buttons
+local auctionRarityHeader = Instance.new("TextLabel")
+auctionRarityHeader.Text = "Auction Rarity Filter (Allowed Bids):"
+auctionRarityHeader.Font = Enum.Font.GothamMedium
+auctionRarityHeader.TextSize = 10
+auctionRarityHeader.TextColor3 = C_MUTED
+auctionRarityHeader.TextXAlignment = Enum.TextXAlignment.Left
+auctionRarityHeader.Position = UDim2.new(0, 16, 0, 240)
+auctionRarityHeader.Size = UDim2.new(1, -32, 0, 14)
+auctionRarityHeader.BackgroundTransparency = 1
+auctionRarityHeader.Parent = bizAutoCard
+
+for _, r in ipairs(rarityTiers) do
+    local key = r.key
+    local isAllowed = (auctionRarityAllowed[key] == true)
+    local btn
+    btn = createButton(
+        bizAutoCard,
+        r.name .. (isAllowed and ": ON" or ": OFF"),
+        isAllowed and r.col or Color3.fromRGB(30, 34, 42),
+        UDim2.new(0, r.x, 0, 256),
+        UDim2.new(0, r.w, 0, 24),
+        function()
+            auctionRarityAllowed[key] = not auctionRarityAllowed[key]
+            local newState = auctionRarityAllowed[key]
+            if newState then
+                btn.Text = r.name .. ": ON"
+                btn.BackgroundColor3 = r.col
+                btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            else
+                btn.Text = r.name .. ": OFF"
+                btn.BackgroundColor3 = Color3.fromRGB(30, 34, 42)
+                btn.TextColor3 = Color3.fromRGB(140, 145, 155)
+            end
+        end
+    )
+    btn.TextSize = 10
+    btn.Font = Enum.Font.GothamBold
+    if not isAllowed then
+        btn.TextColor3 = Color3.fromRGB(140, 145, 155)
+    end
+end
+
 restoreToggle = createToggle(
     bizAutoCard,
     "🛠️ Auto Restore / Fix Bays",
     "Auto-restores project cars, repairs care & fulfills order specs",
     false,
-    UDim2.new(0, 14, 0, 198),
+    UDim2.new(0, 14, 0, 286),
     UDim2.new(1, -28, 0, 44),
     function(state)
         autoRestoreActive = state
@@ -1786,6 +2253,24 @@ restoreToggle = createToggle(
             restoreToggle.SetStatus("Active • Monitoring & fixing bay cars...", C_GREEN)
         else
             restoreToggle.SetStatus("Disabled • Click switch to start", C_MUTED)
+        end
+    end
+)
+
+autoEjectToggle = createToggle(
+    bizAutoCard,
+    "🚫 Auto-Exit Owned Vehicle",
+    "Active • Automatically ejects character if sitting in personal garage car",
+    true,
+    UDim2.new(0, 14, 0, 336),
+    UDim2.new(1, -28, 0, 44),
+    function(state)
+        autoEjectOwnedActive = state
+        if state then
+            autoEjectToggle.SetStatus("Active • Auto-ejects if sitting in personal car", C_GREEN)
+            checkPlayerSeat()
+        else
+            autoEjectToggle.SetStatus("Disabled • Personal car seating allowed", C_MUTED)
         end
     end
 )
@@ -1831,17 +2316,17 @@ task.spawn(function()
                 nextBoardTime = nextRefresh
 
                 -- Check if any deliverable contract car is inside the business bays
-                -- (Prioritizes cars already inside the business regardless of manual or auto retrieval!)
-                local deliverSlot, deliverData = getDeliverableBayCar(s)
+                -- (Excludes auction project cars so Auto Contracts solely focuses on contracts!)
+                local deliverSlot, deliverData = getDeliverableContractCar(s)
 
                 if deliverSlot and deliverData then
-                    -- Bay car detected! Customize to buyer spec and deliver to Collector (+30%) REGARDLESS!
+                    -- Deliverable contract car detected! Customize to buyer spec and deliver to Collector (+30%)!
                     contractsHasWork = "deliver_bay_car"
                 elseif not slots.isFull and untaken > 0 then
                     -- Bays open and contracts available on board -> retrieve next contract
                     contractsHasWork = "retrieve_next"
                 elseif untaken == 0 and not deliverSlot then
-                    -- Board cleared & garage bays empty -> yield to Priority 2 (Auctions)
+                    -- Board cleared & garage bays empty of contract cars -> yield to Priority 2 (Auctions)
                     local serverTime = workspace:GetServerTimeNow()
                     local secsLeft = math.max(0, math.floor(nextBoardTime - serverTime))
                     local timeStr = string.format("%d:%02d", secsLeft // 60, secsLeft % 60)
@@ -1886,31 +2371,41 @@ task.spawn(function()
             if autoAuctionsActive then auctionsToggle.SetStatus("Queued (Priority 2) • Waiting for Contracts delivery", C_MUTED) end
             if autoCustomersActive then customersToggle.SetStatus("Queued (Priority 3) • Waiting for Contracts delivery", C_MUTED) end
 
-            local targetSlot, targetData = getDeliverableBayCar(s)
-            if targetSlot and targetData then
-                local carName = tostring(targetData.display or targetData.car or targetSlot)
+            local deliverCandidates = getAllDeliverableBayCars(s, "contract")
+            local soldAny = false
+            for _, cand in ipairs(deliverCandidates) do
+                if not cand.onCooldown then
+                    local targetSlot = cand.slot
+                    local targetData = cand.data
+                    local carName = tostring(targetData.display or targetData.car or targetSlot)
 
-                -- 1. Customize to buyer's requested spec (paint, rims, wash, plate, restore faults, repair)
-                contractsToggle.SetStatus("Customizing " .. carName .. " in " .. tostring(targetSlot) .. " to Buyer Spec...", Color3.fromRGB(241, 196, 15))
-                setAutoStatus("Customizing " .. carName .. " to buyer specifications...", Color3.fromRGB(241, 196, 15))
-                local okCust, custSuccess, custDesc, actualSlot = pcall(customizeCarToBuyerSpec, targetSlot, targetData)
-                actualSlot = (okCust and custSuccess and actualSlot) or targetSlot
+                    -- 1. Customize to buyer's requested spec (paint, rims, wash, plate, restore faults, repair)
+                    contractsToggle.SetStatus("Customizing " .. carName .. " in " .. tostring(targetSlot) .. " to Buyer Spec...", Color3.fromRGB(241, 196, 15))
+                    setAutoStatus("Customizing " .. carName .. " in " .. tostring(targetSlot) .. " to buyer specifications...", Color3.fromRGB(241, 196, 15))
+                    local okCust, custSuccess, custDesc, actualSlot = pcall(customizeCarToBuyerSpec, targetSlot, targetData)
+                    actualSlot = (okCust and custSuccess and actualSlot) or targetSlot
 
-                -- 2. Deliver to The Collector (+30%)
-                contractsToggle.SetStatus("Delivering " .. carName .. " to Collector (+30%)...", C_ACCENT)
-                setAutoStatus("Delivering " .. carName .. " to Collector...", C_ACCENT)
-                missionBusy = true
-                local okSell, sold, msg = pcall(sellAndDeliverToCollector, actualSlot)
-                missionBusy = false
+                    -- 2. Deliver to The Collector (+30%)
+                    contractsToggle.SetStatus("Delivering " .. carName .. " in " .. tostring(actualSlot) .. " to Collector (+30%)...", C_ACCENT)
+                    setAutoStatus("Delivering " .. carName .. " to Collector...", C_ACCENT)
+                    missionBusy = true
+                    local okSell, sold, msg = pcall(sellAndDeliverToCollector, actualSlot)
+                    missionBusy = false
 
-                if okSell and sold then
-                    contractsToggle.SetStatus("Sold " .. carName .. " to Collector (+30%)! (" .. tostring(custDesc) .. ")", C_GREEN)
-                    setAutoStatus("Sold " .. carName .. " to Collector (+30%)", C_GREEN)
-                    task.wait(2)
-                else
-                    contractsToggle.SetStatus("Sale: " .. tostring(msg), Color3.fromRGB(241, 196, 15))
-                    task.wait(3)
+                    if okSell and sold then
+                        contractsToggle.SetStatus("Sold " .. carName .. " in " .. tostring(actualSlot) .. " to Collector (+30%)! (" .. tostring(custDesc) .. ")", C_GREEN)
+                        setAutoStatus("Sold " .. carName .. " to Collector (+30%)", C_GREEN)
+                        soldAny = true
+                        task.wait(2)
+                        break
+                    else
+                        slotSellCooldown[tostring(actualSlot)] = os.clock() + 25
+                        contractsToggle.SetStatus(tostring(actualSlot) .. " Sale: " .. tostring(msg) .. " • Trying next bay...", Color3.fromRGB(241, 196, 15))
+                        task.wait(1)
+                    end
                 end
+            end
+            if soldAny then
                 continue
             end
         end
@@ -1920,7 +2415,9 @@ task.spawn(function()
         -- (Runs when Contracts has cleared the board or is disabled)
         -- -------------------------------------------------------------
         local auctionsHasWork = false
-        local projectBay = (slots.projectBays and slots.projectBays[1])
+        local deliverableAuctionCars = getAllDeliverableBayCars(s, "project")
+        local projectCand = deliverableAuctionCars[1]
+        local projectBay = projectCand and projectCand.slot
 
         if autoAuctionsActive then
             if projectBay then
@@ -1941,7 +2438,7 @@ task.spawn(function()
                 end
 
                 missionBusy = true
-                auctionsToggle.SetStatus("Fixing & delivering won car to Collector (+30%)...", C_ACCENT)
+                auctionsToggle.SetStatus("Fixing & delivering won car in " .. tostring(projectBay) .. " to Collector (+30%)...", C_ACCENT)
                 local ok, sold, msg = pcall(sellAndDeliverToCollector, projectBay)
                 missionBusy = false
 
@@ -1949,8 +2446,9 @@ task.spawn(function()
                     auctionsToggle.SetStatus(tostring(msg), C_GREEN)
                     task.wait(2)
                 else
-                    auctionsToggle.SetStatus("Sale: " .. tostring(msg), Color3.fromRGB(241, 196, 15))
-                    task.wait(3.5)
+                    slotSellCooldown[tostring(projectBay)] = os.clock() + 25
+                    auctionsToggle.SetStatus(tostring(projectBay) .. " Sale: " .. tostring(msg), Color3.fromRGB(241, 196, 15))
+                    task.wait(2)
                 end
                 continue
             end
@@ -2015,7 +2513,7 @@ end)
 -- ======================================================================
 -- QUICK MANUAL ACTIONS
 -- ======================================================================
-createButton(bizAutoCard, "⚡ Run 1 Contract", Color3.fromRGB(52, 152, 219), UDim2.new(0, 14, 0, 250), UDim2.new(0, 146, 0, 28), function()
+createButton(bizAutoCard, "⚡ Run 1 Contract", Color3.fromRGB(52, 152, 219), UDim2.new(0, 14, 0, 388), UDim2.new(0, 146, 0, 28), function()
     task.spawn(function()
         if missionBusy then
             setAutoStatus("System busy with another task", Color3.fromRGB(241, 196, 15))
@@ -2027,7 +2525,7 @@ createButton(bizAutoCard, "⚡ Run 1 Contract", Color3.fromRGB(52, 152, 219), UD
     end)
 end)
 
-createButton(bizAutoCard, "👥 Serve Client", Color3.fromRGB(155, 89, 182), UDim2.new(0, 168, 0, 250), UDim2.new(0, 146, 0, 28), function()
+createButton(bizAutoCard, "👥 Serve Client", Color3.fromRGB(155, 89, 182), UDim2.new(0, 168, 0, 388), UDim2.new(0, 146, 0, 28), function()
     task.spawn(function()
         if missionBusy then
             setAutoStatus("System busy with another task", Color3.fromRGB(241, 196, 15))
@@ -2039,11 +2537,11 @@ createButton(bizAutoCard, "👥 Serve Client", Color3.fromRGB(155, 89, 182), UDi
     end)
 end)
 
-createButton(bizAutoCard, "🏷️ Bid Best Lot", Color3.fromRGB(241, 196, 15), UDim2.new(0, 322, 0, 250), UDim2.new(0, 154, 0, 28), function()
+createButton(bizAutoCard, "🏷️ Bid Best Lot", Color3.fromRGB(241, 196, 15), UDim2.new(0, 322, 0, 388), UDim2.new(0, 154, 0, 28), function()
     task.spawn(runAuctionCycle)
 end)
 
-createButton(bizAutoCard, "💎 Prep & Sell Bay Car to Collector (+30%)", Color3.fromRGB(46, 204, 113), UDim2.new(0, 14, 0, 282), UDim2.new(1, -28, 0, 28), function()
+local function sellSpecificBay(slotKey)
     task.spawn(function()
         if missionBusy then
             setAutoStatus("System busy with another task", Color3.fromRGB(241, 196, 15))
@@ -2052,25 +2550,87 @@ createButton(bizAutoCard, "💎 Prep & Sell Bay Car to Collector (+30%)", Color3
         local Net = getNet()
         if not Net then return end
         local s = Net.State()
-        local baySlot, bayData = getDeliverableBayCar(s)
-        if not baySlot then
-            setAutoStatus("No deliverable cars found in business bays", Color3.fromRGB(241, 196, 15))
+        local num = tonumber(tostring(slotKey):match("%d+"))
+        local strSlot = "B" .. (num or slotKey)
+        local bayData = s and s.bays and (s.bays[slotKey] or (num and s.bays[num]) or s.bays[strSlot])
+        if not bayData or not (bayData.car or bayData.display or bayData.model) then
+            setAutoStatus("No car found in " .. tostring(strSlot), Color3.fromRGB(241, 196, 15))
             return
         end
-        local carName = tostring(bayData.display or bayData.car or baySlot)
-        setAutoStatus("Prepping & delivering " .. carName .. " to Collector (+30%)...", C_ACCENT)
+        local carName = tostring(bayData.display or bayData.car or strSlot)
+        setAutoStatus("Prepping & delivering " .. carName .. " in " .. tostring(strSlot) .. " to Collector (+30%)...", C_ACCENT)
         missionBusy = true
-        local ok, sold, msg = pcall(sellAndDeliverToCollector, baySlot)
+        local ok, sold, msg = pcall(sellAndDeliverToCollector, strSlot)
         missionBusy = false
         if ok and sold then
             setAutoStatus(tostring(msg), C_GREEN)
         else
-            setAutoStatus("Delivery: " .. tostring(msg), Color3.fromRGB(231, 76, 60))
+            slotSellCooldown[tostring(strSlot)] = os.clock() + 25
+            setAutoStatus("Bay " .. tostring(strSlot) .. " Sale: " .. tostring(msg), Color3.fromRGB(231, 76, 60))
+        end
+    end)
+end
+
+createButton(bizAutoCard, "💎 Prep & Sell Best Ready Bay Car to Collector (+30%)", Color3.fromRGB(46, 204, 113), UDim2.new(0, 14, 0, 420), UDim2.new(1, -28, 0, 28), function()
+    task.spawn(function()
+        if missionBusy then
+            setAutoStatus("System busy with another task", Color3.fromRGB(241, 196, 15))
+            return
+        end
+        local Net = getNet()
+        if not Net then return end
+        local s = Net.State()
+        local filter = (not autoAuctionsActive) and "contract" or nil
+        local candidates = getAllDeliverableBayCars(s, filter)
+        if #candidates == 0 and filter then
+            -- Fallback to any ready bay car if no contract cars exist
+            candidates = getAllDeliverableBayCars(s)
+        end
+        if #candidates == 0 then
+            setAutoStatus("No deliverable cars found in business bays", Color3.fromRGB(241, 196, 15))
+            return
+        end
+
+        local soldSuccess = false
+        for _, cand in ipairs(candidates) do
+            local baySlot = cand.slot
+            local bayData = cand.data
+            local carName = tostring(bayData.display or bayData.car or baySlot)
+            setAutoStatus("Prepping & delivering " .. carName .. " in " .. tostring(baySlot) .. " to Collector (+30%)...", C_ACCENT)
+            missionBusy = true
+            local ok, sold, msg = pcall(sellAndDeliverToCollector, baySlot)
+            missionBusy = false
+            if ok and sold then
+                setAutoStatus(tostring(msg), C_GREEN)
+                soldSuccess = true
+                break
+            else
+                slotSellCooldown[tostring(baySlot)] = os.clock() + 25
+                setAutoStatus(tostring(baySlot) .. " Sale: " .. tostring(msg) .. " • Checking next bay...", Color3.fromRGB(241, 196, 15))
+                task.wait(1)
+            end
+        end
+
+        if not soldSuccess then
+            setAutoStatus("None of the bay cars could be sold (check repairs/restore)", Color3.fromRGB(231, 76, 60))
         end
     end)
 end)
 
-createButton(bizAutoCard, "🛠️ Restore & Clean All Bays", Color3.fromRGB(45, 52, 70), UDim2.new(0, 14, 0, 316), UDim2.new(0, 226, 0, 28), function()
+-- Direct per-bay sell buttons (Allows delivering Bay 1, Bay 2, or Bay 3 directly!)
+createButton(bizAutoCard, "🚗 Sell Bay 1", Color3.fromRGB(39, 174, 96), UDim2.new(0, 14, 0, 452), UDim2.new(0, 146, 0, 26), function()
+    sellSpecificBay("B1")
+end)
+
+createButton(bizAutoCard, "🚗 Sell Bay 2", Color3.fromRGB(39, 174, 96), UDim2.new(0, 168, 0, 452), UDim2.new(0, 146, 0, 26), function()
+    sellSpecificBay("B2")
+end)
+
+createButton(bizAutoCard, "🚗 Sell Bay 3", Color3.fromRGB(39, 174, 96), UDim2.new(0, 322, 0, 452), UDim2.new(0, 154, 0, 26), function()
+    sellSpecificBay("B3")
+end)
+
+createButton(bizAutoCard, "🛠️ Restore & Clean All Bays", Color3.fromRGB(45, 52, 70), UDim2.new(0, 14, 0, 484), UDim2.new(0, 226, 0, 28), function()
     task.spawn(function()
         local ok, success, detail = pcall(fixAllBays)
         refreshBusiness()
@@ -2082,7 +2642,7 @@ createButton(bizAutoCard, "🛠️ Restore & Clean All Bays", Color3.fromRGB(45,
     end)
 end)
 
-createButton(bizAutoCard, "🛑 Cancel Active Mission", Color3.fromRGB(192, 57, 43), UDim2.new(0, 248, 0, 316), UDim2.new(0, 228, 0, 28), function()
+createButton(bizAutoCard, "🛑 Cancel Active Mission", Color3.fromRGB(192, 57, 43), UDim2.new(0, 248, 0, 484), UDim2.new(0, 228, 0, 28), function()
     local Net = getNet()
     if Net then
         Net.Call("cancel")
@@ -2100,7 +2660,7 @@ autoHelpText.TextSize = 10
 autoHelpText.TextColor3 = C_MUTED
 autoHelpText.TextXAlignment = Enum.TextXAlignment.Left
 autoHelpText.TextWrapped = true
-autoHelpText.Position = UDim2.new(0, 14, 0, 352)
+autoHelpText.Position = UDim2.new(0, 14, 0, 518)
 autoHelpText.Size = UDim2.new(1, -28, 0, 48)
 autoHelpText.BackgroundTransparency = 1
 autoHelpText.Parent = bizAutoCard
