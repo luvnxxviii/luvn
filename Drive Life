@@ -1870,6 +1870,7 @@ end
 local boardCache = {
     checkedAt = 0,
     untakenCount = 0,
+    matchingCount = 0,
     nextRefresh = 0,
     bestOffer = nil
 }
@@ -1877,11 +1878,11 @@ local boardCache = {
 local function checkContractBoard(force)
     local now = os.clock()
     if not force and (now - boardCache.checkedAt < 2.5) then
-        return boardCache.untakenCount, boardCache.nextRefresh, boardCache.bestOffer
+        return boardCache.matchingCount, boardCache.nextRefresh, boardCache.bestOffer, boardCache.untakenCount
     end
 
     local Net = getNet()
-    if not Net then return 0, 0, nil end
+    if not Net then return 0, 0, nil, 0 end
 
     local b = Net.Call("board")
     local offers = b and b.offers or {}
@@ -1889,6 +1890,7 @@ local function checkContractBoard(force)
     local nextRefresh = (boardInfo and tonumber(boardInfo.next)) or 0
 
     local untaken = 0
+    local matching = 0
     local best = nil
     local maxProfit = 0
 
@@ -1897,6 +1899,7 @@ local function checkContractBoard(force)
             untaken = untaken + 1
             local tier = tostring(o.tier or o.rarity or "common"):lower()
             if contractRarityAllowed[tier] ~= false then
+                matching = matching + 1
                 local profit = (type(o.fee) == "table" and tonumber(o.fee[2])) or tonumber(o.fee) or 0
                 if profit > maxProfit then
                     maxProfit = profit
@@ -1908,10 +1911,11 @@ local function checkContractBoard(force)
 
     boardCache.checkedAt = now
     boardCache.untakenCount = untaken
+    boardCache.matchingCount = matching
     boardCache.nextRefresh = nextRefresh
     boardCache.bestOffer = best
 
-    return untaken, nextRefresh, best
+    return matching, nextRefresh, best, untaken
 end
 
 local function runOneContract()
@@ -1941,12 +1945,14 @@ local function runOneContract()
         local boardInfo = b and b.state and b.state.board
         local nextRefresh = (boardInfo and tonumber(boardInfo.next)) or 0
         local untakenCount = 0
+        local matchingCount = 0
 
         for _, o in ipairs(offers) do
             if not o.taken then
                 untakenCount = untakenCount + 1
                 local tier = tostring(o.tier or o.rarity or "common"):lower()
                 if contractRarityAllowed[tier] ~= false then
+                    matchingCount = matchingCount + 1
                     local profit = (type(o.fee) == "table" and tonumber(o.fee[2])) or tonumber(o.fee) or 0
                     if profit > maxProfit then
                         maxProfit = profit
@@ -1958,12 +1964,13 @@ local function runOneContract()
 
         boardCache.checkedAt = os.clock()
         boardCache.untakenCount = untakenCount
+        boardCache.matchingCount = matchingCount
         boardCache.nextRefresh = nextRefresh
         boardCache.bestOffer = best
 
-        if untakenCount == 0 or not best then
+        if matchingCount == 0 or not best then
             if untakenCount > 0 and not best then
-                contractsToggle.SetStatus("No offers matching allowed contract rarities", Color3.fromRGB(241, 196, 15))
+                contractsToggle.SetStatus("No offers matching allowed contract rarities • Yielding to Auctions", Color3.fromRGB(52, 152, 219))
             end
             return false, "board_empty", nextRefresh
         end
@@ -2463,6 +2470,7 @@ for _, r in ipairs(rarityTiers) do
         UDim2.new(0, r.w, 0, 24),
         function()
             contractRarityAllowed[key] = not contractRarityAllowed[key]
+            boardCache.checkedAt = 0 -- Force immediate contract board re-check on next tick!
             local newState = contractRarityAllowed[key]
             if newState then
                 btn.Text = r.name .. ": ON"
@@ -2619,19 +2627,34 @@ task.spawn(function()
 
         -- -------------------------------------------------------------
         -- PRIORITY 1: AUTO CONTRACTS (BATCH RETRIEVAL -> CUSTOMIZE -> DELIVER)
+        -- If matching contracts (e.g. Legendary) or bay contract cars exist,
+        -- pauses Auto Auctions and runs Contracts first. If 0 matching contracts
+        -- are on the board and no contract cars are in bays, switches to Auctions!
         -- -------------------------------------------------------------
         local contractsHasWork = false
         local nextBoardTime = 0
-        local untakenContracts = 0
+        local matchingContracts = 0
+        local totalUntakenContracts = 0
+
+        -- Determine if an active sale mission belongs to an Auction project car
+        local isAuctionSaleMission = false
+        if hasActiveMission and (s.mission.buyer or s.mission.destName or s.mission.kind == "sell") then
+            local mSlot = s.mission.slot and resolveBayKey(s.mission.slot, s)
+            local mBay = mSlot and s.bays and s.bays[mSlot]
+            if (mBay and mBay.kind == "project") or s.mission.fromKind == "project" then
+                isAuctionSaleMission = true
+            end
+        end
 
         if autoContractsActive then
-            if hasActiveMission and (s.mission.buyer or s.mission.destName or s.mission.kind == "sell") then
+            if hasActiveMission and (s.mission.buyer or s.mission.destName or s.mission.kind == "sell") and not (isAuctionSaleMission and autoAuctionsActive) then
                 contractsHasWork = "deliver_sale_in_progress"
-            elseif hasActiveMission and not (s.mission.buyer or s.mission.destName) then
+            elseif hasActiveMission and not (s.mission.buyer or s.mission.destName or s.mission.kind == "sell") then
                 contractsHasWork = "retrieve_in_progress"
-            else
-                local untaken, nextRefresh = checkContractBoard()
-                untakenContracts = untaken
+            elseif not hasActiveMission then
+                local matching, nextRefresh, bestOffer, totalUntaken = checkContractBoard()
+                matchingContracts = matching
+                totalUntakenContracts = totalUntaken or 0
                 nextBoardTime = nextRefresh
 
                 -- Check if any deliverable contract car is inside the business bays
@@ -2641,26 +2664,32 @@ task.spawn(function()
                 if deliverSlot and deliverData then
                     -- Deliverable contract car detected! Customize to buyer spec and deliver to Collector (+30%)!
                     contractsHasWork = "deliver_bay_car"
-                elseif not slots.isFull and untaken > 0 then
-                    -- Bays open and contracts available on board -> retrieve next contract
+                elseif not slots.isFull and matching > 0 and bestOffer ~= nil then
+                    -- Bays open and a contract matching allowed rarities (e.g. Legendary) is available -> retrieve it & pause Auctions!
                     contractsHasWork = "retrieve_next"
-                elseif untaken == 0 and not deliverSlot then
-                    -- Board cleared & garage bays empty of contract cars -> yield to Priority 2 (Auctions)
+                else
+                    -- No matching contracts on board (or bays full with non-contract cars) & no contract cars in bays -> switch to Priority 2 (Auctions)!
                     local serverTime = workspace:GetServerTimeNow()
                     local secsLeft = math.max(0, math.floor(nextBoardTime - serverTime))
                     local timeStr = string.format("%d:%02d", secsLeft // 60, secsLeft % 60)
-                    contractsToggle.SetStatus(string.format("Board cleared (0 left) • Yielding to Auctions • New in %s", timeStr), Color3.fromRGB(52, 152, 219))
+                    if totalUntakenContracts > 0 and matching == 0 then
+                        contractsToggle.SetStatus(string.format("No matching rarities on board • Switched to Auctions • New in %s", timeStr), Color3.fromRGB(52, 152, 219))
+                    elseif slots.isFull and matching > 0 then
+                        contractsToggle.SetStatus(string.format("Bays full (%d/%d) • Switched to Auctions to clear bays", slots.occupied, slots.total), Color3.fromRGB(241, 196, 15))
+                    else
+                        contractsToggle.SetStatus(string.format("Board cleared (0 left) • Switched to Auctions • New in %s", timeStr), Color3.fromRGB(52, 152, 219))
+                    end
                     contractsHasWork = false
                 end
             end
         end
 
         if contractsHasWork == "deliver_sale_in_progress" then
-            if autoAuctionsActive then auctionsToggle.SetStatus("Queued (Priority 2) • Waiting for Contracts delivery", C_MUTED) end
-            if autoCustomersActive then customersToggle.SetStatus("Queued (Priority 3) • Waiting for Contracts delivery", C_MUTED) end
+            if autoAuctionsActive then auctionsToggle.SetStatus("Paused (Priority 2) • Auto Contracts delivering car", C_MUTED) end
+            if autoCustomersActive then customersToggle.SetStatus("Paused (Priority 3) • Auto Contracts delivering car", C_MUTED) end
 
-            contractsToggle.SetStatus("Delivering active sale car to Collector (+30%)...", C_ACCENT)
-            setAutoStatus("Delivering active sale car to Collector...", C_ACCENT)
+            contractsToggle.SetStatus("Delivering active contract car to Collector (+30%)...", C_ACCENT)
+            setAutoStatus("Delivering active contract car to Collector...", C_ACCENT)
             missionBusy = true
             local okSell, sold, msg = pcall(sellAndDeliverToCollector, s.mission.slot or "B1")
             missionBusy = false
@@ -2675,10 +2704,10 @@ task.spawn(function()
             end
             continue
         elseif contractsHasWork == "retrieve_next" or contractsHasWork == "retrieve_in_progress" then
-            if autoAuctionsActive then auctionsToggle.SetStatus("Queued (Priority 2) • Waiting for Contracts batch", C_MUTED) end
-            if autoCustomersActive then customersToggle.SetStatus("Queued (Priority 3) • Waiting for Contracts batch", C_MUTED) end
+            if autoAuctionsActive then auctionsToggle.SetStatus("Paused (Priority 2) • Auto Contracts retrieving matching car", C_MUTED) end
+            if autoCustomersActive then customersToggle.SetStatus("Paused (Priority 3) • Auto Contracts retrieving matching car", C_MUTED) end
 
-            contractsToggle.SetStatus(string.format("Filling Garage (%d/%d bays) • Retrieving contract car...", slots.occupied, slots.total), C_ACCENT)
+            contractsToggle.SetStatus(string.format("Priority 1 Active (%d/%d bays) • Retrieving matching contract car...", slots.occupied, slots.total), C_ACCENT)
             missionBusy = true
             local ok, success, code, extra = pcall(runOneContract)
             missionBusy = false
@@ -2687,8 +2716,8 @@ task.spawn(function()
             task.wait(1.5)
             continue
         elseif contractsHasWork == "deliver_bay_car" then
-            if autoAuctionsActive then auctionsToggle.SetStatus("Queued (Priority 2) • Waiting for Contracts delivery", C_MUTED) end
-            if autoCustomersActive then customersToggle.SetStatus("Queued (Priority 3) • Waiting for Contracts delivery", C_MUTED) end
+            if autoAuctionsActive then auctionsToggle.SetStatus("Paused (Priority 2) • Auto Contracts delivering bay car", C_MUTED) end
+            if autoCustomersActive then customersToggle.SetStatus("Paused (Priority 3) • Auto Contracts delivering bay car", C_MUTED) end
 
             local deliverCandidates = getAllDeliverableBayCars(s, "contract")
             local soldAny = false
