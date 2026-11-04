@@ -629,7 +629,7 @@ end)
 -- ======================================================================
 -- BUSINESS AUTOMATION SUITE (CONTRACTS, CUSTOMERS, AUCTIONS & RESTORE)
 -- ======================================================================
-local bizAutoCard = createCard(pageBusiness, "🤖 Business Automation Suite", 375)
+local bizAutoCard = createCard(pageBusiness, "🤖 Business Automation Suite", 420)
 
 local autoStatusLabel = Instance.new("TextLabel")
 autoStatusLabel.Text = "System: Ready • Toggles operate independently"
@@ -661,16 +661,30 @@ local auctionsToggle
 local restoreToggle
 
 -- ======================================================================
--- HIGH-ALTITUDE SKY CRUISE & SAFE FEATHERED LANDING
--- Cruises at Y=750 (150+ studs above all mountains/trees) at 235 studs/s
+-- AUTOMATIC DISTANCE-BASED SPEED CALIBRATION & SAFE SKY CRUISE
+-- Auto-calculates flight speed based on distance to office / delivery
+-- Guarantees total travel time respects the server's anti-cheat limit
 -- Lands with 0% impact damage using raycasted ground & tire clearance
 -- ======================================================================
-local function glideVehicleTo(car, targetPos, maxSpeed, onProgress)
+local function calculateTransitCalibration(startPos, targetPos, missionObj)
+    local airDist = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(startPos.X, 0, startPos.Z)).Magnitude
+
+    -- In Drive Life: Road distance is approx 1.35x to 1.5x Euclidean air distance.
+    -- The server enforces MAX_SPEED = 260 studs/s along roads (ReplicatedStorage.Office.MAX_SPEED).
+    -- By targeting a safe road speed of 180 studs/s, we guarantee transit can NEVER trigger "too quick".
+    local roadDist = (missionObj and tonumber(missionObj.dist)) or (airDist * 1.45)
+    local minSafeDuration = math.max(10, roadDist / 180)
+    local calibratedSpeed = math.clamp(airDist / minSafeDuration, 75, 140)
+
+    return calibratedSpeed, minSafeDuration, roadDist, airDist
+end
+
+local function glideVehicleTo(car, targetPos, maxSpeed, onProgress, missionObj)
     if not car or not car.PrimaryPart then return false end
-    maxSpeed = maxSpeed or 235 -- Safe cruising speed strictly below server limit (260)
 
     local startPos = car.PrimaryPart.Position
-    local totalDist = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(startPos.X, 0, startPos.Z)).Magnitude
+    local calSpeed, minSafeDuration, roadDist, totalDist = calculateTransitCalibration(startPos, targetPos, missionObj)
+    maxSpeed = maxSpeed or calSpeed
 
     if totalDist < 25 then
         car:SetPrimaryPartCFrame(CFrame.new(targetPos))
@@ -700,7 +714,7 @@ local function glideVehicleTo(car, targetPos, maxSpeed, onProgress)
         task.wait(0.04)
     end
 
-    -- Phase 2: High-altitude cruise at 235 studs/s (satisfies server speed check without obstacles)
+    -- Phase 2: High-altitude cruise calibrated automatically by distance
     local curPos = car.PrimaryPart.Position
     local remaining = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(curPos.X, 0, curPos.Z)).Magnitude
     local lastTime = os.clock()
@@ -784,6 +798,55 @@ local function glideVehicleTo(car, targetPos, maxSpeed, onProgress)
     end
 
     return true
+end
+
+-- ======================================================================
+-- RING HANDOVER WAITER WITH ANTI-CHEAT TIME LOCK
+-- Enforces server minimum road duration + mandatory 6s hold (t.STILL = 6)
+-- ======================================================================
+local function waitForRingHandover(statusCallback, minSafeDuration, legStartTime)
+    local Net = getNet()
+    local waitStart = os.clock()
+    legStartTime = legStartTime or waitStart
+    minSafeDuration = minSafeDuration or 0
+    local confirmed = false
+
+    -- 1. If car reached ring faster than minimum server time, hold safely in ring until time clears
+    local legElapsed = os.clock() - legStartTime
+    if legElapsed < minSafeDuration then
+        while os.clock() - legStartTime < minSafeDuration do
+            local left = math.max(0, math.ceil(minSafeDuration - (os.clock() - legStartTime)))
+            if statusCallback then
+                statusCallback(string.format("Calibrating safe transit... (%ds left)", left))
+            end
+            task.wait(0.5)
+        end
+    end
+
+    -- 2. Keep vehicle stationary inside ring. In Drive Life: t.STILL = 6 (requires 6s still hold)
+    waitStart = os.clock()
+    for i = 1, 16 do
+        task.wait(0.5)
+        local elapsed = os.clock() - waitStart
+        if statusCallback then
+            statusCallback(string.format("Parking in ring... (%ds / 7s)", math.floor(elapsed)))
+        end
+        local s = Net and Net.State()
+        if not (s and s.mission) then
+            confirmed = true
+            break
+        end
+        if elapsed >= 7.5 then
+            break
+        end
+    end
+
+    task.wait(0.8)
+    if Net then
+        Net.Call("go")
+    end
+    refreshBusiness()
+    return confirmed
 end
 
 local function runOneCustomer()
@@ -876,20 +939,300 @@ local function runOneCustomer()
             task.wait(0.5)
         end
 
+        local legStart = os.clock()
+        local calSpeed, minSafeDuration = calculateTransitCalibration(car.PrimaryPart.Position, dest, m)
         pcall(function() player:RequestStreamAroundAsync(dest) end)
-        glideVehicleTo(car, dest, 235, function(left, total, eta)
-            local statusStr = string.format("Delivering order: %d studs left (ETA: %ds)...", math.floor(left), eta)
+        glideVehicleTo(car, dest, calSpeed, function(left, total, eta)
+            local statusStr = string.format("Delivering order: %d studs left (ETA: %ds, calibrated)...", math.floor(left), eta)
             customersToggle.SetStatus(statusStr, C_GREEN)
             setAutoStatus(statusStr, C_GREEN)
-        end)
-        task.wait(2.5)
+        end, m)
+        waitForRingHandover(function(txt)
+            customersToggle.SetStatus(txt, C_GREEN)
+            setAutoStatus(txt, C_GREEN)
+        end, minSafeDuration, legStart)
     end
 
-    Net.Call("go")
-    refreshBusiness()
     setAutoStatus("Client order completed successfully!", C_GREEN)
     customersToggle.SetStatus("Order fulfilled for " .. cName, C_GREEN)
     return true
+end
+
+-- ======================================================================
+-- VEHICLE & BAY ACTION HELPERS
+-- ======================================================================
+local function getBusinessCar()
+    local vehFolder = workspace:FindFirstChild("Vehicles")
+    if not vehFolder then return nil end
+    local car = vehFolder:FindFirstChild(player.Name .. " - Business")
+        or vehFolder:FindFirstChild(player.Name .. " - Service")
+        or vehFolder:FindFirstChild(player.Name .. " - Project")
+        or vehFolder:FindFirstChild(player.Name .. " - Auction")
+        or vehFolder:FindFirstChild(player.Name)
+    if car then return car end
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum and hum.SeatPart and hum.SeatPart:IsA("VehicleSeat") then
+        return hum.SeatPart:FindFirstAncestorOfClass("Model")
+    end
+    for _, v in ipairs(vehFolder:GetChildren()) do
+        if v.Name:find(player.Name) then
+            return v
+        end
+    end
+    return nil
+end
+
+local function callBayAction(action, slot, arg2, arg3)
+    local Net = getNet()
+    if not Net then return nil end
+
+    local function invoke(s)
+        if arg3 ~= nil then
+            return Net.Call(action, s, arg2, arg3)
+        elseif arg2 ~= nil then
+            return Net.Call(action, s, arg2)
+        else
+            return Net.Call(action, s)
+        end
+    end
+
+    local res = invoke(slot)
+    if res and res.ok then return res end
+
+    -- Try numeric slot if passed string like "B2"
+    local num = tonumber(tostring(slot):match("%d+"))
+    if num and num ~= slot then
+        local resNum = invoke(num)
+        if resNum and resNum.ok then return resNum end
+    end
+
+    -- Try string format "B" .. num if passed numeric
+    if type(slot) == "number" then
+        local strSlot = "B" .. slot
+        local resStr = invoke(strSlot)
+        if resStr and resStr.ok then return resStr end
+    end
+
+    return res
+end
+
+-- ======================================================================
+-- BUYER SPECIFICATION CUSTOMIZATION (PAINT, RIMS, WASH, PLATE, REPAIRS)
+-- Extracts what the buyer wants (e.g. Silver paint, Gold rims, Clean)
+-- ======================================================================
+local function getWantedPicks(slot, bayData)
+    local picks = { wash = true }
+    local Net = getNet()
+    local s = Net and Net.State()
+
+    -- Resolve bayData if not provided or incomplete
+    if not bayData and s and s.bays then
+        local num = tonumber(tostring(slot):match("%d+"))
+        bayData = s.bays[slot] or (num and s.bays[num]) or (num and s.bays["B" .. num])
+    end
+
+    local spec = bayData and (bayData.spec or bayData.order or bayData.collectorSpec or bayData.wanted or bayData.prep)
+
+    -- Try Office.MakeSpec if no spec present
+    if (not spec or not next(spec)) and ReplicatedStorage:FindFirstChild("Office") then
+        pcall(function()
+            local Office_m = require(ReplicatedStorage.Office)
+            if Office_m and Office_m.MakeSpec then
+                local carId = bayData and (bayData.car or bayData.display or bayData.model)
+                spec = Office_m.MakeSpec(carId, "collector")
+            end
+        end)
+    end
+
+    if spec then
+        -- Direct spec extraction
+        if spec.paint then
+            if type(spec.paint) == "table" then
+                picks.paint = spec.paint.id or spec.paint.word or spec.paint.name or spec.paint[1]
+            else
+                picks.paint = tostring(spec.paint)
+            end
+        end
+
+        if spec.rims then
+            if type(spec.rims) == "table" then
+                picks.rims = spec.rims.id or spec.rims.word or spec.rims.name or spec.rims[1]
+            else
+                picks.rims = tostring(spec.rims)
+            end
+        end
+
+        if spec.plate then
+            if type(spec.plate) == "table" then
+                picks.plate = spec.plate.text or spec.plate.plate or spec.plate[1]
+            else
+                picks.plate = tostring(spec.plate)
+            end
+        end
+
+        if spec.wash ~= nil or spec.clean ~= nil or spec.washed ~= nil then
+            picks.wash = (spec.wash ~= false and spec.clean ~= false and spec.washed ~= false)
+        else
+            picks.wash = true
+        end
+
+        -- Parse via Office.SpecLines if available for extra accuracy
+        pcall(function()
+            local Office_m = require(ReplicatedStorage.Office)
+            if Office_m and Office_m.SpecLines then
+                local lines = Office_m.SpecLines(spec, bayData and bayData.look)
+                for _, line in ipairs(lines or {}) do
+                    if line.kind == "paint" and line.id then
+                        picks.paint = line.id
+                    elseif line.kind == "rims" and line.id then
+                        picks.rims = line.id
+                    elseif line.kind == "plate" and line.text then
+                        picks.plate = line.text
+                    elseif line.kind == "wash" then
+                        picks.wash = true
+                    end
+                end
+            end
+        end)
+    end
+
+    -- Scrape active PREP UI in PlayerGui if open or visible (matches user's screen)
+    pcall(function()
+        local pg = player:FindFirstChild("PlayerGui")
+        if not pg then return end
+        for _, desc in ipairs(pg:GetDescendants()) do
+            if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+                local txt = desc.Text or ""
+                local lower = txt:lower()
+
+                -- Check for paint: e.g. "Silver paint" or "Pick a Silver paint to meet the spec" or "PICK SILVER"
+                local paintMatch = txt:match("([%a%s]+)%s+[Pp]aint") or txt:match("Pick a%s+([%a%s]+)%s+paint") or txt:match("^PICK%s+([%a%s]+)")
+                if paintMatch and not picks.paint then
+                    local pClean = paintMatch:gsub("^%s+", ""):gsub("%s+$", "")
+                    if pClean ~= "" and pClean:lower() ~= "pick" and pClean:lower() ~= "done" then
+                        picks.paint = pClean:lower()
+                    end
+                end
+
+                -- Check for rims: e.g. "Gold rims" or "Pick a Gold rim"
+                local rimsMatch = txt:match("([%a%s]+)%s+[Rr]ims") or txt:match("Pick a%s+([%a%s]+)%s+rim")
+                if rimsMatch and not picks.rims then
+                    local rClean = rimsMatch:gsub("^%s+", ""):gsub("%s+$", "")
+                    if rClean ~= "" then
+                        picks.rims = rClean:lower()
+                    end
+                end
+
+                -- Check for wash: "Clean" or "Wash"
+                if lower == "clean" or lower:find("clean") or lower:find("wash zone") then
+                    picks.wash = true
+                end
+            end
+        end
+    end)
+
+    return picks, spec
+end
+
+-- Detects any deliverable car in the business bays (contract, repo, lease, project)
+local function getDeliverableBayCar(s)
+    if not s or not s.bays then return nil end
+    local maxBays = tonumber(s.bayCount) or 6
+    for i = 1, maxBays do
+        local slotCandidates = { "B" .. i, i, tostring(i) }
+        for _, candidate in ipairs(slotCandidates) do
+            local bayData = s.bays[candidate]
+            if bayData and (bayData.car or bayData.display or bayData.model or bayData.state or bayData.kind) then
+                if bayData.kind ~= "service" then
+                    return candidate, bayData
+                end
+            end
+        end
+    end
+    -- Fallback: iterate all keys in s.bays
+    for slotKey, bayData in pairs(s.bays) do
+        if type(bayData) == "table" and (bayData.car or bayData.display or bayData.model or bayData.state or bayData.kind) then
+            if bayData.kind ~= "service" then
+                return slotKey, bayData
+            end
+        end
+    end
+    return nil
+end
+
+local function customizeCarToBuyerSpec(slot, bayData)
+    local Net = getNet()
+    if not Net then return false, "No Net" end
+    local s = Net.State()
+
+    local numSlot = tonumber(tostring(slot):match("%d+"))
+    local strSlot = "B" .. (numSlot or slot)
+    bayData = bayData or (s.bays and (s.bays[slot] or (numSlot and s.bays[numSlot]) or s.bays[strSlot]))
+    if not bayData or not (bayData.car or bayData.display or bayData.model) then
+        return false, "No car in bay " .. tostring(slot)
+    end
+
+    local carName = tostring(bayData.display or bayData.car or slot)
+
+    -- If car needs rim/suspension work, move to a bay with a lift
+    local lifts = s.lifts or {}
+    if not (lifts[slot] or (numSlot and lifts[numSlot]) or lifts[strSlot]) then
+        for liftSlot, _ in pairs(lifts) do
+            local numLift = tonumber(tostring(liftSlot):match("%d+"))
+            if not (s.bays and (s.bays[liftSlot] or (numLift and s.bays[numLift]))) then
+                callBayAction("moveBay", slot, liftSlot)
+                task.wait(0.4)
+                slot = liftSlot
+                s = Net.State()
+                numSlot = tonumber(tostring(slot):match("%d+"))
+                strSlot = "B" .. (numSlot or slot)
+                bayData = s.bays and (s.bays[slot] or (numSlot and s.bays[numSlot]) or s.bays[strSlot])
+                break
+            end
+        end
+    end
+
+    -- 1. Restore all mechanical faults (rims, engine, exhaust, suspension, bodywork)
+    callBayAction("restore", slot, "all")
+    task.wait(0.25)
+
+    -- 2. Repair care to 100%
+    callBayAction("repair", slot)
+    task.wait(0.25)
+
+    -- 3. Extract buyer's wanted customization picks
+    local wantedPicks, spec = getWantedPicks(slot, bayData)
+
+    -- 4. If interactive PREP UI buttons are visible on screen, click any "PICK ..." buttons
+    pcall(function()
+        local pg = player:FindFirstChild("PlayerGui")
+        if not pg then return end
+        for _, btn in ipairs(pg:GetDescendants()) do
+            if btn:IsA("TextButton") and btn.Visible then
+                local bText = btn.Text or ""
+                if bText:match("^PICK%s+") then
+                    if firesignal then
+                        firesignal(btn.MouseButton1Click)
+                        firesignal(btn.Activated)
+                    end
+                end
+            end
+        end
+    end)
+
+    -- 5. Apply all customizations: Paint, Rims, Plate, Wash
+    local prepRes = callBayAction("prepAll", slot, wantedPicks)
+    task.wait(1.5)
+
+    local details = {}
+    if wantedPicks.paint then table.insert(details, "Paint: " .. tostring(wantedPicks.paint)) end
+    if wantedPicks.rims then table.insert(details, "Rims: " .. tostring(wantedPicks.rims)) end
+    if wantedPicks.wash then table.insert(details, "Clean") end
+    if wantedPicks.plate then table.insert(details, "Plate: " .. tostring(wantedPicks.plate)) end
+
+    local desc = #details > 0 and table.concat(details, ", ") or "Buyer Spec"
+    return true, desc, slot
 end
 
 local function sellAndDeliverToCollector(slot)
@@ -897,63 +1240,95 @@ local function sellAndDeliverToCollector(slot)
     if not Net then return false, "No Net" end
 
     local s = Net.State()
-    local bay = s.bays and s.bays[slot]
-    if not bay or not bay.car then
+    local m = s and s.mission
+
+    -- If a sell mission is already active, deliver it directly!
+    if m and m.dest and (m.buyer or m.destName or m.kind == "sell") then
+        local carName = tostring(m.display or m.car or "Vehicle")
+        local dest = Vector3.new(m.dest[1], m.dest[2] + 2, m.dest[3])
+        local car = getBusinessCar()
+        local seat = car and car:FindFirstChild("DriveSeat", true)
+        local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+
+        if seat and hum and seat.Occupant ~= hum then
+            seat:Sit(hum)
+            task.wait(0.5)
+        end
+
+        local legStart = os.clock()
+        local calSpeed, minSafeDuration = calculateTransitCalibration(car.PrimaryPart.Position, dest, m)
+        pcall(function() player:RequestStreamAroundAsync(dest) end)
+        glideVehicleTo(car, dest, calSpeed, function(left, total, eta)
+            local statusStr = string.format("Delivering to Collector: %d studs left (ETA: %ds, calibrated)...", math.floor(left), eta)
+            contractsToggle.SetStatus(statusStr, C_ACCENT)
+            auctionsToggle.SetStatus(statusStr, C_ACCENT)
+            setAutoStatus(statusStr, C_ACCENT)
+        end, m)
+
+        waitForRingHandover(function(txt)
+            contractsToggle.SetStatus(txt, C_ACCENT)
+            auctionsToggle.SetStatus(txt, C_ACCENT)
+            setAutoStatus(txt, C_ACCENT)
+        end, minSafeDuration, legStart)
+        local priceEarned = m.price or 0
+        local buyerName = tostring(m.destName or m.buyer or "Collector")
+        return true, string.format("Sold %s to %s for $%s", carName, buyerName, tostring(priceEarned))
+    end
+
+    local numSlot = tonumber(tostring(slot):match("%d+"))
+    local strSlot = "B" .. (numSlot or slot)
+    local bay = s.bays and (s.bays[slot] or (numSlot and s.bays[numSlot]) or s.bays[strSlot])
+    if not bay or not (bay.car or bay.display or bay.model) then
         return false, "No car in slot " .. tostring(slot)
     end
 
     local carName = tostring(bay.display or bay.car or slot)
 
-    -- If project car, make sure it is on a bay with a car lift to allow fixing wheels/suspension
-    if bay.kind == "project" then
-        local lifts = s.lifts or {}
-        if not lifts[slot] then
-            for liftSlot, _ in pairs(lifts) do
-                if not (s.bays and s.bays[liftSlot]) then
-                    Net.Call("moveBay", slot, liftSlot)
-                    task.wait(0.4)
-                    slot = liftSlot
-                    s = Net.State()
-                    bay = s.bays and s.bays[slot]
-                    break
-                end
-            end
-        end
-
-        -- Restore all faults
-        Net.Call("restore", slot, "all")
-        task.wait(0.3)
+    -- Fully customize to buyer's requested spec (paint, rims, wash, restore, repair)
+    local okCust, custSuccess, custDesc, actualSlot = pcall(customizeCarToBuyerSpec, slot, bay)
+    if okCust and custSuccess and actualSlot then
+        slot = actualSlot
     end
-
-    -- Repair care to 100% and prep
-    Net.Call("repair", slot)
-    Net.Call("prepAll", slot, {})
-    task.wait(0.4)
+    task.wait(1.5)
 
     -- Start sell mission to highest paying buyer: "collector" (+30%)
-    -- Fallbacks: "dealer" (+15%), then "private"
-    local sellRes = Net.Call("sell", slot, "collector")
-    if not (sellRes and sellRes.ok) then
-        sellRes = Net.Call("sell", slot, "dealer")
-    end
-    if not (sellRes and sellRes.ok) then
-        sellRes = Net.Call("sell", slot, "private")
+    -- Retry if server returns "One moment..." due to transaction cooldown
+    local sellRes
+    for attempt = 1, 4 do
+        sellRes = callBayAction("sell", slot, "collector")
+        if not (sellRes and sellRes.ok) then
+            sellRes = callBayAction("sell", slot, "dealer")
+        end
+        if not (sellRes and sellRes.ok) then
+            sellRes = callBayAction("sell", slot, "private")
+        end
+
+        if sellRes and sellRes.ok then
+            break
+        end
+
+        if type(sellRes) == "table" and sellRes.message == "One moment..." then
+            contractsToggle.SetStatus("Server busy (" .. tostring(sellRes.message) .. "), waiting to sell...", Color3.fromRGB(241, 196, 15))
+            task.wait(1.8)
+        else
+            break
+        end
     end
 
     if not sellRes or not sellRes.ok then
         return false, (type(sellRes) == "table" and sellRes.message) or "Could not start sale"
     end
 
-    task.wait(0.8)
+    task.wait(1.0)
     s = Net.State()
-    local m = s.mission
+    m = s.mission
     if not m or not m.dest then
         return false, "Sell mission did not initialize"
     end
 
-    -- Deliver car to buyer destination ring
+    -- Deliver car to buyer destination ring safely
     local dest = Vector3.new(m.dest[1], m.dest[2] + 2, m.dest[3])
-    local car = workspace.Vehicles:FindFirstChild(player.Name .. " - Business")
+    local car = getBusinessCar()
     local seat = car and car:FindFirstChild("DriveSeat", true)
     local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 
@@ -962,18 +1337,21 @@ local function sellAndDeliverToCollector(slot)
         task.wait(0.5)
     end
 
+    local legStart = os.clock()
+    local calSpeed, minSafeDuration = calculateTransitCalibration(car.PrimaryPart.Position, dest, m)
     pcall(function() player:RequestStreamAroundAsync(dest) end)
-    glideVehicleTo(car, dest, 235, function(left, total, eta)
-        local statusStr = string.format("Delivering to Collector: %d studs left (ETA: %ds)...", math.floor(left), eta)
+    glideVehicleTo(car, dest, calSpeed, function(left, total, eta)
+        local statusStr = string.format("Delivering to Collector: %d studs left (ETA: %ds, calibrated)...", math.floor(left), eta)
+        contractsToggle.SetStatus(statusStr, C_ACCENT)
         auctionsToggle.SetStatus(statusStr, C_ACCENT)
         setAutoStatus(statusStr, C_ACCENT)
-    end)
+    end, m)
 
-    -- Hold still inside ring for 2.5s for server validation
-    task.wait(2.5)
-
-    Net.Call("go")
-    refreshBusiness()
+    waitForRingHandover(function(txt)
+        contractsToggle.SetStatus(txt, C_ACCENT)
+        auctionsToggle.SetStatus(txt, C_ACCENT)
+        setAutoStatus(txt, C_ACCENT)
+    end, minSafeDuration, legStart)
     local priceEarned = m.price or 0
     local buyerName = tostring(m.destName or m.buyer or "Collector")
     return true, string.format("Sold %s to %s for $%s", carName, buyerName, tostring(priceEarned))
@@ -1123,45 +1501,24 @@ local function runOneContract()
             task.wait(0.5)
         end
 
+        local legStart = os.clock()
+        local calSpeed, minSafeDuration = calculateTransitCalibration(car.PrimaryPart.Position, dest, m)
         pcall(function() player:RequestStreamAroundAsync(dest) end)
-        glideVehicleTo(car, dest, 235, function(left, total, eta)
-            local statusStr = string.format("Retrieving vehicle: %d studs left (ETA: %ds)...", math.floor(left), eta)
+        glideVehicleTo(car, dest, calSpeed, function(left, total, eta)
+            local statusStr = string.format("Retrieving vehicle: %d studs left (ETA: %ds, calibrated)...", math.floor(left), eta)
             contractsToggle.SetStatus(statusStr, Color3.fromRGB(52, 152, 219))
             setAutoStatus(statusStr, Color3.fromRGB(52, 152, 219))
-        end)
-        task.wait(2.5)
+        end, m)
+        waitForRingHandover(function(txt)
+            contractsToggle.SetStatus(txt, Color3.fromRGB(52, 152, 219))
+            setAutoStatus(txt, Color3.fromRGB(52, 152, 219))
+        end, minSafeDuration, legStart)
     end
 
-    Net.Call("go")
-
-    -- Clean up, restore & repair all bays
-    for slot = 1, 6 do
-        Net.Call("restore", slot)
-        Net.Call("repair", slot)
-        Net.Call("prepAll", slot, {})
-    end
-
-    refreshBusiness()
-
-    -- If contract resulted in a car stored in the garage, sell to highest buyer (the Collector)
-    s = Net.State()
-    local soldMsg = nil
-    if s and s.bays then
-        for sSlot, bayData in pairs(s.bays) do
-            if bayData and bayData.car and bayData.kind ~= "service" and (not autoAuctionsActive or bayData.kind ~= "project") then
-                contractsToggle.SetStatus("Delivering " .. tostring(bayData.display or bayData.car) .. " to Collector (+30%)...", C_ACCENT)
-                local okSell, sold, msg = pcall(sellAndDeliverToCollector, sSlot)
-                if okSell and sold then
-                    soldMsg = msg
-                end
-                break
-            end
-        end
-    end
-
-    setAutoStatus("Contract completed & profit collected!", C_GREEN)
-    contractsToggle.SetStatus(soldMsg or ("Delivered " .. tostring(best and best.display or "Vehicle") .. " (+$" .. tostring(maxProfit) .. ")"), C_GREEN)
-    return true
+    local carName = tostring(best and best.display or "Vehicle")
+    setAutoStatus("Car retrieved to garage: " .. carName, C_GREEN)
+    contractsToggle.SetStatus("Retrieved to garage: " .. carName .. " (+$" .. tostring(maxProfit) .. ")", C_GREEN)
+    return true, "retrieved", carName, maxProfit
 end
 
 local function runAuctionCycle()
@@ -1196,41 +1553,69 @@ local function runAuctionCycle()
 
     for _, lot in ipairs(lots) do
         -- Skip if we are currently the leading bidder
-        local amLeading = (lot.you == true) or (lot.leader == player.Name)
+        local amLeading = (lot.you == true) or (lot.leader == player.Name) or (lot.aiLeads == false and lot.you == true)
         if not amLeading then
             local step = tonumber(lot.step) or 2000
             local price = tonumber(lot.price) or 0
             local nextBid = price + step
             local worth = tonumber(lot.worth) or 0
-            local maxBid = math.min(nextBid + 2 * step, worth)
+            local collectorRev = math.floor(worth * 1.3) -- Collector pays +30% when restored
+            local maxBid = math.min(nextBid + 2 * step, collectorRev)
 
-            -- Compute complete restoration fee for this car
-            local fixCost = tonumber(lot.fixKnown) or (tonumber(lot.fixSeen) or 0)
-            if lot.faults and type(lot.faults) == "table" then
-                local faultSum = 0
-                for _, f in ipairs(lot.faults) do
-                    faultSum = faultSum + (tonumber(f.cost) or 0)
+            -- Check preliminary viability before inspecting full vehicle report
+            local estMinFix = tonumber(lot.fixKnown) or (tonumber(lot.fixSeen) or 0)
+            local prelimProfit = collectorRev - nextBid - estMinFix
+            local prelimNeeded = maxBid + estMinFix
+
+            if prelimProfit >= 8000 and cash >= prelimNeeded then
+                -- Full Vehicle Report Inspection:
+                -- If hidden faults exist and not yet reported, check the full report to reveal exact costs
+                if (tonumber(lot.hidden) or 0) > 0 and not lot.reported then
+                    local repCost = tonumber(lot.report) or 0
+                    if cash >= (prelimNeeded + repCost) then
+                        auctionsToggle.SetStatus("Checking full report for " .. tostring(lot.display) .. " ($" .. repCost .. ")...", C_ACCENT)
+                        local repRes = Net.Call("report", lot.tier)
+                        if repRes and repRes.auctions and repRes.auctions.lots then
+                            for _, updatedLot in ipairs(repRes.auctions.lots) do
+                                if updatedLot.key == lot.key or updatedLot.tier == lot.tier then
+                                    lot = updatedLot
+                                    break
+                                end
+                            end
+                        end
+                    end
                 end
-                fixCost = math.max(fixCost, faultSum)
-            end
 
-            -- Total required: Max possible bid + complete restoration & repair fees
-            local totalNeeded = maxBid + fixCost
-            local estProfit = worth - nextBid - fixCost
-
-            -- Must have enough cash left over to pay for BOTH the car AND all restoration fees!
-            if cash >= totalNeeded and estProfit >= 10000 then
-                if estProfit > bestProfit then
-                    bestProfit = estProfit
-                    bestLot = lot
-                    bestNextBid = nextBid
-                    bestMaxBid = maxBid
-                    bestFixCost = fixCost
+                -- Compute exact full restoration fee from unlocked vehicle report
+                local fixCost = tonumber(lot.fixKnown)
+                if not fixCost or fixCost == 0 then
+                    local faultSum = 0
+                    if lot.faults and type(lot.faults) == "table" then
+                        for _, f in ipairs(lot.faults) do
+                            faultSum = faultSum + (tonumber(f.cost) or 0)
+                        end
+                    end
+                    fixCost = math.max(faultSum, tonumber(lot.fixSeen) or 0)
                 end
-            elseif estProfit >= 10000 and (cash < totalNeeded) then
-                if not unaffordableCandidate or totalNeeded < minAffordableGap then
-                    minAffordableGap = totalNeeded
-                    unaffordableCandidate = lot
+
+                -- Total required: Max possible bid + complete restoration & repair fees
+                local totalNeeded = maxBid + fixCost
+                local actualProfit = collectorRev - nextBid - fixCost
+
+                -- Must have enough cash left over to pay for BOTH the car AND all restoration fees!
+                if cash >= totalNeeded and actualProfit >= 8000 then
+                    if actualProfit > bestProfit then
+                        bestProfit = actualProfit
+                        bestLot = lot
+                        bestNextBid = nextBid
+                        bestMaxBid = maxBid
+                        bestFixCost = fixCost
+                    end
+                elseif actualProfit >= 8000 and (cash < totalNeeded) then
+                    if not unaffordableCandidate or totalNeeded < minAffordableGap then
+                        minAffordableGap = totalNeeded
+                        unaffordableCandidate = lot
+                    end
                 end
             end
         end
@@ -1317,10 +1702,12 @@ local function fixAllBays()
                 end
             else
                 -- Contract or other vehicle
-                Net.Call("repair", slot)
-                Net.Call("prepAll", slot, {})
+                callBayAction("restore", slot, "all")
+                callBayAction("repair", slot)
+                local wantedPicks = getWantedPicks(slot, bay)
+                callBayAction("prepAll", slot, wantedPicks)
                 fixedAny = true
-                table.insert(actions, carName .. " (Repaired)")
+                table.insert(actions, carName .. " (Restored, Repaired & Prepped)")
             end
         end
     end
@@ -1427,56 +1814,105 @@ task.spawn(function()
         local hasActiveMission = s and s.mission ~= nil
 
         -- -------------------------------------------------------------
-        -- PRIORITY 1: AUTO CONTRACTS
-        -- (Must finish all board contracts first. Yields only when board has 0 untaken offers)
+        -- PRIORITY 1: AUTO CONTRACTS (BATCH RETRIEVAL -> CUSTOMIZE -> DELIVER)
         -- -------------------------------------------------------------
         local contractsHasWork = false
         local nextBoardTime = 0
         local untakenContracts = 0
 
         if autoContractsActive then
-            if hasActiveMission and not (s.mission.buyer or s.mission.destName) then
-                contractsHasWork = true
-            elseif slots.isFull then
-                contractsToggle.SetStatus(string.format("Bays full (%d/%d) • Contracts paused", slots.occupied, slots.total), Color3.fromRGB(241, 196, 15))
-                contractsHasWork = false
+            if hasActiveMission and (s.mission.buyer or s.mission.destName or s.mission.kind == "sell") then
+                contractsHasWork = "deliver_sale_in_progress"
+            elseif hasActiveMission and not (s.mission.buyer or s.mission.destName) then
+                contractsHasWork = "retrieve_in_progress"
             else
                 local untaken, nextRefresh = checkContractBoard()
                 untakenContracts = untaken
                 nextBoardTime = nextRefresh
-                local serverTime = workspace:GetServerTimeNow()
-                local secsLeft = math.max(0, math.floor(nextBoardTime - serverTime))
-                local timeStr = string.format("%d:%02d", secsLeft // 60, secsLeft % 60)
 
-                if untaken > 0 then
-                    contractsHasWork = true
-                else
-                    contractsToggle.SetStatus(string.format("Board cleared (0 left) • Yielding to Auctions • Next in %s", timeStr), Color3.fromRGB(52, 152, 219))
+                -- Check if any deliverable contract car is inside the business bays
+                -- (Prioritizes cars already inside the business regardless of manual or auto retrieval!)
+                local deliverSlot, deliverData = getDeliverableBayCar(s)
+
+                if deliverSlot and deliverData then
+                    -- Bay car detected! Customize to buyer spec and deliver to Collector (+30%) REGARDLESS!
+                    contractsHasWork = "deliver_bay_car"
+                elseif not slots.isFull and untaken > 0 then
+                    -- Bays open and contracts available on board -> retrieve next contract
+                    contractsHasWork = "retrieve_next"
+                elseif untaken == 0 and not deliverSlot then
+                    -- Board cleared & garage bays empty -> yield to Priority 2 (Auctions)
+                    local serverTime = workspace:GetServerTimeNow()
+                    local secsLeft = math.max(0, math.floor(nextBoardTime - serverTime))
+                    local timeStr = string.format("%d:%02d", secsLeft // 60, secsLeft % 60)
+                    contractsToggle.SetStatus(string.format("Board cleared (0 left) • Yielding to Auctions • New in %s", timeStr), Color3.fromRGB(52, 152, 219))
                     contractsHasWork = false
                 end
             end
         end
 
-        if contractsHasWork then
-            -- CONTRACTS RUNS! Priority 2 (Auctions) and Priority 3 (Customers) yield.
-            if autoAuctionsActive then
-                auctionsToggle.SetStatus("Queued (Priority 2) • Waiting for Contracts to finish board", C_MUTED)
-            end
-            if autoCustomersActive then
-                customersToggle.SetStatus("Queued (Priority 3) • Waiting for Contracts to finish", C_MUTED)
-            end
+        if contractsHasWork == "deliver_sale_in_progress" then
+            if autoAuctionsActive then auctionsToggle.SetStatus("Queued (Priority 2) • Waiting for Contracts delivery", C_MUTED) end
+            if autoCustomersActive then customersToggle.SetStatus("Queued (Priority 3) • Waiting for Contracts delivery", C_MUTED) end
 
+            contractsToggle.SetStatus("Delivering active sale car to Collector (+30%)...", C_ACCENT)
+            setAutoStatus("Delivering active sale car to Collector...", C_ACCENT)
+            missionBusy = true
+            local okSell, sold, msg = pcall(sellAndDeliverToCollector, s.mission.slot or "B1")
+            missionBusy = false
+
+            if okSell and sold then
+                contractsToggle.SetStatus("Sold to Collector (+30%)!", C_GREEN)
+                setAutoStatus("Sold to Collector (+30%)", C_GREEN)
+                task.wait(2)
+            else
+                contractsToggle.SetStatus("Sale: " .. tostring(msg), Color3.fromRGB(241, 196, 15))
+                task.wait(3)
+            end
+            continue
+        elseif contractsHasWork == "retrieve_next" or contractsHasWork == "retrieve_in_progress" then
+            if autoAuctionsActive then auctionsToggle.SetStatus("Queued (Priority 2) • Waiting for Contracts batch", C_MUTED) end
+            if autoCustomersActive then customersToggle.SetStatus("Queued (Priority 3) • Waiting for Contracts batch", C_MUTED) end
+
+            contractsToggle.SetStatus(string.format("Filling Garage (%d/%d bays) • Retrieving contract car...", slots.occupied, slots.total), C_ACCENT)
             missionBusy = true
             local ok, success, code, extra = pcall(runOneContract)
             missionBusy = false
-            boardCache.checkedAt = 0 -- refresh board state immediately
+            boardCache.checkedAt = 0
 
-            if ok and success then
-                task.wait(1.5)
-            else
-                task.wait(2.5)
-            end
+            task.wait(1.5)
             continue
+        elseif contractsHasWork == "deliver_bay_car" then
+            if autoAuctionsActive then auctionsToggle.SetStatus("Queued (Priority 2) • Waiting for Contracts delivery", C_MUTED) end
+            if autoCustomersActive then customersToggle.SetStatus("Queued (Priority 3) • Waiting for Contracts delivery", C_MUTED) end
+
+            local targetSlot, targetData = getDeliverableBayCar(s)
+            if targetSlot and targetData then
+                local carName = tostring(targetData.display or targetData.car or targetSlot)
+
+                -- 1. Customize to buyer's requested spec (paint, rims, wash, plate, restore faults, repair)
+                contractsToggle.SetStatus("Customizing " .. carName .. " in " .. tostring(targetSlot) .. " to Buyer Spec...", Color3.fromRGB(241, 196, 15))
+                setAutoStatus("Customizing " .. carName .. " to buyer specifications...", Color3.fromRGB(241, 196, 15))
+                local okCust, custSuccess, custDesc, actualSlot = pcall(customizeCarToBuyerSpec, targetSlot, targetData)
+                actualSlot = (okCust and custSuccess and actualSlot) or targetSlot
+
+                -- 2. Deliver to The Collector (+30%)
+                contractsToggle.SetStatus("Delivering " .. carName .. " to Collector (+30%)...", C_ACCENT)
+                setAutoStatus("Delivering " .. carName .. " to Collector...", C_ACCENT)
+                missionBusy = true
+                local okSell, sold, msg = pcall(sellAndDeliverToCollector, actualSlot)
+                missionBusy = false
+
+                if okSell and sold then
+                    contractsToggle.SetStatus("Sold " .. carName .. " to Collector (+30%)! (" .. tostring(custDesc) .. ")", C_GREEN)
+                    setAutoStatus("Sold " .. carName .. " to Collector (+30%)", C_GREEN)
+                    task.wait(2)
+                else
+                    contractsToggle.SetStatus("Sale: " .. tostring(msg), Color3.fromRGB(241, 196, 15))
+                    task.wait(3)
+                end
+                continue
+            end
         end
 
         -- -------------------------------------------------------------
@@ -1607,7 +2043,34 @@ createButton(bizAutoCard, "🏷️ Bid Best Lot", Color3.fromRGB(241, 196, 15), 
     task.spawn(runAuctionCycle)
 end)
 
-createButton(bizAutoCard, "🛠️ Restore & Clean All Bays", Color3.fromRGB(45, 52, 70), UDim2.new(0, 14, 0, 284), UDim2.new(0, 226, 0, 28), function()
+createButton(bizAutoCard, "💎 Prep & Sell Bay Car to Collector (+30%)", Color3.fromRGB(46, 204, 113), UDim2.new(0, 14, 0, 282), UDim2.new(1, -28, 0, 28), function()
+    task.spawn(function()
+        if missionBusy then
+            setAutoStatus("System busy with another task", Color3.fromRGB(241, 196, 15))
+            return
+        end
+        local Net = getNet()
+        if not Net then return end
+        local s = Net.State()
+        local baySlot, bayData = getDeliverableBayCar(s)
+        if not baySlot then
+            setAutoStatus("No deliverable cars found in business bays", Color3.fromRGB(241, 196, 15))
+            return
+        end
+        local carName = tostring(bayData.display or bayData.car or baySlot)
+        setAutoStatus("Prepping & delivering " .. carName .. " to Collector (+30%)...", C_ACCENT)
+        missionBusy = true
+        local ok, sold, msg = pcall(sellAndDeliverToCollector, baySlot)
+        missionBusy = false
+        if ok and sold then
+            setAutoStatus(tostring(msg), C_GREEN)
+        else
+            setAutoStatus("Delivery: " .. tostring(msg), Color3.fromRGB(231, 76, 60))
+        end
+    end)
+end)
+
+createButton(bizAutoCard, "🛠️ Restore & Clean All Bays", Color3.fromRGB(45, 52, 70), UDim2.new(0, 14, 0, 316), UDim2.new(0, 226, 0, 28), function()
     task.spawn(function()
         local ok, success, detail = pcall(fixAllBays)
         refreshBusiness()
@@ -1619,7 +2082,7 @@ createButton(bizAutoCard, "🛠️ Restore & Clean All Bays", Color3.fromRGB(45,
     end)
 end)
 
-createButton(bizAutoCard, "🛑 Cancel Active Mission", Color3.fromRGB(192, 57, 43), UDim2.new(0, 248, 0, 284), UDim2.new(0, 228, 0, 28), function()
+createButton(bizAutoCard, "🛑 Cancel Active Mission", Color3.fromRGB(192, 57, 43), UDim2.new(0, 248, 0, 316), UDim2.new(0, 228, 0, 28), function()
     local Net = getNet()
     if Net then
         Net.Call("cancel")
@@ -1637,7 +2100,7 @@ autoHelpText.TextSize = 10
 autoHelpText.TextColor3 = C_MUTED
 autoHelpText.TextXAlignment = Enum.TextXAlignment.Left
 autoHelpText.TextWrapped = true
-autoHelpText.Position = UDim2.new(0, 14, 0, 320)
+autoHelpText.Position = UDim2.new(0, 14, 0, 352)
 autoHelpText.Size = UDim2.new(1, -28, 0, 48)
 autoHelpText.BackgroundTransparency = 1
 autoHelpText.Parent = bizAutoCard
