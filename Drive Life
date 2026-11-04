@@ -1725,14 +1725,14 @@ local function sellAndDeliverToCollector(slot, skipCustomize)
         pcall(function() player:RequestStreamAroundAsync(dest) end)
         glideVehicleTo(car, dest, calSpeed, function(left, total, eta)
             local statusStr = string.format("Delivering to Collector: %d studs left (ETA: %ds, calibrated)...", math.floor(left), eta)
-            contractsToggle.SetStatus(statusStr, C_ACCENT)
-            auctionsToggle.SetStatus(statusStr, C_ACCENT)
+            if autoContractsActive then contractsToggle.SetStatus(statusStr, C_ACCENT) end
+            if autoAuctionsActive then auctionsToggle.SetStatus(statusStr, C_ACCENT) end
             setAutoStatus(statusStr, C_ACCENT)
         end, m)
 
         waitForRingHandover(function(txt)
-            contractsToggle.SetStatus(txt, C_ACCENT)
-            auctionsToggle.SetStatus(txt, C_ACCENT)
+            if autoContractsActive then contractsToggle.SetStatus(txt, C_ACCENT) end
+            if autoAuctionsActive then auctionsToggle.SetStatus(txt, C_ACCENT) end
             setAutoStatus(txt, C_ACCENT)
         end, minSafeDuration, legStart)
         local priceEarned = m.price or 0
@@ -2048,105 +2048,162 @@ local function runOneContract()
     return true, "retrieved", carName, maxProfit
 end
 
+-- ======================================================================
+-- FREE FULL VEHICLE REPORT & AI DEALER RESERVE CALCULATOR ($0 COST)
+-- Uses ReplicatedStorage.Office.Project.Lot deterministic RNG seed to
+-- compute exact hidden engine faults & AI dealer top bid locally for FREE!
+-- ======================================================================
+local function getLotFixCost(lot)
+    local exactFix = tonumber(lot.fixKnown)
+    local aiTop = nil
+
+    -- 1. Simulate the exact lot locally via ReplicatedStorage.Office.Project.Lot ($0 cost!)
+    pcall(function()
+        local off = ReplicatedStorage:FindFirstChild("Office")
+        local projMod = off and off:FindFirstChild("Project")
+        if projMod and lot.tier and lot.n and lot.worth then
+            local Project_m = require(projMod)
+            local sim = Project_m.Lot(tostring(lot.tier), tonumber(lot.n), {
+                { name = tostring(lot.car or lot.display or "Car"), price = tonumber(lot.worth) }
+            })
+            if sim then
+                if tonumber(sim.fix) and tonumber(sim.fix) > 0 then
+                    exactFix = tonumber(sim.fix)
+                end
+                if sim.ai and sim.ai[1] and tonumber(sim.ai[1].top) then
+                    aiTop = tonumber(sim.ai[1].top)
+                end
+            end
+        end
+    end)
+
+    -- 2. Fallback if simulation not available
+    if not exactFix or exactFix == 0 then
+        local faultSum = 0
+        if lot.faults and type(lot.faults) == "table" then
+            for _, f in ipairs(lot.faults) do
+                faultSum = faultSum + (tonumber(f.cost) or 0)
+            end
+        end
+        exactFix = math.max(faultSum, tonumber(lot.fixSeen) or 0)
+    end
+
+    return exactFix, aiTop
+end
+
+local function getGarageUnfixedReserve(s)
+    local reserve = 0
+    local unfixedCarName = nil
+    if s and s.bays then
+        for _, bay in pairs(s.bays) do
+            if type(bay) == "table" and bay.kind == "project" and type(bay.faults) == "table" then
+                local carUnfixed = 0
+                for _, f in ipairs(bay.faults) do
+                    if type(f) == "table" and f.state ~= "fixed" and f.fixed ~= true then
+                        carUnfixed = carUnfixed + (tonumber(f.cost) or 0)
+                    end
+                end
+                if carUnfixed > 0 then
+                    reserve = reserve + carUnfixed
+                    unfixedCarName = unfixedCarName or tostring(bay.display or bay.car or "Project Car")
+                end
+            end
+        end
+    end
+    return reserve, unfixedCarName
+end
+
 local function runAuctionCycle()
     local Net = getNet()
     if not Net then return false, "No Net" end
 
     -- Check if car slots are full before bidding
-    local slots = getBaySlots()
+    local s = Net.State()
+    local slots = getBaySlots(s)
     if slots.isFull then
         local msg = string.format("All bays full (%d/%d) • Bidding paused", slots.occupied, slots.total)
         auctionsToggle.SetStatus(msg, Color3.fromRGB(241, 196, 15))
         return false, msg
     end
 
+    local leaderstats = player:FindFirstChild("leaderstats")
+    local cashObj = leaderstats and (leaderstats:FindFirstChild("Cash") or leaderstats:FindFirstChild("Money"))
+    local cash = cashObj and cashObj.Value or 0
+
+    -- 1. Reserve cash required to restore any unfixed project cars already sitting in garage bays!
+    local garageFixReserve, unfixedBayCar = getGarageUnfixedReserve(s)
+    if garageFixReserve > cash then
+        local shortfall = garageFixReserve - cash
+        local msg = string.format("Reserved $%d to fix %s • Need $%d more cash before bidding", garageFixReserve, tostring(unfixedBayCar), shortfall)
+        auctionsToggle.SetStatus(msg, Color3.fromRGB(241, 196, 15))
+        return false, msg
+    end
+
+    local officeLvl = tonumber(s and s.officeLevel) or 1
     local res = Net.Call("auctions")
     local lots = res and (res.lots or (res.auctions and res.auctions.lots))
     if not lots or #lots == 0 then
         return false, "No active auction lots"
     end
 
-    local leaderstats = player:FindFirstChild("leaderstats")
-    local cashObj = leaderstats and (leaderstats:FindFirstChild("Cash") or leaderstats:FindFirstChild("Money"))
-    local cash = cashObj and cashObj.Value or 999999999
+    -- 2. Also reserve the exact fix cost for any auction lot we are ALREADY leading (lot.you == true)
+    local leadingFixReserve = 0
+    local leadingSummary = {}
+    for _, lot in ipairs(lots) do
+        local amLeading = (lot.you == true) or (lot.leader == player.Name) or (lot.aiLeads == false and lot.you == true)
+        if amLeading then
+            local lFix = getLotFixCost(lot)
+            leadingFixReserve = leadingFixReserve + lFix
+            local endsLeft = (tonumber(lot.ends) or 0) - workspace:GetServerTimeNow()
+            table.insert(leadingSummary, string.format("%s @ $%d ($%d fix reserved, %ds)", tostring(lot.display), tonumber(lot.price) or 0, lFix, math.max(0, math.ceil(endsLeft))))
+        end
+    end
 
-    local bestLot = nil
-    local bestProfit = 0
-    local bestNextBid = 0
-    local bestMaxBid = 0
-    local bestFixCost = 0
+    -- True free cash available for new bids after locking garage + leading-lot fix reserves
+    local availableCash = math.max(0, cash - garageFixReserve - leadingFixReserve)
+
+    local candidates = {}
     local minAffordableGap = 0
     local unaffordableCandidate = nil
 
     for _, lot in ipairs(lots) do
-        -- Check rarity filter (Common, Rare, Epic, Legendary)
         local tier = tostring(lot.tier or lot.rarity or "common"):lower()
-        if auctionRarityAllowed[tier] == false then
-            continue
-        end
+        local reqLvl = tonumber(lot.level) or 1
+        local endsLeft = (tonumber(lot.ends) or 0) - workspace:GetServerTimeNow()
 
-        -- Skip if we are currently the leading bidder
-        local amLeading = (lot.you == true) or (lot.leader == player.Name) or (lot.aiLeads == false and lot.you == true)
-        if not amLeading then
-            local step = tonumber(lot.step) or 2000
-            local price = tonumber(lot.price) or 0
-            local nextBid = price + step
-            local worth = tonumber(lot.worth) or 0
-            local collectorRev = math.floor(worth * 1.3) -- Collector pays +30% when restored
-            local maxBid = math.min(nextBid + 2 * step, collectorRev)
+        if auctionRarityAllowed[tier] ~= false and officeLvl >= reqLvl and endsLeft > 0 then
+            local amLeading = (lot.you == true) or (lot.leader == player.Name) or (lot.aiLeads == false and lot.you == true)
+            if not amLeading then
+                local step = tonumber(lot.step) or 2000
+                local price = tonumber(lot.price) or 0
+                local nextBid = price + step
+                local worth = tonumber(lot.worth) or 0
+                local collectorRev = math.floor(worth * 1.3)
 
-            -- Check preliminary viability before inspecting full vehicle report
-            local estMinFix = tonumber(lot.fixKnown) or (tonumber(lot.fixSeen) or 0)
-            local prelimProfit = collectorRev - nextBid - estMinFix
-            local prelimNeeded = maxBid + estMinFix
+                -- Calculate exact full restoration cost (including hidden engine faults) for FREE!
+                local exactFixCost, aiTop = getLotFixCost(lot)
 
-            if prelimProfit >= 8000 and cash >= prelimNeeded then
-                -- Full Vehicle Report Inspection:
-                -- If hidden faults exist and not yet reported, check the full report to reveal exact costs
-                if (tonumber(lot.hidden) or 0) > 0 and not lot.reported then
-                    local repCost = tonumber(lot.report) or 0
-                    if cash >= (prelimNeeded + repCost) then
-                        auctionsToggle.SetStatus("Checking full report for " .. tostring(lot.display) .. " ($" .. repCost .. ")...", C_ACCENT)
-                        local repRes = Net.Call("report", lot.tier)
-                        if repRes and repRes.auctions and repRes.auctions.lots then
-                            for _, updatedLot in ipairs(repRes.auctions.lots) do
-                                if updatedLot.key == lot.key or updatedLot.tier == lot.tier then
-                                    lot = updatedLot
-                                    break
-                                end
-                            end
-                        end
-                    end
+                -- Effective price needed to beat AI dealer if AI leads
+                local effectiveBid = nextBid
+                if lot.aiLeads and aiTop and aiTop >= nextBid then
+                    effectiveBid = aiTop + step
                 end
 
-                -- Compute exact full restoration fee from unlocked vehicle report
-                local fixCost = tonumber(lot.fixKnown)
-                if not fixCost or fixCost == 0 then
-                    local faultSum = 0
-                    if lot.faults and type(lot.faults) == "table" then
-                        for _, f in ipairs(lot.faults) do
-                            faultSum = faultSum + (tonumber(f.cost) or 0)
-                        end
-                    end
-                    fixCost = math.max(faultSum, tonumber(lot.fixSeen) or 0)
-                end
+                local estProfit = collectorRev - effectiveBid - exactFixCost
+                local totalNeeded = effectiveBid + exactFixCost
 
-                -- Total required: Max possible bid + complete restoration & repair fees
-                local totalNeeded = maxBid + fixCost
-                local actualProfit = collectorRev - nextBid - fixCost
-
-                -- Must have enough cash left over to pay for BOTH the car AND all restoration fees!
-                if cash >= totalNeeded and actualProfit >= 8000 then
-                    if actualProfit > bestProfit then
-                        bestProfit = actualProfit
-                        bestLot = lot
-                        bestNextBid = nextBid
-                        bestMaxBid = maxBid
-                        bestFixCost = fixCost
-                    end
-                elseif actualProfit >= 8000 and (cash < totalNeeded) then
-                    if not unaffordableCandidate or totalNeeded < minAffordableGap then
-                        minAffordableGap = totalNeeded
+                -- STRICT RESERVE CHECK: availableCash must cover BOTH the winning bid AND 100% of exactFixCost!
+                if estProfit >= 8000 and availableCash >= totalNeeded then
+                    table.insert(candidates, {
+                        lot = lot,
+                        prelimProfit = estProfit,
+                        fixCost = exactFixCost,
+                        aiTop = aiTop
+                    })
+                elseif (collectorRev - nextBid - exactFixCost) >= 8000 and availableCash < totalNeeded then
+                    local requiredCash = totalNeeded + garageFixReserve + leadingFixReserve
+                    if not unaffordableCandidate or requiredCash < minAffordableGap then
+                        minAffordableGap = requiredCash
                         unaffordableCandidate = lot
                     end
                 end
@@ -2154,20 +2211,119 @@ local function runAuctionCycle()
         end
     end
 
-    if bestLot then
-        local statusTxt = string.format("Bidding %s ($%d bid + $%d fix reserve)...", tostring(bestLot.display), bestNextBid, bestFixCost)
-        auctionsToggle.SetStatus(statusTxt, C_ACCENT)
-        local bidRes = Net.Call("bid", bestLot.tier, bestNextBid, bestMaxBid)
-        if bidRes and bidRes.ok then
-            local msg = string.format("Leading: %s @ $%d (+$%d profit | $%d fix reserved)", tostring(bestLot.display), bestNextBid, bestProfit, bestFixCost)
-            setAutoStatus(msg, C_GREEN)
-            auctionsToggle.SetStatus(msg, C_GREEN)
-            return true, msg
-        else
-            local errMsg = (type(bidRes) == "table" and bidRes.message) or "Bid failed"
-            auctionsToggle.SetStatus(errMsg, Color3.fromRGB(241, 196, 15))
-            return false, errMsg
+    -- Sort highest exact profit first (Legendary -> Epic -> Rare -> Common)
+    table.sort(candidates, function(a, b)
+        return a.prelimProfit > b.prelimProfit
+    end)
+
+    for _, cand in ipairs(candidates) do
+        local lot = cand.lot
+        local fixCost = cand.fixCost
+        local aiTop = cand.aiTop
+
+        -- Bid loop (never buys report; strictly guarantees post-win cash >= fixCost + existing reserves)
+        for counterRound = 1, 5 do
+            cash = (cashObj and cashObj.Value) or cash
+            availableCash = math.max(0, cash - garageFixReserve - leadingFixReserve)
+
+            local step = tonumber(lot.step) or 2000
+            local price = tonumber(lot.price) or 0
+            local nextBid = price + step
+            local worth = tonumber(lot.worth) or 0
+            local collectorRev = math.floor(worth * 1.3)
+
+            local maxProfitableBid = collectorRev - fixCost - 8000
+            local maxAffordableBid = availableCash - fixCost
+            local ceiling = math.min(maxProfitableBid, maxAffordableBid, worth)
+
+            -- Never bid if nextBid or AI reserve exceeds maxAffordableBid (guarantees fixCost is 100% left over!)
+            if nextBid > ceiling then
+                if (collectorRev - nextBid - fixCost) >= 8000 and nextBid > maxAffordableBid then
+                    local reqTotal = nextBid + fixCost + garageFixReserve + leadingFixReserve
+                    if not unaffordableCandidate or reqTotal < minAffordableGap then
+                        minAffordableGap = reqTotal
+                        unaffordableCandidate = lot
+                    end
+                end
+                break
+            end
+
+            if lot.aiLeads and aiTop and (aiTop + step) > ceiling then
+                if (collectorRev - (aiTop + step) - fixCost) >= 8000 and (aiTop + step) > maxAffordableBid then
+                    local reqTotal = (aiTop + step) + fixCost + garageFixReserve + leadingFixReserve
+                    if not unaffordableCandidate or reqTotal < minAffordableGap then
+                        minAffordableGap = reqTotal
+                        unaffordableCandidate = lot
+                    end
+                end
+                break
+            end
+
+            local targetMax = nextBid + 3 * step
+            if lot.aiLeads and aiTop and (aiTop + step) <= ceiling then
+                targetMax = math.max(targetMax, aiTop + step)
+            end
+            -- Strictly clamp maxBid <= ceiling (which is <= availableCash - fixCost)
+            local maxBid = math.min(targetMax, ceiling)
+
+            local actualProfit = collectorRev - nextBid - fixCost
+            if actualProfit < 8000 or maxBid < nextBid or (maxBid + fixCost) > availableCash then
+                break
+            end
+
+            local statusTxt = string.format("Bidding %s ($%d bid | $%d fix reserved)...", tostring(lot.display), nextBid, fixCost)
+            auctionsToggle.SetStatus(statusTxt, C_ACCENT)
+
+            local bidRes
+            for bidTry = 1, 3 do
+                bidRes = Net.Call("bid", lot.tier, nextBid, maxBid)
+                if bidRes and bidRes.ok then
+                    break
+                end
+                local bMsg = type(bidRes) == "table" and tostring(bidRes.message or "") or ""
+                if bMsg == "One moment..." or bMsg:lower():find("moment") then
+                    task.wait(1.2)
+                else
+                    break
+                end
+            end
+
+            -- Update lot from response if provided
+            if type(bidRes) == "table" and bidRes.auctions and bidRes.auctions.lots then
+                for _, updatedLot in ipairs(bidRes.auctions.lots) do
+                    if updatedLot.key == lot.key or updatedLot.tier == lot.tier then
+                        lot = updatedLot
+                        break
+                    end
+                end
+            end
+
+            if bidRes and bidRes.ok then
+                local leadPrice = tonumber(lot.price) or nextBid
+                local leadProfit = collectorRev - leadPrice - fixCost
+                local msg = string.format("Leading: %s @ $%d (+$%d profit | $%d fix reserved)", tostring(lot.display), leadPrice, leadProfit, fixCost)
+                setAutoStatus(msg, C_GREEN)
+                auctionsToggle.SetStatus(msg, C_GREEN)
+                return true, msg
+            else
+                local errMsg = (type(bidRes) == "table" and tostring(bidRes.message or "")) or "Bid failed"
+                -- If AI dealer counter-bid ("came straight back"), wait 1.1s and step up bid in next counterRound!
+                if errMsg:find("came straight back", 1, true) or (lot.aiLeads and not lot.you and (tonumber(lot.price) or 0) > price) then
+                    auctionsToggle.SetStatus("Dealer counter-bid on " .. tostring(lot.display) .. " ($" .. tostring(lot.price) .. "), stepping up...", Color3.fromRGB(241, 196, 15))
+                    task.wait(1.1)
+                else
+                    auctionsToggle.SetStatus(errMsg, Color3.fromRGB(241, 196, 15))
+                    task.wait(1.0)
+                    break
+                end
+            end
         end
+    end
+
+    if #leadingSummary > 0 then
+        local msg = "Leading: " .. table.concat(leadingSummary, " • ")
+        auctionsToggle.SetStatus(msg, C_GREEN)
+        return true, msg
     end
 
     if unaffordableCandidate then
@@ -2176,7 +2332,9 @@ local function runAuctionCycle()
         return false, msg
     end
 
-    return false, "Watching lots (no profitable lots within full restoration budget)"
+    local watchMsg = "Watching lots (no profitable lots within full restoration budget)"
+    auctionsToggle.SetStatus(watchMsg, C_MUTED)
+    return false, watchMsg
 end
 
 local function fixAllBays()
@@ -2577,11 +2735,19 @@ task.spawn(function()
         -- -------------------------------------------------------------
         local auctionsHasWork = false
         local deliverableAuctionCars = getAllDeliverableBayCars(s, "project")
-        local projectCand = deliverableAuctionCars[1]
+        local projectCand = nil
+        for _, cand in ipairs(deliverableAuctionCars) do
+            if not cand.onCooldown and cand.canAffordFix then
+                projectCand = cand
+                break
+            end
+        end
         local projectBay = projectCand and projectCand.slot
 
         if autoAuctionsActive then
-            if projectBay then
+            if hasActiveMission and (s.mission.buyer or s.mission.destName or s.mission.kind == "sell") then
+                auctionsHasWork = "deliver_sale_in_progress"
+            elseif projectBay then
                 auctionsHasWork = true
             elseif not slots.isFull then
                 auctionsHasWork = true
@@ -2591,7 +2757,20 @@ task.spawn(function()
             end
         end
 
-        if auctionsHasWork then
+        if auctionsHasWork == "deliver_sale_in_progress" then
+            missionBusy = true
+            auctionsToggle.SetStatus("Delivering active auction sale car to Collector (+30%)...", C_ACCENT)
+            local okSell, sold, msg = pcall(sellAndDeliverToCollector, s.mission.slot or "B1", true)
+            missionBusy = false
+            if okSell and sold then
+                auctionsToggle.SetStatus(tostring(msg), C_GREEN)
+                task.wait(2)
+            else
+                auctionsToggle.SetStatus("Sale: " .. tostring(msg), Color3.fromRGB(241, 196, 15))
+                task.wait(2)
+            end
+            continue
+        elseif auctionsHasWork then
             -- Sub-step A: If a won project car is in a garage bay, restore and sell to Collector (+30%)
             if projectBay then
                 if autoCustomersActive then
@@ -2606,24 +2785,21 @@ task.spawn(function()
                 if ok and sold then
                     auctionsToggle.SetStatus(tostring(msg), C_GREEN)
                     task.wait(2)
+                    continue
                 else
                     slotSellCooldown[tostring(projectBay)] = os.clock() + 25
                     auctionsToggle.SetStatus(tostring(projectBay) .. " Sale: " .. tostring(msg), Color3.fromRGB(241, 196, 15))
-                    task.wait(2)
+                    task.wait(1.5)
                 end
-                continue
             end
 
-            -- Sub-step B: Evaluate and bid on auction lots
-            local okBid, bidSuccess, bidMsg = pcall(runAuctionCycle)
-            if okBid and bidSuccess then
-                -- Successfully placed a bid or leading lot
-                task.wait(3.5)
-                continue
-            else
-                -- No profitable lot or already leading all lots!
-                -- If Customers is active, yield so it can serve clients while waiting on auction lots
-                if autoCustomersActive then
+            -- Sub-step B: Evaluate and bid on auction lots if bays have space
+            if not slots.isFull then
+                local okBid, bidSuccess, bidMsg = pcall(runAuctionCycle)
+                if okBid and bidSuccess then
+                    task.wait(3.5)
+                    continue
+                elseif autoCustomersActive then
                     auctionsToggle.SetStatus(tostring(bidMsg) .. " • Yielding to Customers", Color3.fromRGB(241, 196, 15))
                 end
             end
