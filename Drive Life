@@ -12,18 +12,33 @@ local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
 
--- Clean up previous instance if running
+-- Clean up previous instance & background loops if running
+if _G.DriveLifeHub_Cleanup then
+    pcall(_G.DriveLifeHub_Cleanup)
+end
+
 local existing = game:GetService("CoreGui"):FindFirstChild("DriveLifeHub_UI") 
     or (player:FindFirstChild("PlayerGui") and player.PlayerGui:FindFirstChild("DriveLifeHub_UI"))
 if existing then
     existing:Destroy()
 end
 
+local hubAlive = true
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "DriveLifeHub_UI"
 screenGui.ResetOnSpawn = false
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.DisplayOrder = 100
+
+_G.DriveLifeHub_Cleanup = function()
+    hubAlive = false
+    if screenGui and screenGui.Parent then
+        screenGui:Destroy()
+    end
+end
+screenGui.Destroying:Connect(function()
+    hubAlive = false
+end)
 
 pcall(function()
     screenGui.Parent = game:GetService("CoreGui")
@@ -213,6 +228,7 @@ sidebar.BorderSizePixel = 0
 sidebar.Parent = main
 
 local sidebarLayout = Instance.new("UIListLayout")
+sidebarLayout.SortOrder = Enum.SortOrder.LayoutOrder
 sidebarLayout.Padding = UDim.new(0, 6)
 sidebarLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
 sidebarLayout.Parent = sidebar
@@ -222,6 +238,121 @@ sidebarPadding.PaddingTop = UDim.new(0, 12)
 sidebarPadding.PaddingLeft = UDim.new(0, 8)
 sidebarPadding.PaddingRight = UDim.new(0, 8)
 sidebarPadding.Parent = sidebar
+
+-- ======================================================================
+-- MULTI-LAYER ANTI-AFK SYSTEM (ALWAYS ACTIVE BY DEFAULT)
+-- 1. Disables internal Roblox Idled connections via getconnections
+-- 2. Intercepts player.Idled via VirtualUser controller capture
+-- 3. Proactive 60s background heartbeat pulse
+-- ======================================================================
+local VirtualUser = game:GetService("VirtualUser")
+local antiAfkEnabled = true
+local antiAfkPulses = 0
+
+local function disableInternalIdledConnections()
+    pcall(function()
+        local gc = getconnections or get_signal_cons
+        if gc then
+            for _, conn in ipairs(gc(player.Idled)) do
+                if conn.Disable then
+                    conn:Disable()
+                elseif conn.Disconnect then
+                    conn:Disconnect()
+                end
+            end
+        end
+    end)
+end
+disableInternalIdledConnections()
+
+local sidebarDivider = Instance.new("Frame")
+sidebarDivider.Name = "AntiAfkDivider"
+sidebarDivider.Size = UDim2.new(1, -8, 0, 1)
+sidebarDivider.BackgroundColor3 = C_STROKE
+sidebarDivider.BorderSizePixel = 0
+sidebarDivider.LayoutOrder = 9
+sidebarDivider.Parent = sidebar
+
+local antiAfkBtn = Instance.new("TextButton")
+antiAfkBtn.Name = "AntiAfkToggle"
+antiAfkBtn.Text = "🛡️ Anti-AFK: ON"
+antiAfkBtn.Font = Enum.Font.GothamBold
+antiAfkBtn.TextSize = 12
+antiAfkBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+antiAfkBtn.BackgroundColor3 = C_GREEN
+antiAfkBtn.Size = UDim2.new(1, 0, 0, 34)
+antiAfkBtn.LayoutOrder = 10
+antiAfkBtn.Parent = sidebar
+
+local antiAfkCorner = Instance.new("UICorner")
+antiAfkCorner.CornerRadius = UDim.new(0, 6)
+antiAfkCorner.Parent = antiAfkBtn
+
+local antiAfkStatus = Instance.new("TextLabel")
+antiAfkStatus.Name = "AntiAfkStatus"
+antiAfkStatus.Text = "20m Kick Blocked • 0 pulses"
+antiAfkStatus.Font = Enum.Font.Gotham
+antiAfkStatus.TextSize = 10
+antiAfkStatus.TextColor3 = C_MUTED
+antiAfkStatus.BackgroundTransparency = 1
+antiAfkStatus.Size = UDim2.new(1, 0, 0, 16)
+antiAfkStatus.LayoutOrder = 11
+antiAfkStatus.Parent = sidebar
+
+local function sendAntiAfkPulse(reason)
+    if not antiAfkEnabled then return end
+    disableInternalIdledConnections()
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        local cf = (cam and cam.CFrame) or CFrame.new()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.zero, cf)
+    end)
+    antiAfkPulses = antiAfkPulses + 1
+    if antiAfkStatus and antiAfkStatus.Parent then
+        antiAfkStatus.Text = string.format("%s • %d pulse%s", reason or "Active", antiAfkPulses, antiAfkPulses == 1 and "" or "s")
+        antiAfkStatus.TextColor3 = C_GREEN
+    end
+end
+
+antiAfkBtn.MouseButton1Click:Connect(function()
+    antiAfkEnabled = not antiAfkEnabled
+    if antiAfkEnabled then
+        antiAfkBtn.Text = "🛡️ Anti-AFK: ON"
+        antiAfkBtn.BackgroundColor3 = C_GREEN
+        antiAfkBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        sendAntiAfkPulse("Enabled")
+    else
+        antiAfkBtn.Text = "🛡️ Anti-AFK: OFF"
+        antiAfkBtn.BackgroundColor3 = Color3.fromRGB(45, 50, 60)
+        antiAfkBtn.TextColor3 = C_MUTED
+        antiAfkStatus.Text = "Protection paused"
+        antiAfkStatus.TextColor3 = C_MUTED
+    end
+end)
+
+local idledConn = player.Idled:Connect(function()
+    if not hubAlive then return end
+    if antiAfkEnabled then
+        sendAntiAfkPulse("Blocked Idle")
+    end
+end)
+screenGui.Destroying:Connect(function()
+    pcall(function() idledConn:Disconnect() end)
+end)
+
+task.spawn(function()
+    task.wait(2)
+    if hubAlive and antiAfkEnabled then
+        sendAntiAfkPulse("Protected")
+    end
+    while hubAlive do
+        task.wait(55)
+        if hubAlive and antiAfkEnabled then
+            sendAntiAfkPulse("Protected")
+        end
+    end
+end)
 
 local content = Instance.new("Frame")
 content.Name = "Content"
@@ -1179,7 +1310,7 @@ end)
 
 -- Continuous background safety loop (every 0.3s)
 task.spawn(function()
-    while true do
+    while hubAlive do
         task.wait(0.3)
         if autoEjectOwnedActive then
             pcall(checkPlayerSeat)
@@ -1213,9 +1344,23 @@ local function getBusinessCar()
     return nil
 end
 
+local function resolveBayKey(slot, s)
+    s = s or (getNet() and getNet().State())
+    local num = tonumber(tostring(slot):match("%d+"))
+    local strSlot = num and ("B" .. num) or tostring(slot)
+    if s and s.bays then
+        if s.bays[strSlot] then return strSlot end
+        if s.bays[slot] then return slot end
+        if num and s.bays[num] then return num end
+    end
+    return strSlot
+end
+
 local function callBayAction(action, slot, arg2, arg3)
     local Net = getNet()
     if not Net then return nil end
+
+    local targetSlot = resolveBayKey(slot)
 
     local function invoke(s)
         if arg3 ~= nil then
@@ -1227,21 +1372,17 @@ local function callBayAction(action, slot, arg2, arg3)
         end
     end
 
-    local res = invoke(slot)
-    if res and res.ok then return res end
-
-    -- Try numeric slot if passed string like "B2"
-    local num = tonumber(tostring(slot):match("%d+"))
-    if num and num ~= slot then
-        local resNum = invoke(num)
-        if resNum and resNum.ok then return resNum end
-    end
-
-    -- Try string format "B" .. num if passed numeric
-    if type(slot) == "number" then
-        local strSlot = "B" .. slot
-        local resStr = invoke(strSlot)
-        if resStr and resStr.ok then return resStr end
+    local res
+    for attempt = 1, 3 do
+        res = invoke(targetSlot)
+        if res and res.ok then
+            return res
+        end
+        if type(res) == "table" and res.message == "One moment..." then
+            task.wait(1.1)
+        else
+            break
+        end
     end
 
     return res
@@ -1249,118 +1390,56 @@ end
 
 -- ======================================================================
 -- BUYER SPECIFICATION CUSTOMIZATION (PAINT, RIMS, WASH, PLATE, REPAIRS)
--- Extracts what the buyer wants (e.g. Silver paint, Gold rims, Clean)
+-- Extracts exact spec values (HEX paint, rim finish ID, plate, wash)
+-- that are still needed according to ReplicatedStorage.Office
 -- ======================================================================
 local function getWantedPicks(slot, bayData)
-    local picks = { wash = true }
+    local picks = {}
     local Net = getNet()
     local s = Net and Net.State()
+    local targetSlot = resolveBayKey(slot, s)
 
-    -- Resolve bayData if not provided or incomplete
-    if not bayData and s and s.bays then
-        local num = tonumber(tostring(slot):match("%d+"))
-        bayData = s.bays[slot] or (num and s.bays[num]) or (num and s.bays["B" .. num])
+    if s and s.bays and s.bays[targetSlot] then
+        bayData = s.bays[targetSlot]
+    end
+    if not bayData then
+        return picks, nil
     end
 
-    local spec = bayData and (bayData.spec or bayData.order or bayData.collectorSpec or bayData.wanted or bayData.prep)
+    local spec = bayData.spec or bayData.order or bayData.collectorSpec or bayData.wanted or bayData.prep
+    local look = bayData.look or {}
 
-    -- Try Office.MakeSpec if no spec present
-    if (not spec or not next(spec)) and ReplicatedStorage:FindFirstChild("Office") then
-        pcall(function()
-            local Office_m = require(ReplicatedStorage.Office)
-            if Office_m and Office_m.MakeSpec then
-                local carId = bayData and (bayData.car or bayData.display or bayData.model)
-                spec = Office_m.MakeSpec(carId, "collector")
-            end
-        end)
-    end
-
-    if spec then
-        -- Direct spec extraction
+    if spec and type(spec) == "table" then
+        -- 1. Paint (exact 6-char HEX string from spec.paint)
         if spec.paint then
-            if type(spec.paint) == "table" then
-                picks.paint = spec.paint.id or spec.paint.word or spec.paint.name or spec.paint[1]
-            else
-                picks.paint = tostring(spec.paint)
+            local wantedPaint = type(spec.paint) == "table" and (spec.paint.hex or spec.paint.id or spec.paint[1]) or tostring(spec.paint)
+            if wantedPaint and string.upper(tostring(look.paint or "")) ~= string.upper(tostring(wantedPaint)) then
+                picks.paint = tostring(wantedPaint)
             end
         end
 
-        if spec.rims then
-            if type(spec.rims) == "table" then
-                picks.rims = spec.rims.id or spec.rims.word or spec.rims.name or spec.rims[1]
-            else
-                picks.rims = tostring(spec.rims)
+        -- 2. Rims (exact finish id from spec.rims, only if bayData.rimsOk is true)
+        if spec.rims and bayData.rimsOk ~= false then
+            local wantedRims = type(spec.rims) == "table" and (spec.rims.id or spec.rims[1]) or tostring(spec.rims)
+            if wantedRims and tostring(look.rims or "stock") ~= tostring(wantedRims) then
+                picks.rims = tostring(wantedRims)
             end
         end
 
+        -- 3. Plate (exact text from spec.plate)
         if spec.plate then
-            if type(spec.plate) == "table" then
-                picks.plate = spec.plate.text or spec.plate.plate or spec.plate[1]
-            else
-                picks.plate = tostring(spec.plate)
+            local wantedPlate = type(spec.plate) == "table" and (spec.plate.text or spec.plate.plate or spec.plate[1]) or tostring(spec.plate)
+            if wantedPlate and tostring(look.plate or "") ~= tostring(wantedPlate) then
+                picks.plate = tostring(wantedPlate)
             end
         end
 
-        if spec.wash ~= nil or spec.clean ~= nil or spec.washed ~= nil then
-            picks.wash = (spec.wash ~= false and spec.clean ~= false and spec.washed ~= false)
-        else
+        -- 4. Wash (boolean)
+        local wantsWash = (spec.washed ~= false and spec.wash ~= false and spec.clean ~= false)
+        if wantsWash and look.washed ~= true then
             picks.wash = true
         end
-
-        -- Parse via Office.SpecLines if available for extra accuracy
-        pcall(function()
-            local Office_m = require(ReplicatedStorage.Office)
-            if Office_m and Office_m.SpecLines then
-                local lines = Office_m.SpecLines(spec, bayData and bayData.look)
-                for _, line in ipairs(lines or {}) do
-                    if line.kind == "paint" and line.id then
-                        picks.paint = line.id
-                    elseif line.kind == "rims" and line.id then
-                        picks.rims = line.id
-                    elseif line.kind == "plate" and line.text then
-                        picks.plate = line.text
-                    elseif line.kind == "wash" then
-                        picks.wash = true
-                    end
-                end
-            end
-        end)
     end
-
-    -- Scrape active PREP UI in PlayerGui if open or visible (matches user's screen)
-    pcall(function()
-        local pg = player:FindFirstChild("PlayerGui")
-        if not pg then return end
-        for _, desc in ipairs(pg:GetDescendants()) do
-            if desc:IsA("TextLabel") or desc:IsA("TextButton") then
-                local txt = desc.Text or ""
-                local lower = txt:lower()
-
-                -- Check for paint: e.g. "Silver paint" or "Pick a Silver paint to meet the spec" or "PICK SILVER"
-                local paintMatch = txt:match("([%a%s]+)%s+[Pp]aint") or txt:match("Pick a%s+([%a%s]+)%s+paint") or txt:match("^PICK%s+([%a%s]+)")
-                if paintMatch and not picks.paint then
-                    local pClean = paintMatch:gsub("^%s+", ""):gsub("%s+$", "")
-                    if pClean ~= "" and pClean:lower() ~= "pick" and pClean:lower() ~= "done" then
-                        picks.paint = pClean:lower()
-                    end
-                end
-
-                -- Check for rims: e.g. "Gold rims" or "Pick a Gold rim"
-                local rimsMatch = txt:match("([%a%s]+)%s+[Rr]ims") or txt:match("Pick a%s+([%a%s]+)%s+rim")
-                if rimsMatch and not picks.rims then
-                    local rClean = rimsMatch:gsub("^%s+", ""):gsub("%s+$", "")
-                    if rClean ~= "" then
-                        picks.rims = rClean:lower()
-                    end
-                end
-
-                -- Check for wash: "Clean" or "Wash"
-                if lower == "clean" or lower:find("clean") or lower:find("wash zone") then
-                    picks.wash = true
-                end
-            end
-        end
-    end)
 
     return picks, spec
 end
@@ -1494,81 +1573,130 @@ local function getDeliverableBayCar(s)
     return nil
 end
 
+local function isSpecFullyMet(bayData)
+    if not bayData or bayData.kind == "project" then
+        return true
+    end
+    local ok, met = pcall(function()
+        local Office_m = require(ReplicatedStorage.Office)
+        return Office_m.SpecMet(bayData.spec, bayData.look)
+    end)
+    if ok then
+        return met == true
+    end
+    local picks = getWantedPicks(nil, bayData)
+    return next(picks) == nil
+end
+
+local function getBayWaitLeft(bayData)
+    if not bayData or not bayData.look then return 0, nil end
+    local ok, wLeft, wWord = pcall(function()
+        local Office_m = require(ReplicatedStorage.Office)
+        return Office_m.WaitLeft(bayData.look)
+    end)
+    if ok and tonumber(wLeft) then
+        return tonumber(wLeft), wWord
+    end
+    return 0, nil
+end
+
 local function customizeCarToBuyerSpec(slot, bayData)
     local Net = getNet()
     if not Net then return false, "No Net" end
     local s = Net.State()
 
-    local numSlot = tonumber(tostring(slot):match("%d+"))
-    local strSlot = "B" .. (numSlot or slot)
-    bayData = bayData or (s.bays and (s.bays[slot] or (numSlot and s.bays[numSlot]) or s.bays[strSlot]))
+    slot = resolveBayKey(slot, s)
+    bayData = (s and s.bays and s.bays[slot]) or bayData
     if not bayData or not (bayData.car or bayData.display or bayData.model) then
         return false, "No car in bay " .. tostring(slot)
     end
 
-    local carName = tostring(bayData.display or bayData.car or slot)
-
-    -- If car needs rim/suspension work, move to a bay with a lift
+    -- If car needs rim work and current bay has no lift, move to an open bay with a lift
     local lifts = s.lifts or {}
+    local numSlot = tonumber(tostring(slot):match("%d+"))
+    local strSlot = "B" .. (numSlot or slot)
     if not (lifts[slot] or (numSlot and lifts[numSlot]) or lifts[strSlot]) then
         for liftSlot, _ in pairs(lifts) do
-            local numLift = tonumber(tostring(liftSlot):match("%d+"))
-            if not (s.bays and (s.bays[liftSlot] or (numLift and s.bays[numLift]))) then
-                callBayAction("moveBay", slot, liftSlot)
-                task.wait(0.4)
-                slot = liftSlot
+            local resolvedLift = resolveBayKey(liftSlot, s)
+            if not (s.bays and s.bays[resolvedLift]) then
+                callBayAction("moveBay", slot, resolvedLift)
+                task.wait(0.5)
                 s = Net.State()
-                numSlot = tonumber(tostring(slot):match("%d+"))
-                strSlot = "B" .. (numSlot or slot)
-                bayData = s.bays and (s.bays[slot] or (numSlot and s.bays[numSlot]) or s.bays[strSlot])
+                slot = resolvedLift
+                bayData = s and s.bays and s.bays[slot]
                 break
             end
         end
     end
 
-    -- 1. Restore all mechanical faults (rims, engine, exhaust, suspension, bodywork)
-    callBayAction("restore", slot, "all")
-    task.wait(0.25)
-
-    -- 2. Repair care to 100%
-    callBayAction("repair", slot)
-    task.wait(0.25)
-
-    -- 3. Extract buyer's wanted customization picks
-    local wantedPicks, spec = getWantedPicks(slot, bayData)
-
-    -- 4. If interactive PREP UI buttons are visible on screen, click any "PICK ..." buttons
-    pcall(function()
-        local pg = player:FindFirstChild("PlayerGui")
-        if not pg then return end
-        for _, btn in ipairs(pg:GetDescendants()) do
-            if btn:IsA("TextButton") and btn.Visible then
-                local bText = btn.Text or ""
-                if bText:match("^PICK%s+") then
-                    if firesignal then
-                        firesignal(btn.MouseButton1Click)
-                        firesignal(btn.Activated)
-                    end
-                end
+    -- 1. Restore mechanical faults ONLY if it is a project car with unfixed faults
+    if bayData and bayData.kind == "project" and type(bayData.faults) == "table" then
+        local hasUnfixed = false
+        for _, f in ipairs(bayData.faults) do
+            if type(f) == "table" and f.state ~= "fixed" and f.fixed ~= true then
+                hasUnfixed = true
+                break
             end
         end
-    end)
+        if hasUnfixed then
+            callBayAction("restore", slot, "all")
+            task.wait(0.6)
+            s = Net.State()
+            bayData = (s and s.bays and s.bays[slot]) or bayData
+        end
+    end
 
-    -- 5. Apply all customizations: Paint, Rims, Plate, Wash
-    local prepRes = callBayAction("prepAll", slot, wantedPicks)
-    task.wait(1.5)
+    -- 2. Repair care ONLY if care < 95% (Collector requires >= 95%)
+    local currentCare = tonumber(bayData and bayData.care) or 100
+    if currentCare < 95 then
+        callBayAction("repair", slot)
+        task.wait(0.6)
+        s = Net.State()
+        bayData = (s and s.bays and s.bays[slot]) or bayData
+    end
+
+    -- 3. Apply buyer's wanted customization picks ONLY for items not yet matching spec
+    local wantedPicks, spec = getWantedPicks(slot, bayData)
+    if bayData and bayData.kind ~= "project" and (not isSpecFullyMet(bayData)) and next(wantedPicks) ~= nil then
+        for prepTry = 1, 3 do
+            local prepRes = callBayAction("prepAll", slot, wantedPicks)
+            task.wait(0.8)
+            s = Net.State()
+            bayData = (s and s.bays and s.bays[slot]) or bayData
+            if (prepRes and prepRes.ok) or isSpecFullyMet(bayData) then
+                break
+            end
+            wantedPicks = getWantedPicks(slot, bayData)
+            if next(wantedPicks) == nil then
+                break
+            end
+            task.wait(0.8)
+        end
+    end
+
+    -- 4. Wait if paint is drying or rims are fitting (WaitLeft > 0)
+    local waitSec, waitWord = getBayWaitLeft(bayData)
+    while waitSec > 0 and hubAlive do
+        local wMsg = string.format("%s in %s (%ds left)...", tostring(waitWord or "PREPPING"), tostring(slot), waitSec)
+        contractsToggle.SetStatus(wMsg, Color3.fromRGB(241, 196, 15))
+        setAutoStatus(wMsg, Color3.fromRGB(241, 196, 15))
+        task.wait(1.0)
+        s = Net.State()
+        bayData = (s and s.bays and s.bays[slot]) or bayData
+        waitSec, waitWord = getBayWaitLeft(bayData)
+    end
 
     local details = {}
-    if wantedPicks.paint then table.insert(details, "Paint: " .. tostring(wantedPicks.paint)) end
-    if wantedPicks.rims then table.insert(details, "Rims: " .. tostring(wantedPicks.rims)) end
-    if wantedPicks.wash then table.insert(details, "Clean") end
-    if wantedPicks.plate then table.insert(details, "Plate: " .. tostring(wantedPicks.plate)) end
+    if spec and spec.paint then table.insert(details, "Paint: " .. tostring(spec.paint)) end
+    if spec and spec.rims then table.insert(details, "Rims: " .. tostring(spec.rims)) end
+    if spec and (spec.washed ~= false) then table.insert(details, "Clean") end
+    if spec and spec.plate then table.insert(details, "Plate: " .. tostring(spec.plate)) end
 
     local desc = #details > 0 and table.concat(details, ", ") or "Buyer Spec"
     return true, desc, slot
 end
 
-local function sellAndDeliverToCollector(slot)
+local function sellAndDeliverToCollector(slot, skipCustomize)
     local Net = getNet()
     if not Net then return false, "No Net" end
 
@@ -1612,42 +1740,75 @@ local function sellAndDeliverToCollector(slot)
         return true, string.format("Sold %s to %s for $%s", carName, buyerName, tostring(priceEarned))
     end
 
-    local numSlot = tonumber(tostring(slot):match("%d+"))
-    local strSlot = "B" .. (numSlot or slot)
-    local bay = s.bays and (s.bays[slot] or (numSlot and s.bays[numSlot]) or s.bays[strSlot])
+    slot = resolveBayKey(slot, s)
+    local bay = s and s.bays and s.bays[slot]
     if not bay or not (bay.car or bay.display or bay.model) then
         return false, "No car in slot " .. tostring(slot)
     end
 
     local carName = tostring(bay.display or bay.car or slot)
 
-    -- Fully customize to buyer's requested spec (paint, rims, wash, restore, repair)
-    local okCust, custSuccess, custDesc, actualSlot = pcall(customizeCarToBuyerSpec, slot, bay)
-    if okCust and custSuccess and actualSlot then
-        slot = actualSlot
+    -- Customize to buyer's requested spec if not already customized
+    if not skipCustomize or not isSpecFullyMet(bay) or (tonumber(bay.care) or 100) < 95 then
+        local okCust, custSuccess, custDesc, actualSlot = pcall(customizeCarToBuyerSpec, slot, bay)
+        if okCust and custSuccess and actualSlot then
+            slot = actualSlot
+        end
+        task.wait(0.6)
     end
-    task.wait(1.5)
 
-    -- Start sell mission to highest paying buyer: "collector" (+30%)
-    -- Retry if server returns "One moment..." due to transaction cooldown
+    s = Net.State()
+    bay = s and s.bays and s.bays[slot]
+    local officeLvl = tonumber(s and s.officeLevel) or 1
+
+    -- Choose highest unlocked buyer for the player's Office Level:
+    -- Level >= 7: strictly "collector" (+30%)
+    -- Level 3..6: "dealer" (+15%)
+    -- Level 1..2: "private" (+0%)
+    local preferredBuyer = (officeLvl >= 7 and "collector") or (officeLvl >= 3 and "dealer") or "private"
+
     local sellRes
-    for attempt = 1, 4 do
-        sellRes = callBayAction("sell", slot, "collector")
-        if not (sellRes and sellRes.ok) then
-            sellRes = callBayAction("sell", slot, "dealer")
-        end
-        if not (sellRes and sellRes.ok) then
-            sellRes = callBayAction("sell", slot, "private")
+    for attempt = 1, 5 do
+        s = Net.State()
+        bay = s and s.bays and s.bays[slot]
+        if bay and preferredBuyer ~= "private" then
+            if (tonumber(bay.care) or 100) < 95 then
+                callBayAction("repair", slot)
+                task.wait(0.5)
+            end
+            if not isSpecFullyMet(bay) then
+                local picks = getWantedPicks(slot, bay)
+                if next(picks) ~= nil then
+                    callBayAction("prepAll", slot, picks)
+                    task.wait(0.8)
+                end
+            end
         end
 
+        sellRes = callBayAction("sell", slot, preferredBuyer)
         if sellRes and sellRes.ok then
             break
         end
 
-        if type(sellRes) == "table" and sellRes.message == "One moment..." then
-            contractsToggle.SetStatus("Server busy (" .. tostring(sellRes.message) .. "), waiting to sell...", Color3.fromRGB(241, 196, 15))
-            task.wait(1.8)
+        local errMsg = type(sellRes) == "table" and tostring(sellRes.message or "") or ""
+        if errMsg == "One moment..." or errMsg:lower():find("moment") then
+            contractsToggle.SetStatus("Server busy (" .. errMsg .. "), retrying Collector...", Color3.fromRGB(241, 196, 15))
+            task.wait(1.4)
         else
+            -- Re-run customization once and retry preferred buyer
+            pcall(customizeCarToBuyerSpec, slot, bay)
+            task.wait(1.0)
+            sellRes = callBayAction("sell", slot, preferredBuyer)
+            if sellRes and sellRes.ok then
+                break
+            end
+            -- Only fall back if collector/dealer is genuinely locked or walked away
+            if preferredBuyer == "collector" then
+                sellRes = callBayAction("sell", slot, "dealer")
+            end
+            if not (sellRes and sellRes.ok) and officeLvl < 7 then
+                sellRes = callBayAction("sell", slot, "private")
+            end
             break
         end
     end
@@ -2279,7 +2440,7 @@ autoEjectToggle = createToggle(
 -- PRIORITY AUTOMATION COORDINATOR (1: CONTRACTS > 2: AUCTIONS > 3: CUSTOMERS)
 -- ======================================================================
 task.spawn(function()
-    while true do
+    while hubAlive do
         task.wait(0.7)
 
         -- Mutex: wait if player is physically on the road / delivering
@@ -2389,7 +2550,7 @@ task.spawn(function()
                     contractsToggle.SetStatus("Delivering " .. carName .. " in " .. tostring(actualSlot) .. " to Collector (+30%)...", C_ACCENT)
                     setAutoStatus("Delivering " .. carName .. " to Collector...", C_ACCENT)
                     missionBusy = true
-                    local okSell, sold, msg = pcall(sellAndDeliverToCollector, actualSlot)
+                    local okSell, sold, msg = pcall(sellAndDeliverToCollector, actualSlot, true)
                     missionBusy = false
 
                     if okSell and sold then
@@ -2493,7 +2654,7 @@ end)
 
 -- Background Worker 4: Auto Restore / Fix Bays
 task.spawn(function()
-    while true do
+    while hubAlive do
         if autoRestoreActive then
             local ok, success, detail = pcall(fixAllBays)
             if ok and success then
@@ -2751,35 +2912,722 @@ createButton(jobSelectCard, "▶ Start Selected Job", Color3.fromRGB(46, 204, 11
     end
 end)
 
-local jobFastFixCard = createCard(pageJobs, "Mechanic & Job Automation", 100)
-createButton(jobFastFixCard, "⚡ Instant Repair / Step Mechanic Task", C_ACCENT, UDim2.new(0, 14, 0, 32), UDim2.new(0.96, 0, 0, 30), function()
-    local mechRemotes = ReplicatedStorage:FindFirstChild("CarMechanicJob") and ReplicatedStorage.CarMechanicJob:FindFirstChild("Remotes")
-    if mechRemotes then
+local mechAutoCard = createCard(pageJobs, "🔧 Mechanic Job Automation Suite", 365)
+
+local mechInfoLabel = Instance.new("TextLabel")
+mechInfoLabel.Text = "Loading Mechanic telemetry..."
+mechInfoLabel.Font = Enum.Font.Gotham
+mechInfoLabel.TextSize = 11
+mechInfoLabel.TextColor3 = C_TEXT
+mechInfoLabel.TextXAlignment = Enum.TextXAlignment.Left
+mechInfoLabel.TextYAlignment = Enum.TextYAlignment.Top
+mechInfoLabel.Position = UDim2.new(0, 14, 0, 30)
+mechInfoLabel.Size = UDim2.new(1, -28, 0, 48)
+mechInfoLabel.BackgroundTransparency = 1
+mechInfoLabel.Parent = mechAutoCard
+
+local mechOrderLabel = Instance.new("TextLabel")
+mechOrderLabel.Text = "Order: Idle • Toggle Auto Mechanic below to start farming"
+mechOrderLabel.Font = Enum.Font.GothamMedium
+mechOrderLabel.TextSize = 11
+mechOrderLabel.TextColor3 = C_MUTED
+mechOrderLabel.TextXAlignment = Enum.TextXAlignment.Left
+mechOrderLabel.Position = UDim2.new(0, 14, 0, 82)
+mechOrderLabel.Size = UDim2.new(1, -28, 0, 18)
+mechOrderLabel.BackgroundTransparency = 1
+mechOrderLabel.Parent = mechAutoCard
+
+local autoMechanicActive = false
+local autoMechUpgradesActive = false
+local mechBusy = false
+local mechCarsFixedSession = 0
+local mechLastReceipt = "None"
+local mechComboStreak = 0
+local autoMechanicToggle
+local autoMechUpgradesToggle
+local visualBayState = nil
+
+local MECH_WORKSHOP_POS = Vector3.new(2697.5, 426.5, 1592)
+local MECH_WORKSHOP_CENTER = Vector3.new(2720, 425.5, 1580)
+
+local function setMechOrderStatus(txt, col)
+    mechOrderLabel.Text = "Order: " .. tostring(txt)
+    mechOrderLabel.TextColor3 = col or C_TEXT
+end
+
+local function getMechanicStats()
+    local mjFolder = player:FindFirstChild("mechanicJob")
+    local xpVal = mjFolder and mjFolder:FindFirstChild("XP_Value")
+    local sessVal = mjFolder and mjFolder:FindFirstChild("SessionEarnedMoney")
+    local totVal = mjFolder and mjFolder:FindFirstChild("TotalEarnedMoney")
+
+    local xp = xpVal and tonumber(xpVal.Value) or 0
+    local sessionCash = tonumber(player:GetAttribute("ShiftEarned")) or (sessVal and tonumber(sessVal.Value)) or 0
+    local totalCash = totVal and tonumber(totVal.Value) or 0
+
+    local levelNum = 1
+    local payMult = 1
+    local nextLvlXP = nil
+
+    pcall(function()
+        local cmj = ReplicatedStorage:FindFirstChild("CarMechanicJob")
+        if cmj then
+            local getLvl = require(cmj.Client.getMechanicLevel)
+            local sysSettings = require(cmj.SystemSettings)
+            local lvlKey = getLvl.getPlayerMechanicLevel(player)
+            levelNum = tonumber(tostring(lvlKey):match("%d+")) or 1
+            local curData = sysSettings.levels[lvlKey]
+            payMult = curData and tonumber(curData.moneyDobble) or 1
+            local nextData = sysSettings.levels["Level" .. (levelNum + 1)]
+            nextLvlXP = nextData and tonumber(nextData.requiredXP) or nil
+        end
+    end)
+
+    return {
+        level = levelNum,
+        xp = xp,
+        nextXP = nextLvlXP,
+        payMult = payMult,
+        sessionCash = sessionCash,
+        totalCash = totalCash
+    }
+end
+
+local function refreshMechanicTelemetry()
+    local st = getMechanicStats()
+    local xpStr = st.nextXP and string.format("%d / %d XP", st.xp, st.nextXP) or string.format("%d XP (MAX)", st.xp)
+    local comboBonus = mechComboStreak * 5
+    mechInfoLabel.Text = string.format(
+        "Level: %d (%s)  |  Pay Multiplier: x%.2f  |  Combo: x%d (+%d%%)\nShift Earned: $%d  |  Total Earned: $%d  |  Cars Fixed: %d\nLast Payout: %s",
+        st.level,
+        xpStr,
+        st.payMult,
+        mechComboStreak,
+        comboBonus,
+        st.sessionCash,
+        st.totalCash,
+        mechCarsFixedSession,
+        mechLastReceipt
+    )
+end
+
+player:GetAttributeChangedSignal("ShiftEarned"):Connect(refreshMechanicTelemetry)
+task.spawn(function()
+    local mjFolder = player:WaitForChild("mechanicJob", 5)
+    if mjFolder then
+        local xpVal = mjFolder:WaitForChild("XP_Value", 5)
+        if xpVal then
+            xpVal.Changed:Connect(refreshMechanicTelemetry)
+        end
+    end
+    refreshMechanicTelemetry()
+end)
+
+local function dismountForWorkshop()
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if hum and (hum.Sit or hum.SeatPart) then
+        local seat = hum.SeatPart
+        if seat then
+            for _, c in ipairs(seat:GetChildren()) do
+                if c:IsA("Weld") or c:IsA("WeldConstraint") or c.Name == "SeatWeld" then
+                    pcall(function() c:Destroy() end)
+                end
+            end
+        end
+        hum.Jump = true
+        hum:ChangeState(Enum.HumanoidStateType.Jumping)
+        task.wait(0.05)
+        hum.Sit = false
+        hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+        if root then
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+        task.wait(0.15)
+    end
+end
+
+local function getMechanicWorkshopBay()
+    local dlnb = workspace:FindFirstChild("DLNewBuildings")
+    local gar = dlnb and dlnb:FindFirstChild("Garage")
+    local mj = gar and gar:FindFirstChild("MechanicJob")
+    if mj then
+        return mj:FindFirstChild("Bay1") or mj:FindFirstChild("Bay2") or mj:FindFirstChild("Bay3") or mj:FindFirstChild("Bay4"), mj
+    end
+    return nil, nil
+end
+
+local function ensureAtMechanicWorkshop(forceTeleport)
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+
+    local dist = (root.Position - MECH_WORKSHOP_CENTER).Magnitude
+    if not forceTeleport and dist <= 75 then
+        return true
+    end
+
+    setMechOrderStatus("Teleporting to Mechanic Workshop...", C_ACCENT)
+    dismountForWorkshop()
+
+    pcall(function()
+        player:RequestStreamAroundAsync(MECH_WORKSHOP_CENTER, 5)
+    end)
+
+    local targetPos = MECH_WORKSHOP_POS
+    local bay1, _ = getMechanicWorkshopBay()
+    if bay1 and bay1:FindFirstChild("CarPosition") then
+        local cp = bay1.CarPosition:GetPivot().Position
+        targetPos = cp + Vector3.new(0, 2.2, 12)
+    end
+
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    root.CFrame = CFrame.new(targetPos, MECH_WORKSHOP_CENTER)
+    task.wait(0.4)
+    return (root.Position - MECH_WORKSHOP_CENTER).Magnitude <= 115
+end
+
+local function cleanupVisualBayCar()
+    if visualBayState then
         pcall(function()
-            if mechRemotes:FindFirstChild("onJobStarted") then
-                mechRemotes.onJobStarted:FireServer()
-            end
-            if mechRemotes:FindFirstChild("jobStep") then
-                mechRemotes.jobStep:FireServer()
-            end
-            if mechRemotes:FindFirstChild("taskCompleted") then
-                mechRemotes.taskCompleted:FireServer("Repair")
-            end
-            if mechRemotes:FindFirstChild("jobDone") then
-                mechRemotes.jobDone:FireServer()
+            local cmj = ReplicatedStorage:FindFirstChild("CarMechanicJob")
+            local vh = cmj and require(cmj.Client.mechanicTasks.vehicleHandler)
+            if vh and vh.removeNewVehicle then
+                vh.removeNewVehicle(visualBayState)
             end
         end)
+        pcall(function()
+            if visualBayState.newRandomCar then
+                visualBayState.newRandomCar:Destroy()
+            end
+        end)
+        visualBayState = nil
+    end
+end
+
+local function spawnVisualBayCar(carName)
+    pcall(function()
+        cleanupVisualBayCar()
+        local bay1, _ = getMechanicWorkshopBay()
+        if not bay1 or not bay1:FindFirstChild("CarPosition") then return end
+        local cmj = ReplicatedStorage:FindFirstChild("CarMechanicJob")
+        local vh = cmj and require(cmj.Client.mechanicTasks.vehicleHandler)
+        if vh and vh.parkNow then
+            visualBayState = {
+                mechanicJobFolder = bay1,
+                light = true,
+                onGoingJob = true
+            }
+            task.spawn(function()
+                pcall(vh.parkNow, visualBayState, carName)
+            end)
+        end
+    end)
+end
+
+local function stopNativeMechanicClientLoop()
+    pcall(function()
+        local cmj = ReplicatedStorage:FindFirstChild("CarMechanicJob")
+        if not cmj then return end
+        local mt = require(cmj.Client.mechanicTasks)
+        if mt and mt.current then
+            local cur = mt.current
+            cur.onGoingJob = false
+            if cur.bay then
+                pcall(function() cur.bay:Clear() end)
+            end
+            if cur.hud then
+                pcall(function() cur.hud.Destroy() end)
+            end
+            if cur.newRandomCar then
+                pcall(function() cur.newRandomCar:Destroy() end)
+            end
+            for _, c in pairs(cur.cache or {}) do
+                pcall(function() c:Disconnect() end)
+                pcall(function() c:Destroy() end)
+            end
+            mt.current = nil
+            mt.isWorking = false
+        end
+        local rt = require(cmj.Client.mechanicTasks.repairTasks)
+        if rt and rt.clearTargets then
+            pcall(rt.clearTargets)
+        end
+        local cam = workspace.CurrentCamera
+        local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+        if cam and hum then
+            cam.CameraType = Enum.CameraType.Custom
+            cam.CameraSubject = hum
+        end
+    end)
+end
+
+-- Hook Jobs3d.Run so even if native workorder runs, it auto-completes with 1.0 PERFECT score without camera lock
+pcall(function()
+    local cmj = ReplicatedStorage:FindFirstChild("CarMechanicJob")
+    local jobsMod = cmj and require(cmj:WaitForChild("Jobs"))
+    local jobs3d = cmj and require(cmj.Client.mechanicTasks.jobs3d)
+    if jobs3d and jobsMod and not jobs3d._dlHubHooked then
+        local origRun = jobs3d.Run
+        jobs3d._dlHubHooked = true
+        jobs3d.Run = function(jobId, ctx)
+            if not autoMechanicActive then
+                return origRun(jobId, ctx)
+            end
+            local jobDef = jobsMod.BY_ID[jobId]
+            if not jobDef or not ctx or not ctx.progress then
+                return origRun(jobId, ctx)
+            end
+            local startClock = os.clock()
+            local totalSteps = #jobDef.steps
+            local minDur = (tonumber(jobDef.seconds) or 30) * (tonumber(jobsMod.MIN_SHARE) or 0.85) + 0.5
+            local stepWait = math.clamp((minDur * 0.65) / math.max(1, totalSteps), 0.45, 2.2)
+
+            for i, step in ipairs(jobDef.steps) do
+                if not autoMechanicActive or (ctx.alive and not ctx.alive()) then
+                    return false
+                end
+                ensureAtMechanicWorkshop(false)
+                local score = (step.kind == "mini") and 1.0 or nil
+                setMechOrderStatus(string.format("[%s] Step %d/%d: %s (100%% PERFECT)", jobDef.name, i, totalSteps, tostring(step.label or step.action)), C_ACCENT)
+                ctx.progress(i, score)
+                task.wait(stepWait)
+            end
+
+            while autoMechanicActive and (not ctx.alive or ctx.alive()) do
+                local elapsed = os.clock() - startClock
+                local rem = minDur - elapsed
+                if rem <= 0 then break end
+                ensureAtMechanicWorkshop(false)
+                setMechOrderStatus(string.format("[%s] Finishing up... %.1fs left (Calibrated)", jobDef.name, rem), C_GREEN)
+                task.wait(math.min(0.5, rem))
+            end
+            return true
+        end
     end
 end)
 
-createButton(jobFastFixCard, "🛑 End Current Shift", C_RED, UDim2.new(0, 14, 0, 68), UDim2.new(0.96, 0, 0, 24), function()
-    local mechRemotes = ReplicatedStorage:FindFirstChild("CarMechanicJob") and ReplicatedStorage.CarMechanicJob:FindFirstChild("Remotes")
-    if mechRemotes and mechRemotes:FindFirstChild("onJobEnded") then
-        mechRemotes.onJobEnded:FireServer()
+local function ensureMechanicShiftStarted()
+    local curShift = player:GetAttribute("JobShift")
+
+    -- Clear conflicting shifts (e.g. Office Garage road mission)
+    if curShift and curShift ~= "" and curShift ~= "Mechanic" then
+        setMechOrderStatus("Ending conflicting shift (" .. tostring(curShift) .. ")...", Color3.fromRGB(241, 196, 15))
+        if curShift == "Office Garage" then
+            local rf = ReplicatedStorage:FindFirstChild("OfficeRemote")
+            if rf then
+                pcall(function() rf:InvokeServer("cancel") end)
+            end
+        end
+        for _, rName in ipairs({ "BusRemote", "TowRemote", "PizzaRemote" }) do
+            local rem = ReplicatedStorage:FindFirstChild(rName)
+            if rem and rem:IsA("RemoteEvent") then
+                pcall(function() rem:FireServer("end") end)
+                pcall(function() rem:FireServer("stop") end)
+                pcall(function() rem:FireServer("leave") end)
+            end
+        end
+        task.wait(0.6)
     end
-    task.wait(0.5)
+
+    -- Stop any stuck client 3D camera/minigame loop so camera stays free
+    stopNativeMechanicClientLoop()
+
+    local cmj = ReplicatedStorage:FindFirstChild("CarMechanicJob")
+    local remotes = cmj and cmj:FindFirstChild("Remotes")
+    local onJobStarted = remotes and remotes:FindFirstChild("onJobStarted")
+    if not onJobStarted then
+        return false, "CarMechanicJob remotes not found"
+    end
+
+    if player:GetAttribute("JobShift") ~= "Mechanic" then
+        setMechOrderStatus("Starting Mechanic shift...", C_ACCENT)
+        onJobStarted:FireServer()
+        local t0 = os.clock()
+        while player:GetAttribute("JobShift") ~= "Mechanic" and (os.clock() - t0 < 3.0) do
+            task.wait(0.15)
+        end
+    else
+        -- Ensure server table t_1[player] is initialized
+        onJobStarted:FireServer()
+    end
+
     updateJobStatus()
+    return player:GetAttribute("JobShift") == "Mechanic", "Shift state: " .. tostring(player:GetAttribute("JobShift"))
+end
+
+local function checkAndBuyMechanicUpgrades()
+    local upgMod = ReplicatedStorage:FindFirstChild("MechanicUpgrades")
+    local upgRem = ReplicatedStorage:FindFirstChild("MechanicUpgradesRemote")
+    if not upgMod or not upgRem then return false end
+
+    local ok, MechanicUpgrades = pcall(require, upgMod)
+    if not ok or not MechanicUpgrades or not MechanicUpgrades.LIST then return false end
+
+    local st = getMechanicStats()
+    local leaderstats = player:FindFirstChild("leaderstats")
+    local cashObj = leaderstats and (leaderstats:FindFirstChild("Cash") or leaderstats:FindFirstChild("Money"))
+    local cash = cashObj and tonumber(cashObj.Value) or 0
+
+    local boughtAny = false
+    for _, item in ipairs(MechanicUpgrades.LIST) do
+        local curTier = MechanicUpgrades.Tier(player, item.key)
+        local nextLevelData = item.levels and item.levels[curTier + 1]
+        if nextLevelData then
+            local reqLvl = tonumber(nextLevelData.level) or 1
+            local price = tonumber(nextLevelData.price) or 0
+            if st.level >= reqLvl and cash >= price then
+                local okBuy, resBuy = pcall(function()
+                    return upgRem:InvokeServer("buy", item.key)
+                end)
+                if okBuy and (resBuy == true or (type(resBuy) == "table" and resBuy.ok)) then
+                    boughtAny = true
+                    cash = cash - price
+                    autoMechUpgradesToggle.SetStatus("Purchased: " .. tostring(nextLevelData.name) .. " ($" .. tostring(price) .. ")", C_GREEN)
+                    task.wait(0.3)
+                end
+            end
+        end
+    end
+    return boughtAny
+end
+
+local function runOneMechanicOrder()
+    local cmj = ReplicatedStorage:FindFirstChild("CarMechanicJob")
+    local remotes = cmj and cmj:FindFirstChild("Remotes")
+    if not cmj or not remotes then
+        return false, "CarMechanicJob not found"
+    end
+
+    local Jobs_m = require(cmj:WaitForChild("Jobs"))
+    local jobOrderRem = remotes:FindFirstChild("jobOrder")
+    local jobStepRem = remotes:FindFirstChild("jobStep")
+    local jobDoneRem = remotes:FindFirstChild("jobDone")
+    if not jobOrderRem or not jobStepRem or not jobDoneRem then
+        return false, "Mechanic remotes missing"
+    end
+
+    -- 1. Ensure player is physically inside the Mechanic Workshop (server checks <= 120 studs)
+    if not ensureAtMechanicWorkshop(false) then
+        return false, "Could not reach Mechanic Workshop"
+    end
+
+    -- 2. Ensure Mechanic Shift is active on server
+    local shiftOk, shiftErr = ensureMechanicShiftStarted()
+    if not shiftOk then
+        return false, shiftErr or "Could not start Mechanic shift"
+    end
+
+    -- 3. Request new customer repair order from server
+    setMechOrderStatus("Requesting customer work order...", C_ACCENT)
+    local orderStartClock = os.clock()
+    local okOrder, order = pcall(function()
+        return jobOrderRem:InvokeServer()
+    end)
+
+    if not okOrder or type(order) ~= "table" or not order.job then
+        -- Retry once after firing onJobStarted
+        remotes.onJobStarted:FireServer()
+        task.wait(0.4)
+        orderStartClock = os.clock()
+        okOrder, order = pcall(function()
+            return jobOrderRem:InvokeServer()
+        end)
+    end
+
+    if not okOrder or type(order) ~= "table" or not order.job then
+        return false, "No order returned by server"
+    end
+
+    local jobDef = Jobs_m.BY_ID[order.job]
+    if not jobDef or not jobDef.steps then
+        return false, "Unknown job ID: " .. tostring(order.job)
+    end
+
+    local customerName = tostring(order.customer or "Customer")
+    local carName = tostring(order.car or "Vehicle")
+    local jobName = tostring(jobDef.name or order.job)
+    local moodName = tostring(order.mood or "Normal")
+    mechComboStreak = tonumber(order.combo) or mechComboStreak
+
+    local tags = {}
+    if order.special then table.insert(tags, "🌟 2X SPECIAL") end
+    if (tonumber(order.rushLeft) or 0) > 0 then table.insert(tags, "⚡ RUSH HOUR") end
+    if order.regular then table.insert(tags, "💎 REGULAR") end
+    local tagStr = #tags > 0 and (" [" .. table.concat(tags, " • ") .. "]") or ""
+
+    -- Park visual car in Bay 1 for visual feedback (non-blocking, no camera hijack)
+    spawnVisualBayCar(carName)
+
+    -- 4. Calculate server anti-cheat timing requirements:
+    -- Server check A: jobDone requires (os.clock() - issuedAt) >= jobDef.seconds * Jobs_m.MIN_SHARE (0.85)
+    -- Server check B: jobStep requires (os.clock() - firstStepAt) >= sum_{2..i}(mini ? 0.4 : 0.2) for 1.0 PERFECT score
+    local minShare = tonumber(Jobs_m.MIN_SHARE) or 0.85
+    local minRequiredDuration = (tonumber(jobDef.seconds) or 30) * minShare + 0.45
+    local totalSteps = #jobDef.steps
+    local stepInterval = math.clamp((minRequiredDuration * 0.72) / math.max(1, totalSteps), 0.50, 2.50)
+
+    -- 5. Execute all steps sequentially (1 .. totalSteps) with 1.0 PERFECT minigame scores
+    for stepIdx, stepInfo in ipairs(jobDef.steps) do
+        if not hubAlive then return false, "Hub closed" end
+
+        ensureAtMechanicWorkshop(false)
+
+        local stepLabel = tostring(stepInfo.label or stepInfo.action or ("Step " .. stepIdx))
+        local isMini = (stepInfo.kind == "mini")
+        local statusTxt = string.format(
+            "%s — %s (%s)%s • Step %d/%d: %s",
+            carName,
+            jobName,
+            customerName,
+            tagStr,
+            stepIdx,
+            totalSteps,
+            stepLabel
+        )
+        setMechOrderStatus(statusTxt, isMini and Color3.fromRGB(46, 204, 113) or C_ACCENT)
+        if autoMechanicActive then
+            autoMechanicToggle.SetStatus(string.format("Step %d/%d: %s (%s)", stepIdx, totalSteps, stepLabel, carName), C_ACCENT)
+        end
+
+        if isMini then
+            jobStepRem:FireServer(stepIdx, 1.0)
+        else
+            jobStepRem:FireServer(stepIdx)
+        end
+
+        task.wait(stepInterval)
+    end
+
+    -- 6. Hold until server MIN_SHARE duration clears so jobDone never triggers "fast"
+    while hubAlive do
+        local elapsed = os.clock() - orderStartClock
+        local remaining = minRequiredDuration - elapsed
+        if remaining <= 0 then
+            break
+        end
+        ensureAtMechanicWorkshop(false)
+        local waitTxt = string.format(
+            "%s — %s (%s)%s • Finalizing (%ds left, 100%% PERFECT)...",
+            carName,
+            jobName,
+            customerName,
+            tagStr,
+            math.ceil(remaining)
+        )
+        setMechOrderStatus(waitTxt, C_GREEN)
+        if autoMechanicActive then
+            autoMechanicToggle.SetStatus(string.format("Finalizing %s (%ds left)...", jobName, math.ceil(remaining)), C_GREEN)
+        end
+        task.wait(math.min(0.4, remaining))
+    end
+
+    -- 7. Invoke jobDone to settle order and collect payout
+    local settleRes = nil
+    for attempt = 1, 24 do
+        if not hubAlive then break end
+        ensureAtMechanicWorkshop(false)
+
+        local okDone, res = pcall(function()
+            return jobDoneRem:InvokeServer()
+        end)
+
+        if okDone and type(res) == "table" then
+            if res.ok then
+                settleRes = res
+                break
+            elseif res.why == "fast" then
+                setMechOrderStatus(string.format("Syncing server completion clock... (attempt %d)", attempt), Color3.fromRGB(241, 196, 15))
+                task.wait(0.45)
+            elseif res.why == "away" then
+                ensureAtMechanicWorkshop(true)
+                task.wait(0.3)
+            elseif res.why == "steps" then
+                -- Self-heal: re-send all steps with safe spacing if any packet was dropped
+                setMechOrderStatus("Re-syncing repair steps with workshop server...", Color3.fromRGB(241, 196, 15))
+                ensureAtMechanicWorkshop(true)
+                for sIdx, sInfo in ipairs(jobDef.steps) do
+                    if sInfo.kind == "mini" then
+                        jobStepRem:FireServer(sIdx, 1.0)
+                    else
+                        jobStepRem:FireServer(sIdx)
+                    end
+                    task.wait(0.45)
+                end
+                task.wait(0.3)
+            else
+                task.wait(0.4)
+            end
+        else
+            task.wait(0.4)
+        end
+    end
+
+    cleanupVisualBayCar()
+
+    if settleRes and settleRes.ok then
+        mechCarsFixedSession = mechCarsFixedSession + 1
+        local payEarned = tonumber(settleRes.pay) or 0
+        local gradeWord = tostring(settleRes.word or "PERFECT")
+        local stars = tonumber(settleRes.stars) or 5
+        mechComboStreak = (gradeWord == "PERFECT") and math.min((tonumber(settleRes.combo) or 0) + 1, 4) or 0
+
+        mechLastReceipt = string.format("+$%d • %s (%d★) • %s (%s)", payEarned, gradeWord, stars, jobName, carName)
+        refreshMechanicTelemetry()
+
+        local doneMsg = string.format("Completed %s on %s! Earned +$%d (%s %d★)", jobName, carName, payEarned, gradeWord, stars)
+        setMechOrderStatus(doneMsg, C_GREEN)
+        if autoMechanicActive then
+            autoMechanicToggle.SetStatus(doneMsg, C_GREEN)
+        end
+
+        if autoMechUpgradesActive then
+            pcall(checkAndBuyMechanicUpgrades)
+        end
+        return true, doneMsg
+    end
+
+    return false, "Order settlement timed out"
+end
+
+autoMechanicToggle = createToggle(
+    mechAutoCard,
+    "🔧 Auto Mechanic Job (100% PERFECT)",
+    "Auto-teleports to workshop, completes all steps & minigames with 5★ PERFECT pay",
+    false,
+    UDim2.new(0, 14, 0, 108),
+    UDim2.new(1, -28, 0, 46),
+    function(state)
+        autoMechanicActive = state
+        if state then
+            autoMechanicToggle.SetStatus("Active • Initializing Mechanic Workshop shift...", C_GREEN)
+        else
+            autoMechanicToggle.SetStatus("Disabled • Click switch to start farming", C_MUTED)
+            setMechOrderStatus("Paused by user", C_MUTED)
+            cleanupVisualBayCar()
+        end
+    end
+)
+
+autoMechUpgradesToggle = createToggle(
+    mechAutoCard,
+    "⬆️ Auto-Buy Mechanic Upgrades",
+    "Auto-unlocks Air Tools (+30% time), VIP Lounge (+50% tips) & 5-Star Rep (+20% pay)",
+    false,
+    UDim2.new(0, 14, 0, 160),
+    UDim2.new(1, -28, 0, 46),
+    function(state)
+        autoMechUpgradesActive = state
+        if state then
+            autoMechUpgradesToggle.SetStatus("Active • Checking unlocked upgrades...", C_GREEN)
+            task.spawn(checkAndBuyMechanicUpgrades)
+        else
+            autoMechUpgradesToggle.SetStatus("Disabled • Manual upgrades only", C_MUTED)
+        end
+    end
+)
+
+-- Background Worker: Auto Mechanic Job Loop
+task.spawn(function()
+    while hubAlive do
+        if autoMechanicActive and not mechBusy then
+            mechBusy = true
+            local ok, success, msg = pcall(runOneMechanicOrder)
+            mechBusy = false
+
+            if not ok then
+                setMechOrderStatus("Error: " .. tostring(success), C_RED)
+                task.wait(2.0)
+            elseif not success then
+                setMechOrderStatus("Status: " .. tostring(msg), Color3.fromRGB(241, 196, 15))
+                task.wait(1.5)
+            else
+                task.wait(0.6)
+            end
+        else
+            task.wait(0.5)
+        end
+    end
 end)
+
+-- Quick Manual Buttons for Mechanic Job
+createButton(mechAutoCard, "📍 Teleport to Workshop", C_ACCENT, UDim2.new(0, 14, 0, 216), UDim2.new(0.47, 0, 0, 30), function()
+    task.spawn(function()
+        ensureAtMechanicWorkshop(true)
+        setMechOrderStatus("Teleported to Mechanic Workshop (Bay 1)", C_GREEN)
+    end)
+end)
+
+createButton(mechAutoCard, "⚡ Complete 1 Order", Color3.fromRGB(46, 204, 113), UDim2.new(0.51, 0, 0, 216), UDim2.new(0.46, 0, 0, 30), function()
+    task.spawn(function()
+        if mechBusy then
+            setMechOrderStatus("Already running a Mechanic order!", Color3.fromRGB(241, 196, 15))
+            return
+        end
+        mechBusy = true
+        local ok, success, msg = pcall(runOneMechanicOrder)
+        mechBusy = false
+        if not ok or not success then
+            setMechOrderStatus(tostring(msg or success), Color3.fromRGB(241, 196, 15))
+        end
+    end)
+end)
+
+createButton(mechAutoCard, "🖥️ Open Mechanic Kiosk UI", Color3.fromRGB(155, 89, 182), UDim2.new(0, 14, 0, 252), UDim2.new(0.47, 0, 0, 30), function()
+    task.spawn(function()
+        pcall(function()
+            local cmj = ReplicatedStorage:FindFirstChild("CarMechanicJob")
+            local mh = cmj and require(cmj.Client.menuHandler)
+            local bay1, mj = getMechanicWorkshopBay()
+            local npc = mj and mj:FindFirstChild("MechanicJobNPC")
+            if mh and mh.openMenu then
+                mh.openMenu({
+                    onShift = (player:GetAttribute("JobShift") == "Mechanic"),
+                    mechanicJobFolder = bay1,
+                    mechanicNPC = npc,
+                    shift = {
+                        earned = tonumber(player:GetAttribute("ShiftEarned")) or 0,
+                        jobs = mechCarsFixedSession,
+                        since = os.time()
+                    }
+                })
+            end
+        end)
+    end)
+end)
+
+createButton(mechAutoCard, "🛑 End Mechanic Shift", C_RED, UDim2.new(0.51, 0, 0, 252), UDim2.new(0.46, 0, 0, 30), function()
+    task.spawn(function()
+        if autoMechanicActive then
+            autoMechanicToggle.SetState(false)
+        end
+        cleanupVisualBayCar()
+        stopNativeMechanicClientLoop()
+        local mechRemotes = ReplicatedStorage:FindFirstChild("CarMechanicJob") and ReplicatedStorage.CarMechanicJob:FindFirstChild("Remotes")
+        if mechRemotes and mechRemotes:FindFirstChild("onJobEnded") then
+            mechRemotes.onJobEnded:FireServer()
+        end
+        task.wait(0.5)
+        updateJobStatus()
+        refreshMechanicTelemetry()
+        setMechOrderStatus("Shift ended", C_MUTED)
+    end)
+end)
+
+local mechHelpLabel = Instance.new("TextLabel")
+mechHelpLabel.Text = "How it works: Automatically teleports to the workshop, starts your shift, executes every repair & skill game step with a 1.0 (PERFECT) score, calibrates completion time to pass the server's 85% duration check, and collects maximum 5★ pay + combo bonuses without locking your camera."
+mechHelpLabel.Font = Enum.Font.Gotham
+mechHelpLabel.TextSize = 10
+mechHelpLabel.TextColor3 = C_MUTED
+mechHelpLabel.TextXAlignment = Enum.TextXAlignment.Left
+mechHelpLabel.TextWrapped = true
+mechHelpLabel.Position = UDim2.new(0, 14, 0, 290)
+mechHelpLabel.Size = UDim2.new(1, -28, 0, 64)
+mechHelpLabel.BackgroundTransparency = 1
+mechHelpLabel.Parent = mechAutoCard
 
 -- ======================================================================
 -- 3. CATEGORY: RACING 🏁
@@ -3359,7 +4207,7 @@ task.spawn(function()
         return true
     end
 
-    while true do
+    while hubAlive do
         task.wait(0.6)
         if (autoContinueActive or autoRetryActive) and not raceAutoRunning then
             local pg = player:FindFirstChild("PlayerGui")
