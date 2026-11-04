@@ -1,0 +1,1822 @@
+-- ======================================================================
+-- DRIVE LIFE HUB - BUSINESSES, JOBS & RACING
+-- Game: Drive Life: BETA [BUSINESSES 💼]
+-- UI Style: Modern Standalone Luau ScreenGui (Draggable, Dark Theme)
+-- ======================================================================
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+
+-- Clean up previous instance if running
+local existing = game:GetService("CoreGui"):FindFirstChild("DriveLifeHub_UI") 
+    or (player:FindFirstChild("PlayerGui") and player.PlayerGui:FindFirstChild("DriveLifeHub_UI"))
+if existing then
+    existing:Destroy()
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "DriveLifeHub_UI"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.DisplayOrder = 100
+
+pcall(function()
+    screenGui.Parent = game:GetService("CoreGui")
+end)
+if not screenGui.Parent then
+    screenGui.Parent = player:WaitForChild("PlayerGui")
+end
+
+-- ======================================================================
+-- COLOR PALETTE & STYLES
+-- ======================================================================
+local C_BG          = Color3.fromRGB(18, 20, 24)
+local C_SIDEBAR     = Color3.fromRGB(13, 15, 18)
+local C_CARD        = Color3.fromRGB(24, 27, 33)
+local C_CARD_HOVER  = Color3.fromRGB(30, 34, 42)
+local C_ACCENT      = Color3.fromRGB(66, 135, 245)
+local C_ACCENT_HOV  = Color3.fromRGB(85, 150, 255)
+local C_GREEN       = Color3.fromRGB(46, 204, 113)
+local C_RED         = Color3.fromRGB(231, 76, 60)
+local C_TEXT        = Color3.fromRGB(240, 242, 245)
+local C_MUTED       = Color3.fromRGB(145, 152, 162)
+local C_STROKE      = Color3.fromRGB(38, 43, 53)
+
+-- ======================================================================
+-- MAIN FRAME
+-- ======================================================================
+local main = Instance.new("Frame")
+main.Name = "MainFrame"
+main.Size = UDim2.fromOffset(680, 440)
+main.Position = UDim2.new(0.5, -340, 0.5, -220)
+main.BackgroundColor3 = C_BG
+main.BorderSizePixel = 0
+main.ClipsDescendants = true
+main.Parent = screenGui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 10)
+mainCorner.Parent = main
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = C_STROKE
+mainStroke.Thickness = 1.2
+mainStroke.Parent = main
+
+-- ======================================================================
+-- TOPBAR & WINDOW CONTROLS
+-- ======================================================================
+local topbar = Instance.new("Frame")
+topbar.Name = "Topbar"
+topbar.Size = UDim2.new(1, 0, 0, 46)
+topbar.BackgroundColor3 = C_SIDEBAR
+topbar.BorderSizePixel = 0
+topbar.Parent = main
+
+local topbarStroke = Instance.new("UIStroke")
+topbarStroke.Color = C_STROKE
+topbarStroke.Thickness = 1
+topbarStroke.Parent = topbar
+
+local title = Instance.new("TextLabel")
+title.Text = "DRIVE LIFE HUB"
+title.Font = Enum.Font.GothamBold
+title.TextSize = 15
+title.TextColor3 = C_TEXT
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Position = UDim2.new(0, 16, 0, 6)
+title.Size = UDim2.new(0, 200, 0, 20)
+title.BackgroundTransparency = 1
+title.Parent = topbar
+
+local subtitle = Instance.new("TextLabel")
+subtitle.Text = "BUSINESSES • JOBS • RACING"
+subtitle.Font = Enum.Font.GothamMedium
+subtitle.TextSize = 10
+subtitle.TextColor3 = C_ACCENT
+subtitle.TextXAlignment = Enum.TextXAlignment.Left
+subtitle.Position = UDim2.new(0, 16, 0, 26)
+subtitle.Size = UDim2.new(0, 250, 0, 14)
+subtitle.BackgroundTransparency = 1
+subtitle.Parent = topbar
+
+-- Window Buttons (Close & Minimize)
+local closeBtn = Instance.new("TextButton")
+closeBtn.Text = "✕"
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 14
+closeBtn.TextColor3 = C_MUTED
+closeBtn.BackgroundColor3 = Color3.fromRGB(28, 30, 36)
+closeBtn.Size = UDim2.fromOffset(28, 28)
+closeBtn.Position = UDim2.new(1, -38, 0.5, -14)
+closeBtn.Parent = topbar
+
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 6)
+closeCorner.Parent = closeBtn
+
+local minBtn = Instance.new("TextButton")
+minBtn.Text = "—"
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 12
+minBtn.TextColor3 = C_MUTED
+minBtn.BackgroundColor3 = Color3.fromRGB(28, 30, 36)
+minBtn.Size = UDim2.fromOffset(28, 28)
+minBtn.Position = UDim2.new(1, -72, 0.5, -14)
+minBtn.Parent = topbar
+
+local minCorner = Instance.new("UICorner")
+minCorner.CornerRadius = UDim.new(0, 6)
+minCorner.Parent = minBtn
+
+-- Floating Reopen Button (when minimized)
+local toggleBubble = Instance.new("TextButton")
+toggleBubble.Name = "HubToggle"
+toggleBubble.Text = "⚡ DRIVE LIFE HUB"
+toggleBubble.Font = Enum.Font.GothamBold
+toggleBubble.TextSize = 12
+toggleBubble.TextColor3 = C_TEXT
+toggleBubble.BackgroundColor3 = C_ACCENT
+toggleBubble.Size = UDim2.fromOffset(150, 34)
+toggleBubble.Position = UDim2.new(1, -165, 1, -45)
+toggleBubble.Visible = false
+toggleBubble.Parent = screenGui
+
+local bubbleCorner = Instance.new("UICorner")
+bubbleCorner.CornerRadius = UDim.new(0, 8)
+bubbleCorner.Parent = toggleBubble
+
+-- Draggable Logic
+local dragging, dragInput, dragStart, startPos
+topbar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+topbar.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        local delta = input.Position - dragStart
+        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    screenGui:Destroy()
+end)
+
+minBtn.MouseButton1Click:Connect(function()
+    main.Visible = false
+    toggleBubble.Visible = true
+end)
+
+toggleBubble.MouseButton1Click:Connect(function()
+    main.Visible = true
+    toggleBubble.Visible = false
+end)
+
+-- Toggle Keybind (RightShift)
+UserInputService.InputBegan:Connect(function(input, processed)
+    if not processed and input.KeyCode == Enum.KeyCode.RightShift then
+        main.Visible = not main.Visible
+        toggleBubble.Visible = not main.Visible
+    end
+end)
+
+-- ======================================================================
+-- SIDEBAR & TABS
+-- ======================================================================
+local sidebar = Instance.new("Frame")
+sidebar.Name = "Sidebar"
+sidebar.Size = UDim2.new(0, 160, 1, -46)
+sidebar.Position = UDim2.new(0, 0, 0, 46)
+sidebar.BackgroundColor3 = C_SIDEBAR
+sidebar.BorderSizePixel = 0
+sidebar.Parent = main
+
+local sidebarLayout = Instance.new("UIListLayout")
+sidebarLayout.Padding = UDim.new(0, 6)
+sidebarLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+sidebarLayout.Parent = sidebar
+
+local sidebarPadding = Instance.new("UIPadding")
+sidebarPadding.PaddingTop = UDim.new(0, 12)
+sidebarPadding.PaddingLeft = UDim.new(0, 8)
+sidebarPadding.PaddingRight = UDim.new(0, 8)
+sidebarPadding.Parent = sidebar
+
+local content = Instance.new("Frame")
+content.Name = "Content"
+content.Size = UDim2.new(1, -160, 1, -46)
+content.Position = UDim2.new(0, 160, 0, 46)
+content.BackgroundTransparency = 1
+content.Parent = main
+
+local tabs = {}
+local tabButtons = {}
+local currentTab = nil
+
+local function switchTab(name)
+    for tName, page in pairs(tabs) do
+        page.Visible = (tName == name)
+    end
+    for tName, btn in pairs(tabButtons) do
+        if tName == name then
+            btn.BackgroundColor3 = C_ACCENT
+            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        else
+            btn.BackgroundColor3 = Color3.fromRGB(20, 23, 28)
+            btn.TextColor3 = C_MUTED
+        end
+    end
+    currentTab = name
+end
+
+local function createTabButton(name, icon, order)
+    local btn = Instance.new("TextButton")
+    btn.Name = "Tab_" .. name
+    btn.Text = icon .. "  " .. name
+    btn.Font = Enum.Font.GothamSemibold
+    btn.TextSize = 13
+    btn.TextColor3 = C_MUTED
+    btn.BackgroundColor3 = Color3.fromRGB(20, 23, 28)
+    btn.Size = UDim2.new(1, 0, 0, 38)
+    btn.LayoutOrder = order
+    btn.Parent = sidebar
+
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 6)
+    btnCorner.Parent = btn
+
+    btn.MouseButton1Click:Connect(function()
+        switchTab(name)
+    end)
+
+    tabButtons[name] = btn
+
+    local page = Instance.new("ScrollingFrame")
+    page.Name = "Page_" .. name
+    page.Size = UDim2.new(1, 0, 1, 0)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 4
+    page.ScrollBarImageColor3 = C_ACCENT
+    page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    page.Visible = false
+    page.Parent = content
+
+    local pageLayout = Instance.new("UIListLayout")
+    pageLayout.Padding = UDim.new(0, 10)
+    pageLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    pageLayout.Parent = page
+
+    local pagePadding = Instance.new("UIPadding")
+    pagePadding.PaddingTop = UDim.new(0, 12)
+    pagePadding.PaddingBottom = UDim.new(0, 16)
+    pagePadding.PaddingLeft = UDim.new(0, 14)
+    pagePadding.PaddingRight = UDim.new(0, 14)
+    pagePadding.Parent = page
+
+    tabs[name] = page
+    return page
+end
+
+local function createCard(page, titleText, height)
+    local card = Instance.new("Frame")
+    card.BackgroundColor3 = C_CARD
+    card.Size = UDim2.new(1, 0, 0, height or 120)
+    card.BorderSizePixel = 0
+    card.Parent = page
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = card
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = C_STROKE
+    stroke.Thickness = 1
+    stroke.Parent = card
+
+    if titleText then
+        local tLabel = Instance.new("TextLabel")
+        tLabel.Text = titleText:upper()
+        tLabel.Font = Enum.Font.GothamBold
+        tLabel.TextSize = 11
+        tLabel.TextColor3 = C_ACCENT
+        tLabel.TextXAlignment = Enum.TextXAlignment.Left
+        tLabel.Position = UDim2.new(0, 14, 0, 10)
+        tLabel.Size = UDim2.new(1, -28, 0, 16)
+        tLabel.BackgroundTransparency = 1
+        tLabel.Parent = card
+    end
+
+    return card
+end
+
+local function createButton(parent, text, bgColor, pos, size, callback)
+    local btn = Instance.new("TextButton")
+    btn.Text = text
+    btn.Font = Enum.Font.GothamSemibold
+    btn.TextSize = 12
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.BackgroundColor3 = bgColor or C_ACCENT
+    btn.Position = pos
+    btn.Size = size
+    btn.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = btn
+
+    btn.MouseButton1Click:Connect(callback)
+    return btn
+end
+
+local function createToggle(parent, titleText, descText, defaultState, pos, size, onToggle)
+    local frame = Instance.new("Frame")
+    frame.BackgroundColor3 = Color3.fromRGB(20, 23, 28)
+    frame.BorderSizePixel = 0
+    frame.Position = pos or UDim2.new(0, 0, 0, 0)
+    frame.Size = size or UDim2.new(1, 0, 0, 46)
+    frame.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = frame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = defaultState and C_GREEN or C_STROKE
+    stroke.Thickness = 1
+    stroke.Parent = frame
+
+    local tLabel = Instance.new("TextLabel")
+    tLabel.Text = titleText
+    tLabel.Font = Enum.Font.GothamBold
+    tLabel.TextSize = 12
+    tLabel.TextColor3 = C_TEXT
+    tLabel.TextXAlignment = Enum.TextXAlignment.Left
+    tLabel.Position = UDim2.new(0, 12, 0, 7)
+    tLabel.Size = UDim2.new(1, -85, 0, 16)
+    tLabel.BackgroundTransparency = 1
+    tLabel.Parent = frame
+
+    local dLabel = Instance.new("TextLabel")
+    dLabel.Text = descText
+    dLabel.Font = Enum.Font.Gotham
+    dLabel.TextSize = 10
+    dLabel.TextColor3 = C_MUTED
+    dLabel.TextXAlignment = Enum.TextXAlignment.Left
+    dLabel.Position = UDim2.new(0, 12, 0, 24)
+    dLabel.Size = UDim2.new(1, -85, 0, 14)
+    dLabel.BackgroundTransparency = 1
+    dLabel.Parent = frame
+
+    local switchBtn = Instance.new("TextButton")
+    switchBtn.Text = defaultState and "ON" or "OFF"
+    switchBtn.Font = Enum.Font.GothamBold
+    switchBtn.TextSize = 11
+    switchBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    switchBtn.BackgroundColor3 = defaultState and C_GREEN or Color3.fromRGB(45, 50, 60)
+    switchBtn.Position = UDim2.new(1, -64, 0.5, -13)
+    switchBtn.Size = UDim2.fromOffset(52, 26)
+    switchBtn.Parent = frame
+
+    local switchCorner = Instance.new("UICorner")
+    switchCorner.CornerRadius = UDim.new(0, 13)
+    switchCorner.Parent = switchBtn
+
+    local state = defaultState
+
+    local function updateVisuals()
+        if state then
+            switchBtn.Text = "ON"
+            switchBtn.BackgroundColor3 = C_GREEN
+            stroke.Color = C_GREEN
+        else
+            switchBtn.Text = "OFF"
+            switchBtn.BackgroundColor3 = Color3.fromRGB(45, 50, 60)
+            stroke.Color = C_STROKE
+        end
+    end
+
+    switchBtn.MouseButton1Click:Connect(function()
+        state = not state
+        updateVisuals()
+        if onToggle then
+            onToggle(state)
+        end
+    end)
+
+    return {
+        Frame = frame,
+        GetState = function() return state end,
+        SetState = function(val)
+            state = val
+            updateVisuals()
+            if onToggle then onToggle(state) end
+        end,
+        SetStatus = function(txt, col)
+            dLabel.Text = tostring(txt)
+            dLabel.TextColor3 = col or C_MUTED
+        end
+    }
+end
+
+-- ======================================================================
+-- 1. CATEGORY: BUSINESS 💼
+-- ======================================================================
+local pageBusiness = createTabButton("Business", "💼", 1)
+
+local bizStatusCard = createCard(pageBusiness, "Office & Business Status", 130)
+local bizInfoLabel = Instance.new("TextLabel")
+bizInfoLabel.Text = "Loading business data..."
+bizInfoLabel.Font = Enum.Font.Gotham
+bizInfoLabel.TextSize = 12
+bizInfoLabel.TextColor3 = C_TEXT
+bizInfoLabel.TextXAlignment = Enum.TextXAlignment.Left
+bizInfoLabel.TextYAlignment = Enum.TextYAlignment.Top
+bizInfoLabel.Position = UDim2.new(0, 14, 0, 32)
+bizInfoLabel.Size = UDim2.new(1, -28, 0, 50)
+bizInfoLabel.BackgroundTransparency = 1
+bizInfoLabel.Parent = bizStatusCard
+
+local function getNet()
+    local ps = player:FindFirstChild("PlayerScripts")
+    local off = ps and ps:FindFirstChild("Office")
+    local netMod = off and off:FindFirstChild("Net")
+    if netMod and netMod:IsA("ModuleScript") then
+        local ok, res = pcall(require, netMod)
+        if ok and res then return res end
+    end
+    return nil
+end
+
+local function getBaySlots(s)
+    if not s or not s.bayCount then
+        local Net = getNet()
+        if Net then s = Net.State() end
+    end
+    s = s or {}
+
+    local maxBays = tonumber(s.bayCount) or (s.garage and s.garage.bays and #s.garage.bays) or 3
+    local bays = s.bays or {}
+    local occupied = 0
+    local freeSlots = {}
+    local occupiedSlots = {}
+    local serviceBays = {}
+    local projectBays = {}
+
+    for i = 1, maxBays do
+        local slotId = "B" .. i
+        local bayData = bays[slotId]
+        if bayData and (bayData.car or bayData.kind or bayData.state) then
+            occupied = occupied + 1
+            table.insert(occupiedSlots, slotId)
+            if bayData.kind == "service" then
+                table.insert(serviceBays, slotId)
+            elseif bayData.kind == "project" then
+                table.insert(projectBays, slotId)
+            end
+        else
+            table.insert(freeSlots, slotId)
+        end
+    end
+
+    local isFull = (occupied >= maxBays)
+    return {
+        total = maxBays,
+        occupied = occupied,
+        free = #freeSlots,
+        isFull = isFull,
+        freeSlots = freeSlots,
+        occupiedSlots = occupiedSlots,
+        serviceBays = serviceBays,
+        projectBays = projectBays
+    }
+end
+
+local function refreshBusiness()
+    local rf = ReplicatedStorage:FindFirstChild("OfficeRemote")
+    if rf and rf:IsA("RemoteFunction") then
+        local res = rf:InvokeServer("state")
+        if res and res.state then
+            local s = res.state
+            local slots = getBaySlots(s)
+            local bayStr = slots.isFull 
+                and string.format("Bays: %d/%d (FULL ⚠️)", slots.occupied, slots.total)
+                or string.format("Bays: %d/%d (%d Open ✅)", slots.occupied, slots.total, slots.free)
+
+            bizInfoLabel.Text = string.format(
+                "Name: %s\nLevel: %d  |  Office Level: %d  |  %s\nTotal Earned: $%s  |  Status: %s",
+                tostring(s.name or "Office"),
+                tonumber(s.level) or 0,
+                tonumber(s.officeLevel) or 0,
+                bayStr,
+                tostring(s.earned or 0),
+                s.ready and "Ready" or "Active"
+            )
+            return
+        end
+    end
+    bizInfoLabel.Text = "Could not fetch office data. Ensure you have an active business office."
+end
+
+createButton(bizStatusCard, "🔄 Refresh Data", Color3.fromRGB(45, 50, 65), UDim2.new(0, 14, 0, 88), UDim2.new(0.35, 0, 0, 30), refreshBusiness)
+
+local bizActionsCard = createCard(pageBusiness, "Office Actions & Remote Computer", 165)
+
+local function getOSModule()
+    local ps = player:FindFirstChild("PlayerScripts")
+    local off = ps and ps:FindFirstChild("Office")
+    local comp = off and off:FindFirstChild("Computer")
+    local osMod = comp and comp:FindFirstChild("OS")
+    if osMod and osMod:IsA("ModuleScript") then
+        local ok, res = pcall(require, osMod)
+        if ok and res then return res end
+    end
+    return nil
+end
+
+local function toggleComputer(targetApp)
+    local OS = getOSModule()
+    if not OS then
+        warn("[DriveLifeHub] Could not find Office OS module.")
+        return
+    end
+
+    -- Notify server remote
+    local rf = ReplicatedStorage:FindFirstChild("OfficeRemote")
+    if rf then
+        task.spawn(function()
+            pcall(function() rf:InvokeServer("computer") end)
+        end)
+    end
+
+    if OS.IsOpen and OS.IsOpen() then
+        if targetApp then
+            pcall(function() OS.OpenApp(targetApp) end)
+        else
+            OS.Close()
+        end
+    else
+        -- Open computer directly without sitting on chair!
+        OS.Open({ framed = false })
+        if targetApp then
+            task.wait(0.15)
+            pcall(function() OS.OpenApp(targetApp) end)
+        end
+    end
+end
+
+createButton(bizActionsCard, "🏢 Teleport to Office", C_ACCENT, UDim2.new(0, 14, 0, 32), UDim2.new(0.46, 0, 0, 32), function()
+    local rf = ReplicatedStorage:FindFirstChild("OfficeRemote")
+    if rf then
+        rf:InvokeServer("go")
+    end
+end)
+
+local compBtn = createButton(bizActionsCard, "💻 Toggle Computer OS", Color3.fromRGB(39, 174, 96), UDim2.new(0.52, 0, 0, 32), UDim2.new(0.44, 0, 0, 32), function()
+    toggleComputer()
+end)
+
+-- App Quick-Launch Row
+local apps = {
+    { name = "contracts", label = "📋 Contracts", color = Color3.fromRGB(52, 152, 219) },
+    { name = "garage",    label = "🚗 Garage",    color = Color3.fromRGB(230, 126, 34) },
+    { name = "customers", label = "👥 Clients",   color = Color3.fromRGB(155, 89, 182) },
+    { name = "auctions",  label = "🏷️ Auctions",  color = Color3.fromRGB(241, 196, 15) },
+}
+
+for i, app in ipairs(apps) do
+    local w = 0.225
+    local x = 14 + (i - 1) * 118
+    createButton(bizActionsCard, app.label, app.color, UDim2.new(0, x, 0, 72), UDim2.new(0, 110, 0, 26), function()
+        toggleComputer(app.name)
+    end)
+end
+
+createButton(bizActionsCard, "⚡ Auto-Service / Restore All Bays", Color3.fromRGB(41, 128, 185), UDim2.new(0, 14, 0, 112), UDim2.new(0.96, 0, 0, 32), function()
+    local rf = ReplicatedStorage:FindFirstChild("OfficeRemote")
+    if rf then
+        for slot = 1, 6 do
+            rf:InvokeServer("restore", slot)
+            rf:InvokeServer("repair", slot)
+            rf:InvokeServer("prepAll", slot, {})
+        end
+        refreshBusiness()
+    end
+end)
+
+-- ======================================================================
+-- BUSINESS AUTOMATION SUITE (CONTRACTS, CUSTOMERS, AUCTIONS & RESTORE)
+-- ======================================================================
+local bizAutoCard = createCard(pageBusiness, "🤖 Business Automation Suite", 375)
+
+local autoStatusLabel = Instance.new("TextLabel")
+autoStatusLabel.Text = "System: Ready • Toggles operate independently"
+autoStatusLabel.Font = Enum.Font.GothamMedium
+autoStatusLabel.TextSize = 11
+autoStatusLabel.TextColor3 = C_MUTED
+autoStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+autoStatusLabel.Position = UDim2.new(0, 14, 0, 28)
+autoStatusLabel.Size = UDim2.new(1, -28, 0, 16)
+autoStatusLabel.BackgroundTransparency = 1
+autoStatusLabel.Parent = bizAutoCard
+
+local function setAutoStatus(txt, col)
+    autoStatusLabel.Text = "System: " .. tostring(txt)
+    autoStatusLabel.TextColor3 = col or C_TEXT
+end
+
+-- Toggle States & Mutex
+local autoContractsActive = false
+local autoCustomersActive = false
+local autoAuctionsActive  = false
+local autoRestoreActive   = false
+local missionBusy = false
+
+-- Forward declarations of toggle controls
+local contractsToggle
+local customersToggle
+local auctionsToggle
+local restoreToggle
+
+local function runOneCustomer()
+    local Net = getNet()
+    if not Net then return false, "No Net" end
+    local s = Net.State()
+    local slots = getBaySlots(s)
+
+    -- 1. Check if there is already a customer car waiting in a bay that needs to be returned
+    local targetBay = nil
+    local custData = nil
+
+    if #slots.serviceBays > 0 then
+        targetBay = slots.serviceBays[1]
+        custData = s.bays and s.bays[targetBay]
+    end
+
+    -- 2. If no service car in bay, check capacity before taking a new customer from the door
+    if not targetBay then
+        if slots.isFull then
+            local msg = string.format("All bays full (%d/%d) • Cannot take customer", slots.occupied, slots.total)
+            customersToggle.SetStatus(msg, Color3.fromRGB(241, 196, 15))
+            return false, msg
+        end
+
+        local cust = s.cust and s.cust.door and s.cust.door[1]
+        if not cust then
+            return false, "No customers at door"
+        end
+
+        local cName = tostring(cust.name or cust.who or "Client")
+        setAutoStatus("Taking client: " .. cName, C_ACCENT)
+        customersToggle.SetStatus("Accepting client " .. cName .. "...", C_ACCENT)
+
+        local takeRes = Net.Call("custTake", cust.id)
+        if not takeRes or not takeRes.ok then
+            return false, "Failed to take customer"
+        end
+
+        task.wait(0.6)
+        s = Net.State()
+        if s.bays then
+            for bId, b in pairs(s.bays) do
+                if b.who == cust.who or b.name == cust.name or (b.car and b.car == cust.car) then
+                    targetBay = bId
+                    custData = b
+                    break
+                end
+            end
+        end
+        if not targetBay then
+            targetBay = slots.freeSlots[1] or "B1"
+            custData = cust
+        end
+    end
+
+    if not targetBay or not custData then
+        return false, "No target bay found"
+    end
+
+    local cName = tostring(custData.name or custData.who or "Client")
+    customersToggle.SetStatus("Prepping & washing order in " .. tostring(targetBay) .. "...", Color3.fromRGB(241, 196, 15))
+    local spec = custData.spec or custData.order or {}
+    local picks = {
+        wash = (spec.wash == true or spec.washed == true),
+        paint = spec.paint,
+        plate = spec.plate,
+        rims = spec.rims
+    }
+    Net.Call("prepAll", targetBay, picks)
+    task.wait(0.2)
+    Net.Call("restore", targetBay)
+    Net.Call("repair", targetBay)
+    task.wait(0.5)
+
+    customersToggle.SetStatus("Starting delivery mission...", Color3.fromRGB(52, 152, 219))
+    local retRes = Net.Call("custReturn", targetBay)
+    task.wait(0.8)
+
+    s = Net.State()
+    local m = s.mission
+    if m and m.dest then
+        customersToggle.SetStatus("Delivering vehicle to destination...", C_GREEN)
+        local dest = Vector3.new(m.dest[1], m.dest[2] + 2, m.dest[3])
+        local car = workspace.Vehicles:FindFirstChild(player.Name .. " - Business")
+        local seat = car and car:FindFirstChild("DriveSeat", true)
+        local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+
+        if seat and hum and seat.Occupant ~= hum then
+            seat:Sit(hum)
+            task.wait(0.4)
+        end
+
+        pcall(function() player:RequestStreamAroundAsync(dest) end)
+        if car and car.PrimaryPart then
+            car:SetPrimaryPartCFrame(CFrame.new(dest))
+            for _, p in ipairs(car:GetDescendants()) do
+                if p:IsA("BasePart") then
+                    p.AssemblyLinearVelocity = Vector3.zero
+                    p.AssemblyAngularVelocity = Vector3.zero
+                end
+            end
+        end
+        task.wait(2.5)
+    end
+
+    Net.Call("go")
+    refreshBusiness()
+    setAutoStatus("Client order completed successfully!", C_GREEN)
+    customersToggle.SetStatus("Order fulfilled for " .. cName, C_GREEN)
+    return true
+end
+
+local function sellAndDeliverToCollector(slot)
+    local Net = getNet()
+    if not Net then return false, "No Net" end
+
+    local s = Net.State()
+    local bay = s.bays and s.bays[slot]
+    if not bay or not bay.car then
+        return false, "No car in slot " .. tostring(slot)
+    end
+
+    local carName = tostring(bay.display or bay.car or slot)
+
+    -- If project car, make sure it is on a bay with a car lift to allow fixing wheels/suspension
+    if bay.kind == "project" then
+        local lifts = s.lifts or {}
+        if not lifts[slot] then
+            for liftSlot, _ in pairs(lifts) do
+                if not (s.bays and s.bays[liftSlot]) then
+                    Net.Call("moveBay", slot, liftSlot)
+                    task.wait(0.4)
+                    slot = liftSlot
+                    s = Net.State()
+                    bay = s.bays and s.bays[slot]
+                    break
+                end
+            end
+        end
+
+        -- Restore all faults
+        Net.Call("restore", slot, "all")
+        task.wait(0.3)
+    end
+
+    -- Repair care to 100% and prep
+    Net.Call("repair", slot)
+    Net.Call("prepAll", slot, {})
+    task.wait(0.4)
+
+    -- Start sell mission to highest paying buyer: "collector" (+30%)
+    -- Fallbacks: "dealer" (+15%), then "private"
+    local sellRes = Net.Call("sell", slot, "collector")
+    if not (sellRes and sellRes.ok) then
+        sellRes = Net.Call("sell", slot, "dealer")
+    end
+    if not (sellRes and sellRes.ok) then
+        sellRes = Net.Call("sell", slot, "private")
+    end
+
+    if not sellRes or not sellRes.ok then
+        return false, (type(sellRes) == "table" and sellRes.message) or "Could not start sale"
+    end
+
+    task.wait(0.8)
+    s = Net.State()
+    local m = s.mission
+    if not m or not m.dest then
+        return false, "Sell mission did not initialize"
+    end
+
+    -- Deliver car to buyer destination ring
+    local dest = Vector3.new(m.dest[1], m.dest[2] + 2, m.dest[3])
+    local car = workspace.Vehicles:FindFirstChild(player.Name .. " - Business")
+    local seat = car and car:FindFirstChild("DriveSeat", true)
+    local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+
+    if seat and hum and seat.Occupant ~= hum then
+        seat:Sit(hum)
+        task.wait(0.4)
+    end
+
+    pcall(function() player:RequestStreamAroundAsync(dest) end)
+    if car and car.PrimaryPart then
+        car:SetPrimaryPartCFrame(CFrame.new(dest))
+        for _, p in ipairs(car:GetDescendants()) do
+            if p:IsA("BasePart") then
+                p.AssemblyLinearVelocity = Vector3.zero
+                p.AssemblyAngularVelocity = Vector3.zero
+            end
+        end
+    end
+
+    -- Hold still inside ring for 2.5s for server validation
+    for i = 1, 10 do
+        task.wait(0.25)
+        if car and car.PrimaryPart then
+            car.PrimaryPart.AssemblyLinearVelocity = Vector3.zero
+        end
+    end
+
+    Net.Call("go")
+    refreshBusiness()
+    local priceEarned = m.price or 0
+    local buyerName = tostring(m.destName or m.buyer or "Collector")
+    return true, string.format("Sold %s to %s for $%s", carName, buyerName, tostring(priceEarned))
+end
+
+local boardCache = {
+    checkedAt = 0,
+    untakenCount = 0,
+    nextRefresh = 0,
+    bestOffer = nil
+}
+
+local function checkContractBoard(force)
+    local now = os.clock()
+    if not force and (now - boardCache.checkedAt < 2.5) then
+        return boardCache.untakenCount, boardCache.nextRefresh, boardCache.bestOffer
+    end
+
+    local Net = getNet()
+    if not Net then return 0, 0, nil end
+
+    local b = Net.Call("board")
+    local offers = b and b.offers or {}
+    local boardInfo = b and b.state and b.state.board
+    local nextRefresh = (boardInfo and tonumber(boardInfo.next)) or 0
+
+    local untaken = 0
+    local best = nil
+    local maxProfit = 0
+
+    for _, o in ipairs(offers) do
+        if not o.taken then
+            untaken = untaken + 1
+            local profit = (type(o.fee) == "table" and tonumber(o.fee[2])) or tonumber(o.fee) or 0
+            if profit > maxProfit then
+                maxProfit = profit
+                best = o
+            end
+        end
+    end
+
+    boardCache.checkedAt = now
+    boardCache.untakenCount = untaken
+    boardCache.nextRefresh = nextRefresh
+    boardCache.bestOffer = best
+
+    return untaken, nextRefresh, best
+end
+
+local function runOneContract()
+    local Net = getNet()
+    if not Net then return false, "No Net" end
+
+    local s = Net.State()
+    local m = s.mission
+    local slots = getBaySlots(s)
+
+    -- If not already in an active contract delivery, check if car slots are full
+    if not m and slots.isFull then
+        local msg = string.format("All bays full (%d/%d) • Cannot take contract", slots.occupied, slots.total)
+        contractsToggle.SetStatus(msg, Color3.fromRGB(241, 196, 15))
+        return false, msg
+    end
+
+    -- If not already in mission, find and take highest-paying contract
+    local maxProfit = 0
+    local best = nil
+    if not m then
+        setAutoStatus("Scanning contract board...", C_ACCENT)
+        contractsToggle.SetStatus("Scanning contract board...", C_ACCENT)
+
+        local b = Net.Call("board")
+        local offers = b and b.offers or {}
+        local boardInfo = b and b.state and b.state.board
+        local nextRefresh = (boardInfo and tonumber(boardInfo.next)) or 0
+        local untakenCount = 0
+
+        for _, o in ipairs(offers) do
+            if not o.taken then
+                untakenCount = untakenCount + 1
+                local profit = (type(o.fee) == "table" and tonumber(o.fee[2])) or tonumber(o.fee) or 0
+                if profit > maxProfit then
+                    maxProfit = profit
+                    best = o
+                end
+            end
+        end
+
+        boardCache.checkedAt = os.clock()
+        boardCache.untakenCount = untakenCount
+        boardCache.nextRefresh = nextRefresh
+        boardCache.bestOffer = best
+
+        if untakenCount == 0 or not best then
+            return false, "board_empty", nextRefresh
+        end
+
+        contractsToggle.SetStatus("Accepting: " .. tostring(best.display) .. " (+$" .. tostring(maxProfit) .. ")...", C_ACCENT)
+        local takeRes = Net.Call("take", best.slot)
+        if not takeRes or not takeRes.ok then
+            return false, "Could not take contract"
+        end
+
+        task.wait(0.8)
+        s = Net.State()
+        m = s.mission
+    end
+
+    if not m then
+        return false, "Mission did not initialize"
+    end
+
+    local pickup = m.pickup and Vector3.new(m.pickup[1], m.pickup[2] + 2, m.pickup[3])
+    local dest = m.dest and Vector3.new(m.dest[1], m.dest[2] + 2, m.dest[3])
+
+    if pickup and not m.away then
+        setAutoStatus("Retrieving car at pickup point...", Color3.fromRGB(241, 196, 15))
+        contractsToggle.SetStatus("Retrieving car at pickup point...", Color3.fromRGB(241, 196, 15))
+        pcall(function() player:RequestStreamAroundAsync(pickup) end)
+
+        local char = player.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+        if root then
+            root.Anchored = true
+            root.CFrame = CFrame.new(pickup)
+            task.wait(0.8)
+            root.Anchored = false
+        end
+
+        local car = workspace.Vehicles:FindFirstChild(player.Name .. " - Business")
+        local seat = car and car:FindFirstChild("DriveSeat", true)
+        if seat and hum then
+            seat:Sit(hum)
+            task.wait(0.5)
+        end
+    end
+
+    if dest then
+        setAutoStatus("Delivering vehicle to office garage...", Color3.fromRGB(52, 152, 219))
+        contractsToggle.SetStatus("Delivering vehicle to office garage...", Color3.fromRGB(52, 152, 219))
+        pcall(function() player:RequestStreamAroundAsync(dest) end)
+
+        local car = workspace.Vehicles:FindFirstChild(player.Name .. " - Business")
+        if car and car.PrimaryPart then
+            car:SetPrimaryPartCFrame(CFrame.new(dest))
+            for _, p in ipairs(car:GetDescendants()) do
+                if p:IsA("BasePart") then
+                    p.AssemblyLinearVelocity = Vector3.zero
+                    p.AssemblyAngularVelocity = Vector3.zero
+                end
+            end
+        end
+        task.wait(2.5)
+    end
+
+    Net.Call("go")
+
+    -- Clean up, restore & repair all bays
+    for slot = 1, 6 do
+        Net.Call("restore", slot)
+        Net.Call("repair", slot)
+        Net.Call("prepAll", slot, {})
+    end
+
+    refreshBusiness()
+
+    -- If contract resulted in a car stored in the garage, sell to highest buyer (the Collector)
+    s = Net.State()
+    local soldMsg = nil
+    if s and s.bays then
+        for sSlot, bayData in pairs(s.bays) do
+            if bayData and bayData.car and bayData.kind ~= "service" and (not autoAuctionsActive or bayData.kind ~= "project") then
+                contractsToggle.SetStatus("Delivering " .. tostring(bayData.display or bayData.car) .. " to Collector (+30%)...", C_ACCENT)
+                local okSell, sold, msg = pcall(sellAndDeliverToCollector, sSlot)
+                if okSell and sold then
+                    soldMsg = msg
+                end
+                break
+            end
+        end
+    end
+
+    setAutoStatus("Contract completed & profit collected!", C_GREEN)
+    contractsToggle.SetStatus(soldMsg or ("Delivered " .. tostring(best and best.display or "Vehicle") .. " (+$" .. tostring(maxProfit) .. ")"), C_GREEN)
+    return true
+end
+
+local function runAuctionCycle()
+    local Net = getNet()
+    if not Net then return false, "No Net" end
+
+    -- Check if car slots are full before bidding
+    local slots = getBaySlots()
+    if slots.isFull then
+        local msg = string.format("All bays full (%d/%d) • Bidding paused", slots.occupied, slots.total)
+        auctionsToggle.SetStatus(msg, Color3.fromRGB(241, 196, 15))
+        return false, msg
+    end
+
+    local res = Net.Call("auctions")
+    local lots = res and (res.lots or (res.auctions and res.auctions.lots))
+    if not lots or #lots == 0 then
+        return false, "No active auction lots"
+    end
+
+    local leaderstats = player:FindFirstChild("leaderstats")
+    local cashObj = leaderstats and (leaderstats:FindFirstChild("Cash") or leaderstats:FindFirstChild("Money"))
+    local cash = cashObj and cashObj.Value or 999999999
+
+    local bestLot = nil
+    local bestProfit = 0
+    local bestNextBid = 0
+    local bestMaxBid = 0
+    local bestFixCost = 0
+    local minAffordableGap = 0
+    local unaffordableCandidate = nil
+
+    for _, lot in ipairs(lots) do
+        -- Skip if we are currently the leading bidder
+        local amLeading = (lot.you == true) or (lot.leader == player.Name)
+        if not amLeading then
+            local step = tonumber(lot.step) or 2000
+            local price = tonumber(lot.price) or 0
+            local nextBid = price + step
+            local worth = tonumber(lot.worth) or 0
+            local maxBid = math.min(nextBid + 2 * step, worth)
+
+            -- Compute complete restoration fee for this car
+            local fixCost = tonumber(lot.fixKnown) or (tonumber(lot.fixSeen) or 0)
+            if lot.faults and type(lot.faults) == "table" then
+                local faultSum = 0
+                for _, f in ipairs(lot.faults) do
+                    faultSum = faultSum + (tonumber(f.cost) or 0)
+                end
+                fixCost = math.max(fixCost, faultSum)
+            end
+
+            -- Total required: Max possible bid + complete restoration & repair fees
+            local totalNeeded = maxBid + fixCost
+            local estProfit = worth - nextBid - fixCost
+
+            -- Must have enough cash left over to pay for BOTH the car AND all restoration fees!
+            if cash >= totalNeeded and estProfit >= 10000 then
+                if estProfit > bestProfit then
+                    bestProfit = estProfit
+                    bestLot = lot
+                    bestNextBid = nextBid
+                    bestMaxBid = maxBid
+                    bestFixCost = fixCost
+                end
+            elseif estProfit >= 10000 and (cash < totalNeeded) then
+                if not unaffordableCandidate or totalNeeded < minAffordableGap then
+                    minAffordableGap = totalNeeded
+                    unaffordableCandidate = lot
+                end
+            end
+        end
+    end
+
+    if bestLot then
+        local statusTxt = string.format("Bidding %s ($%d bid + $%d fix reserve)...", tostring(bestLot.display), bestNextBid, bestFixCost)
+        auctionsToggle.SetStatus(statusTxt, C_ACCENT)
+        local bidRes = Net.Call("bid", bestLot.tier, bestNextBid, bestMaxBid)
+        if bidRes and bidRes.ok then
+            local msg = string.format("Leading: %s @ $%d (+$%d profit | $%d fix reserved)", tostring(bestLot.display), bestNextBid, bestProfit, bestFixCost)
+            setAutoStatus(msg, C_GREEN)
+            auctionsToggle.SetStatus(msg, C_GREEN)
+            return true, msg
+        else
+            local errMsg = (type(bidRes) == "table" and bidRes.message) or "Bid failed"
+            auctionsToggle.SetStatus(errMsg, Color3.fromRGB(241, 196, 15))
+            return false, errMsg
+        end
+    end
+
+    if unaffordableCandidate then
+        local msg = string.format("Need $%d for %s (Bid + Full Fix) • Cash: $%d", minAffordableGap, tostring(unaffordableCandidate.display), cash)
+        auctionsToggle.SetStatus(msg, Color3.fromRGB(241, 196, 15))
+        return false, msg
+    end
+
+    return false, "Watching lots (no profitable lots within full restoration budget)"
+end
+
+local function fixAllBays()
+    local Net = getNet()
+    if not Net then return false, "No Net" end
+    local s = Net.State()
+    if not s or not s.bays then return false, "No bays" end
+
+    local leaderstats = player:FindFirstChild("leaderstats")
+    local cashObj = leaderstats and (leaderstats:FindFirstChild("Cash") or leaderstats:FindFirstChild("Money"))
+    local cash = cashObj and cashObj.Value or 0
+
+    local fixedAny = false
+    local actions = {}
+
+    for slot, bay in pairs(s.bays) do
+        if bay and bay.car then
+            local carName = tostring(bay.display or bay.car or slot)
+            if bay.kind == "project" then
+                -- Try restoring all faults on project car
+                local resAll = Net.Call("restore", slot, "all")
+                if resAll and resAll.ok then
+                    fixedAny = true
+                    table.insert(actions, carName .. " (Restored)")
+                else
+                    -- Restore individual faults player can afford
+                    if bay.faults then
+                        for _, fault in ipairs(bay.faults) do
+                            if not fault.fixed then
+                                local cost = tonumber(fault.cost) or 0
+                                if cash >= cost then
+                                    local resOne = Net.Call("restore", slot, fault.id)
+                                    if resOne and resOne.ok then
+                                        fixedAny = true
+                                        cash = cash - cost
+                                        table.insert(actions, carName .. " (" .. tostring(fault.label or fault.id) .. ")")
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            elseif bay.kind == "service" then
+                -- Customer service vehicle: wash, paint, plate, rims
+                local spec = bay.spec or {}
+                local picks = {
+                    wash = (spec.washed ~= false),
+                    paint = spec.paint,
+                    plate = spec.plate,
+                    rims = spec.rims
+                }
+                local resPrep = Net.Call("prepAll", slot, picks)
+                if resPrep and resPrep.ok then
+                    fixedAny = true
+                    table.insert(actions, carName .. " (Prepped & Washed)")
+                end
+            else
+                -- Contract or other vehicle
+                Net.Call("repair", slot)
+                Net.Call("prepAll", slot, {})
+                fixedAny = true
+                table.insert(actions, carName .. " (Repaired)")
+            end
+        end
+    end
+
+    if fixedAny then
+        return true, table.concat(actions, ", ")
+    else
+        return false, "All vehicles inside business in top condition"
+    end
+end
+
+-- ======================================================================
+-- 4 SEPARATE INDEPENDENT TOGGLES
+-- ======================================================================
+contractsToggle = createToggle(
+    bizAutoCard,
+    "📋 Auto Contracts",
+    "Auto-picks best fee, retrieves car & sells to Collector (+30%)",
+    false,
+    UDim2.new(0, 14, 0, 48),
+    UDim2.new(1, -28, 0, 44),
+    function(state)
+        autoContractsActive = state
+        if state then
+            contractsToggle.SetStatus("Active • Waiting for task slot...", C_GREEN)
+        else
+            contractsToggle.SetStatus("Disabled • Click switch to start", C_MUTED)
+        end
+    end
+)
+
+customersToggle = createToggle(
+    bizAutoCard,
+    "👥 Auto Customers",
+    "Auto-accepts waiting clients, fulfills order specs & returns car",
+    false,
+    UDim2.new(0, 14, 0, 98),
+    UDim2.new(1, -28, 0, 44),
+    function(state)
+        autoCustomersActive = state
+        if state then
+            customersToggle.SetStatus("Active • Watching office door...", C_GREEN)
+        else
+            customersToggle.SetStatus("Disabled • Click switch to start", C_MUTED)
+        end
+    end
+)
+
+auctionsToggle = createToggle(
+    bizAutoCard,
+    "🏷️ Auto Auctions",
+    "Bids on lots, auto-restores won cars & delivers to Collector (+30%)",
+    false,
+    UDim2.new(0, 14, 0, 148),
+    UDim2.new(1, -28, 0, 44),
+    function(state)
+        autoAuctionsActive = state
+        if state then
+            auctionsToggle.SetStatus("Active • Polling auction lots...", C_GREEN)
+        else
+            auctionsToggle.SetStatus("Disabled • Click switch to start", C_MUTED)
+        end
+    end
+)
+
+restoreToggle = createToggle(
+    bizAutoCard,
+    "🛠️ Auto Restore / Fix Bays",
+    "Auto-restores project cars, repairs care & fulfills order specs",
+    false,
+    UDim2.new(0, 14, 0, 198),
+    UDim2.new(1, -28, 0, 44),
+    function(state)
+        autoRestoreActive = state
+        if state then
+            restoreToggle.SetStatus("Active • Monitoring & fixing bay cars...", C_GREEN)
+        else
+            restoreToggle.SetStatus("Disabled • Click switch to start", C_MUTED)
+        end
+    end
+)
+
+-- ======================================================================
+-- PRIORITY AUTOMATION COORDINATOR (1: CONTRACTS > 2: AUCTIONS > 3: CUSTOMERS)
+-- ======================================================================
+task.spawn(function()
+    while true do
+        task.wait(0.7)
+
+        -- Mutex: wait if player is physically on the road / delivering
+        if missionBusy then
+            continue
+        end
+
+        -- Idle if none of the 3 main business toggles are active
+        if not (autoContractsActive or autoAuctionsActive or autoCustomersActive) then
+            continue
+        end
+
+        local Net = getNet()
+        if not Net then continue end
+        local s = Net.State()
+        local slots = getBaySlots(s)
+        local hasActiveMission = s and s.mission ~= nil
+
+        -- -------------------------------------------------------------
+        -- PRIORITY 1: AUTO CONTRACTS
+        -- (Must finish all board contracts first. Yields only when board has 0 untaken offers)
+        -- -------------------------------------------------------------
+        local contractsHasWork = false
+        local nextBoardTime = 0
+        local untakenContracts = 0
+
+        if autoContractsActive then
+            if hasActiveMission and not (s.mission.buyer or s.mission.destName) then
+                contractsHasWork = true
+            elseif slots.isFull then
+                contractsToggle.SetStatus(string.format("Bays full (%d/%d) • Contracts paused", slots.occupied, slots.total), Color3.fromRGB(241, 196, 15))
+                contractsHasWork = false
+            else
+                local untaken, nextRefresh = checkContractBoard()
+                untakenContracts = untaken
+                nextBoardTime = nextRefresh
+                local serverTime = workspace:GetServerTimeNow()
+                local secsLeft = math.max(0, math.floor(nextBoardTime - serverTime))
+                local timeStr = string.format("%d:%02d", secsLeft // 60, secsLeft % 60)
+
+                if untaken > 0 then
+                    contractsHasWork = true
+                else
+                    contractsToggle.SetStatus(string.format("Board cleared (0 left) • Yielding to Auctions • Next in %s", timeStr), Color3.fromRGB(52, 152, 219))
+                    contractsHasWork = false
+                end
+            end
+        end
+
+        if contractsHasWork then
+            -- CONTRACTS RUNS! Priority 2 (Auctions) and Priority 3 (Customers) yield.
+            if autoAuctionsActive then
+                auctionsToggle.SetStatus("Queued (Priority 2) • Waiting for Contracts to finish board", C_MUTED)
+            end
+            if autoCustomersActive then
+                customersToggle.SetStatus("Queued (Priority 3) • Waiting for Contracts to finish", C_MUTED)
+            end
+
+            missionBusy = true
+            local ok, success, code, extra = pcall(runOneContract)
+            missionBusy = false
+            boardCache.checkedAt = 0 -- refresh board state immediately
+
+            if ok and success then
+                task.wait(1.5)
+            else
+                task.wait(2.5)
+            end
+            continue
+        end
+
+        -- -------------------------------------------------------------
+        -- PRIORITY 2: AUTO AUCTIONS
+        -- (Runs when Contracts has cleared the board or is disabled)
+        -- -------------------------------------------------------------
+        local auctionsHasWork = false
+        local projectBay = (slots.projectBays and slots.projectBays[1])
+
+        if autoAuctionsActive then
+            if projectBay then
+                auctionsHasWork = true
+            elseif not slots.isFull then
+                auctionsHasWork = true
+            else
+                auctionsToggle.SetStatus(string.format("Bays full (%d/%d) • Bidding paused", slots.occupied, slots.total), Color3.fromRGB(241, 196, 15))
+                auctionsHasWork = false
+            end
+        end
+
+        if auctionsHasWork then
+            -- Sub-step A: If a won project car is in a garage bay, restore and sell to Collector (+30%)
+            if projectBay then
+                if autoCustomersActive then
+                    customersToggle.SetStatus("Queued (Priority 3) • Waiting for Auction car delivery", C_MUTED)
+                end
+
+                missionBusy = true
+                auctionsToggle.SetStatus("Fixing & delivering won car to Collector (+30%)...", C_ACCENT)
+                local ok, sold, msg = pcall(sellAndDeliverToCollector, projectBay)
+                missionBusy = false
+
+                if ok and sold then
+                    auctionsToggle.SetStatus(tostring(msg), C_GREEN)
+                    task.wait(2)
+                else
+                    auctionsToggle.SetStatus("Sale: " .. tostring(msg), Color3.fromRGB(241, 196, 15))
+                    task.wait(3.5)
+                end
+                continue
+            end
+
+            -- Sub-step B: Evaluate and bid on auction lots
+            local okBid, bidSuccess, bidMsg = pcall(runAuctionCycle)
+            if okBid and bidSuccess then
+                -- Successfully placed a bid or leading lot
+                task.wait(3.5)
+                continue
+            else
+                -- No profitable lot or already leading all lots!
+                -- If Customers is active, yield so it can serve clients while waiting on auction lots
+                if autoCustomersActive then
+                    auctionsToggle.SetStatus(tostring(bidMsg) .. " • Yielding to Customers", Color3.fromRGB(241, 196, 15))
+                end
+            end
+        end
+
+        -- -------------------------------------------------------------
+        -- PRIORITY 3: AUTO CUSTOMERS
+        -- (Runs when Contracts has no board offers AND Auctions has no car to deliver or bids to place)
+        -- -------------------------------------------------------------
+        if autoCustomersActive then
+            local hasDoorCust = s and s.cust and s.cust.door and #s.cust.door > 0
+            local hasServiceBay = #slots.serviceBays > 0
+
+            if hasServiceBay or (hasDoorCust and not slots.isFull) then
+                missionBusy = true
+                local ok, res = pcall(runOneCustomer)
+                missionBusy = false
+                task.wait(2)
+                continue
+            elseif slots.isFull and not hasServiceBay then
+                customersToggle.SetStatus(string.format("Bays full (%d/%d) • Client work paused", slots.occupied, slots.total), Color3.fromRGB(241, 196, 15))
+            else
+                customersToggle.SetStatus("Watching office door for clients...", C_MUTED)
+            end
+        end
+    end
+end)
+
+-- Background Worker 4: Auto Restore / Fix Bays
+task.spawn(function()
+    while true do
+        if autoRestoreActive then
+            local ok, success, detail = pcall(fixAllBays)
+            if ok and success then
+                restoreToggle.SetStatus("Serviced: " .. tostring(detail), C_GREEN)
+            elseif ok and not success then
+                restoreToggle.SetStatus(tostring(detail), C_MUTED)
+            else
+                restoreToggle.SetStatus("Error fixing bays: " .. tostring(success), C_RED)
+            end
+            task.wait(3.5)
+        else
+            task.wait(1.5)
+        end
+    end
+end)
+
+-- ======================================================================
+-- QUICK MANUAL ACTIONS
+-- ======================================================================
+createButton(bizAutoCard, "⚡ Run 1 Contract", Color3.fromRGB(52, 152, 219), UDim2.new(0, 14, 0, 250), UDim2.new(0, 146, 0, 28), function()
+    task.spawn(function()
+        if missionBusy then
+            setAutoStatus("System busy with another task", Color3.fromRGB(241, 196, 15))
+            return
+        end
+        missionBusy = true
+        pcall(runOneContract)
+        missionBusy = false
+    end)
+end)
+
+createButton(bizAutoCard, "👥 Serve Client", Color3.fromRGB(155, 89, 182), UDim2.new(0, 168, 0, 250), UDim2.new(0, 146, 0, 28), function()
+    task.spawn(function()
+        if missionBusy then
+            setAutoStatus("System busy with another task", Color3.fromRGB(241, 196, 15))
+            return
+        end
+        missionBusy = true
+        pcall(runOneCustomer)
+        missionBusy = false
+    end)
+end)
+
+createButton(bizAutoCard, "🏷️ Bid Best Lot", Color3.fromRGB(241, 196, 15), UDim2.new(0, 322, 0, 250), UDim2.new(0, 154, 0, 28), function()
+    task.spawn(runAuctionCycle)
+end)
+
+createButton(bizAutoCard, "🛠️ Restore & Clean All Bays", Color3.fromRGB(45, 52, 70), UDim2.new(0, 14, 0, 284), UDim2.new(0, 226, 0, 28), function()
+    task.spawn(function()
+        local ok, success, detail = pcall(fixAllBays)
+        refreshBusiness()
+        if ok and success then
+            setAutoStatus("Bays: " .. tostring(detail), C_GREEN)
+        else
+            setAutoStatus("Bays: " .. tostring(detail or "Checked"), C_MUTED)
+        end
+    end)
+end)
+
+createButton(bizAutoCard, "🛑 Cancel Active Mission", Color3.fromRGB(192, 57, 43), UDim2.new(0, 248, 0, 284), UDim2.new(0, 228, 0, 28), function()
+    local Net = getNet()
+    if Net then
+        Net.Call("cancel")
+        Net.Call("go")
+        missionBusy = false
+        refreshBusiness()
+        setAutoStatus("Active mission cancelled", C_RED)
+    end
+end)
+
+local autoHelpText = Instance.new("TextLabel")
+autoHelpText.Text = "Turn on any toggle above to run fully automated in the background. Each feature operates independently or together seamlessly without vehicle conflict."
+autoHelpText.Font = Enum.Font.Gotham
+autoHelpText.TextSize = 10
+autoHelpText.TextColor3 = C_MUTED
+autoHelpText.TextXAlignment = Enum.TextXAlignment.Left
+autoHelpText.TextWrapped = true
+autoHelpText.Position = UDim2.new(0, 14, 0, 320)
+autoHelpText.Size = UDim2.new(1, -28, 0, 48)
+autoHelpText.BackgroundTransparency = 1
+autoHelpText.Parent = bizAutoCard
+
+-- ======================================================================
+-- 2. CATEGORY: JOBS 🛠️
+-- ======================================================================
+local pageJobs = createTabButton("Jobs", "🛠️", 2)
+
+local jobStatusCard = createCard(pageJobs, "Active Shift Status", 75)
+local jobStatusLabel = Instance.new("TextLabel")
+jobStatusLabel.Text = "Current Shift: None"
+jobStatusLabel.Font = Enum.Font.GothamMedium
+jobStatusLabel.TextSize = 13
+jobStatusLabel.TextColor3 = C_TEXT
+jobStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+jobStatusLabel.Position = UDim2.new(0, 14, 0, 34)
+jobStatusLabel.Size = UDim2.new(0.9, 0, 0, 24)
+jobStatusLabel.BackgroundTransparency = 1
+jobStatusLabel.Parent = jobStatusCard
+
+local function updateJobStatus()
+    local shift = player:GetAttribute("JobShift")
+    if shift and shift ~= "" then
+        jobStatusLabel.Text = "Current Shift: " .. tostring(shift)
+        jobStatusLabel.TextColor3 = C_GREEN
+    else
+        jobStatusLabel.Text = "Current Shift: None (Off Shift)"
+        jobStatusLabel.TextColor3 = C_MUTED
+    end
+end
+player:GetAttributeChangedSignal("JobShift"):Connect(updateJobStatus)
+updateJobStatus()
+
+local jobSelectCard = createCard(pageJobs, "Available Jobs & Shifts", 195)
+local jobList = {
+    { name = "Mechanic", icon = "🔧" },
+    { name = "Car Delivery", icon = "🚚" },
+    { name = "Taxi", icon = "🚕" },
+    { name = "Bus Driver", icon = "🚌" },
+    { name = "Tow Truck", icon = "🛻" },
+    { name = "Pizza Delivery", icon = "🍕" },
+}
+
+local selectedJob = "Mechanic"
+local jobButtons = {}
+
+for idx, jData in ipairs(jobList) do
+    local col = (idx - 1) % 2
+    local row = math.floor((idx - 1) / 2)
+    local xPos = col == 0 and UDim2.new(0, 14, 0, 32 + row * 38) or UDim2.new(0.51, 0, 0, 32 + row * 38)
+
+    local jBtn = Instance.new("TextButton")
+    jBtn.Text = jData.icon .. "  " .. jData.name
+    jBtn.Font = Enum.Font.GothamSemibold
+    jBtn.TextSize = 12
+    jBtn.TextColor3 = (jData.name == selectedJob) and Color3.fromRGB(255, 255, 255) or C_MUTED
+    jBtn.BackgroundColor3 = (jData.name == selectedJob) and C_ACCENT or C_CARD_HOVER
+    jBtn.Size = UDim2.new(0.47, 0, 0, 32)
+    jBtn.Position = xPos
+    jBtn.Parent = jobSelectCard
+
+    local jCorner = Instance.new("UICorner")
+    jCorner.CornerRadius = UDim.new(0, 6)
+    jCorner.Parent = jBtn
+
+    jBtn.MouseButton1Click:Connect(function()
+        selectedJob = jData.name
+        for name, b in pairs(jobButtons) do
+            if name == selectedJob then
+                b.BackgroundColor3 = C_ACCENT
+                b.TextColor3 = Color3.fromRGB(255, 255, 255)
+            else
+                b.BackgroundColor3 = C_CARD_HOVER
+                b.TextColor3 = C_MUTED
+            end
+        end
+    end)
+    jobButtons[jData.name] = jBtn
+end
+
+createButton(jobSelectCard, "▶ Start Selected Job", Color3.fromRGB(46, 204, 113), UDim2.new(0, 14, 0, 152), UDim2.new(0.96, 0, 0, 32), function()
+    local selectEvt = ReplicatedStorage:FindFirstChild("SelectJobEvent")
+    if selectEvt then
+        selectEvt:FireServer(selectedJob)
+        task.wait(0.5)
+        updateJobStatus()
+    end
+end)
+
+local jobFastFixCard = createCard(pageJobs, "Mechanic & Job Automation", 100)
+createButton(jobFastFixCard, "⚡ Instant Repair / Step Mechanic Task", C_ACCENT, UDim2.new(0, 14, 0, 32), UDim2.new(0.96, 0, 0, 30), function()
+    local mechRemotes = ReplicatedStorage:FindFirstChild("CarMechanicJob") and ReplicatedStorage.CarMechanicJob:FindFirstChild("Remotes")
+    if mechRemotes then
+        pcall(function()
+            if mechRemotes:FindFirstChild("onJobStarted") then
+                mechRemotes.onJobStarted:FireServer()
+            end
+            if mechRemotes:FindFirstChild("jobStep") then
+                mechRemotes.jobStep:FireServer()
+            end
+            if mechRemotes:FindFirstChild("taskCompleted") then
+                mechRemotes.taskCompleted:FireServer("Repair")
+            end
+            if mechRemotes:FindFirstChild("jobDone") then
+                mechRemotes.jobDone:FireServer()
+            end
+        end)
+    end
+end)
+
+createButton(jobFastFixCard, "🛑 End Current Shift", C_RED, UDim2.new(0, 14, 0, 68), UDim2.new(0.96, 0, 0, 24), function()
+    local mechRemotes = ReplicatedStorage:FindFirstChild("CarMechanicJob") and ReplicatedStorage.CarMechanicJob:FindFirstChild("Remotes")
+    if mechRemotes and mechRemotes:FindFirstChild("onJobEnded") then
+        mechRemotes.onJobEnded:FireServer()
+    end
+    task.wait(0.5)
+    updateJobStatus()
+end)
+
+-- ======================================================================
+-- 3. CATEGORY: RACING 🏁
+-- ======================================================================
+local pageRacing = createTabButton("Racing", "🏁", 3)
+
+local raceSelectCard = createCard(pageRacing, "Select Race Track", 150)
+local trackList = {
+    { name = "SuburbanDash", title = "Suburban Dash" },
+    { name = "KaiapoiCircuit", title = "Kaiapoi Circuit" },
+    { name = "HighwaySprint", title = "Highway Sprint" },
+    { name = "OutskirtsTour", title = "Outskirts Tour" },
+    { name = "CoastalView", title = "Coastal View" },
+}
+
+local selectedRace = "SuburbanDash"
+local raceBtns = {}
+
+for idx, rData in ipairs(trackList) do
+    local col = (idx - 1) % 2
+    local row = math.floor((idx - 1) / 2)
+    local xPos = col == 0 and UDim2.new(0, 14, 0, 32 + row * 36) or UDim2.new(0.51, 0, 0, 32 + row * 36)
+    local width = (idx == 5) and UDim2.new(0.96, 0, 0, 30) or UDim2.new(0.47, 0, 0, 30)
+
+    local rBtn = Instance.new("TextButton")
+    rBtn.Text = "🏁 " .. rData.title
+    rBtn.Font = Enum.Font.GothamSemibold
+    rBtn.TextSize = 12
+    rBtn.TextColor3 = (rData.name == selectedRace) and Color3.fromRGB(255, 255, 255) or C_MUTED
+    rBtn.BackgroundColor3 = (rData.name == selectedRace) and C_ACCENT or C_CARD_HOVER
+    rBtn.Size = width
+    rBtn.Position = xPos
+    rBtn.Parent = raceSelectCard
+
+    local rCorner = Instance.new("UICorner")
+    rCorner.CornerRadius = UDim.new(0, 6)
+    rCorner.Parent = rBtn
+
+    rBtn.MouseButton1Click:Connect(function()
+        selectedRace = rData.name
+        for name, b in pairs(raceBtns) do
+            if name == selectedRace then
+                b.BackgroundColor3 = C_ACCENT
+                b.TextColor3 = Color3.fromRGB(255, 255, 255)
+            else
+                b.BackgroundColor3 = C_CARD_HOVER
+                b.TextColor3 = C_MUTED
+            end
+        end
+    end)
+    raceBtns[rData.name] = rBtn
+end
+
+local raceControlsCard = createCard(pageRacing, "Race Teleports & Actions", 135)
+
+local function teleportToRace()
+    local raceFolder = workspace:FindFirstChild("Races") and workspace.Races:FindFirstChild(selectedRace)
+    if raceFolder and raceFolder:FindFirstChild("StartCircle") then
+        local targetCF = raceFolder.StartCircle.CFrame + Vector3.new(0, 4, 0)
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum and hum.SeatPart and hum.SeatPart:IsA("VehicleSeat") then
+            local car = hum.SeatPart:FindFirstAncestorOfClass("Model")
+            if car and car.PrimaryPart then
+                car:SetPrimaryPartCFrame(targetCF)
+            else
+                hum.SeatPart.CFrame = targetCF
+            end
+        elseif char and char:FindFirstChild("HumanoidRootPart") then
+            char.HumanoidRootPart.CFrame = targetCF
+        end
+    end
+end
+
+createButton(raceControlsCard, "📍 Teleport to Start Circle", C_ACCENT, UDim2.new(0, 14, 0, 32), UDim2.new(0.47, 0, 0, 32), teleportToRace)
+
+createButton(raceControlsCard, "🟢 Join Race Queue", Color3.fromRGB(46, 204, 113), UDim2.new(0.51, 0, 0, 32), UDim2.new(0.46, 0, 0, 32), function()
+    local joinEvt = ReplicatedStorage:FindFirstChild("RaceEvents") and ReplicatedStorage.RaceEvents:FindFirstChild("JoinRace")
+    if joinEvt then
+        joinEvt:FireServer(selectedRace)
+    end
+end)
+
+createButton(raceControlsCard, "🔴 Leave Active Race", C_RED, UDim2.new(0, 14, 0, 70), UDim2.new(0.96, 0, 0, 26), function()
+    local leaveEvt = ReplicatedStorage:FindFirstChild("RaceEvents") and ReplicatedStorage.RaceEvents:FindFirstChild("LeaveRace")
+    if leaveEvt then
+        leaveEvt:FireServer()
+    end
+end)
+
+local raceAutoCard = createCard(pageRacing, "Race Auto-Finish (Checkpoints)", 105)
+local autoWinRunning = false
+local autoWinBtn
+
+local function runAutoCheckpoints()
+    if autoWinRunning then
+        autoWinRunning = false
+        autoWinBtn.Text = "🏆 Auto-Win Race (Run Checkpoints)"
+        autoWinBtn.BackgroundColor3 = Color3.fromRGB(241, 196, 15)
+        return
+    end
+
+    autoWinRunning = true
+    autoWinBtn.Text = "⏹ Stop Auto-Win"
+    autoWinBtn.BackgroundColor3 = C_RED
+
+    task.spawn(function()
+        local raceFolder = workspace:FindFirstChild("Races") and workspace.Races:FindFirstChild(selectedRace)
+        if not raceFolder then
+            autoWinRunning = false
+            autoWinBtn.Text = "🏆 Auto-Win Race (Run Checkpoints)"
+            autoWinBtn.BackgroundColor3 = Color3.fromRGB(241, 196, 15)
+            return
+        end
+
+        local checkpoints = {}
+        for _, c in ipairs(raceFolder:GetChildren()) do
+            if c.Name:match("^Checkpoint%d+$") then
+                local num = tonumber(c.Name:match("%d+"))
+                table.insert(checkpoints, { part = c, num = num })
+            end
+        end
+        table.sort(checkpoints, function(a, b) return a.num < b.num end)
+
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local mover = hum and hum.SeatPart or (char and char:FindFirstChild("HumanoidRootPart"))
+
+        for _, cp in ipairs(checkpoints) do
+            if not autoWinRunning then break end
+            if mover and mover.Parent then
+                local car = hum and hum.SeatPart and hum.SeatPart:FindFirstAncestorOfClass("Model")
+                local targetCF = cp.part.CFrame + Vector3.new(0, 2, 0)
+                if car and car.PrimaryPart then
+                    car:SetPrimaryPartCFrame(targetCF)
+                else
+                    mover.CFrame = targetCF
+                end
+            end
+            task.wait(0.35)
+        end
+
+        if autoWinRunning and raceFolder:FindFirstChild("FinishLine") then
+            local targetCF = raceFolder.FinishLine.CFrame + Vector3.new(0, 2, 0)
+            local car = hum and hum.SeatPart and hum.SeatPart:FindFirstAncestorOfClass("Model")
+            if car and car.PrimaryPart then
+                car:SetPrimaryPartCFrame(targetCF)
+            elseif mover then
+                mover.CFrame = targetCF
+            end
+        end
+
+        autoWinRunning = false
+        autoWinBtn.Text = "🏆 Auto-Win Race (Run Checkpoints)"
+        autoWinBtn.BackgroundColor3 = Color3.fromRGB(241, 196, 15)
+    end)
+end
+
+autoWinBtn = createButton(raceAutoCard, "🏆 Auto-Win Race (Run Checkpoints)", Color3.fromRGB(241, 196, 15), UDim2.new(0, 14, 0, 32), UDim2.new(0.96, 0, 0, 32), runAutoCheckpoints)
+
+local autoNotice = Instance.new("TextLabel")
+autoNotice.Text = "Sequentially teleports car/player through every checkpoint to FinishLine."
+autoNotice.Font = Enum.Font.Gotham
+autoNotice.TextSize = 10
+autoNotice.TextColor3 = C_MUTED
+autoNotice.TextXAlignment = Enum.TextXAlignment.Left
+autoNotice.Position = UDim2.new(0, 14, 0, 72)
+autoNotice.Size = UDim2.new(1, -28, 0, 20)
+autoNotice.BackgroundTransparency = 1
+autoNotice.Parent = raceAutoCard
+
+-- ======================================================================
+-- INITIALIZATION
+-- ======================================================================
+switchTab("Business")
+refreshBusiness()
