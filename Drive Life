@@ -660,6 +660,132 @@ local customersToggle
 local auctionsToggle
 local restoreToggle
 
+-- ======================================================================
+-- HIGH-ALTITUDE SKY CRUISE & SAFE FEATHERED LANDING
+-- Cruises at Y=750 (150+ studs above all mountains/trees) at 235 studs/s
+-- Lands with 0% impact damage using raycasted ground & tire clearance
+-- ======================================================================
+local function glideVehicleTo(car, targetPos, maxSpeed, onProgress)
+    if not car or not car.PrimaryPart then return false end
+    maxSpeed = maxSpeed or 235 -- Safe cruising speed strictly below server limit (260)
+
+    local startPos = car.PrimaryPart.Position
+    local totalDist = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(startPos.X, 0, startPos.Z)).Magnitude
+
+    if totalDist < 25 then
+        car:SetPrimaryPartCFrame(CFrame.new(targetPos))
+        return true
+    end
+
+    -- High-altitude cruise: 750 studs Y (highest mountain/tree in map is Y=592)
+    local cruiseY = math.max(startPos.Y + 250, targetPos.Y + 250, 750)
+    local dirXZ = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(startPos.X, 0, startPos.Z)).Unit
+    local velocity = Vector3.new(dirXZ.X * maxSpeed, 0, dirXZ.Z * maxSpeed)
+
+    -- Phase 1: Straight vertical ascent into high clear airspace (clears local trees/roofs)
+    local liftStart = car.PrimaryPart.Position
+    local liftSteps = 16
+    for i = 1, liftSteps do
+        local alpha = i / liftSteps
+        local smoothed = math.sin(alpha * math.pi / 2)
+        local currentY = liftStart.Y + (cruiseY - liftStart.Y) * smoothed
+        local lookPos = Vector3.new(liftStart.X + dirXZ.X * 10, currentY, liftStart.Z + dirXZ.Z * 10)
+        car:SetPrimaryPartCFrame(CFrame.lookAt(Vector3.new(liftStart.X, currentY, liftStart.Z), lookPos))
+        for _, p in ipairs(car:GetDescendants()) do
+            if p:IsA("BasePart") then
+                p.AssemblyLinearVelocity = Vector3.new(0, 15, 0)
+                p.AssemblyAngularVelocity = Vector3.zero
+            end
+        end
+        task.wait(0.04)
+    end
+
+    -- Phase 2: High-altitude cruise at 235 studs/s (satisfies server speed check without obstacles)
+    local curPos = car.PrimaryPart.Position
+    local remaining = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(curPos.X, 0, curPos.Z)).Magnitude
+    local lastTime = os.clock()
+
+    while remaining > 35 do
+        local dt = os.clock() - lastTime
+        lastTime = os.clock()
+        dt = math.clamp(dt, 0.01, 0.1)
+
+        local stepDist = maxSpeed * dt
+        curPos = curPos + Vector3.new(dirXZ.X * stepDist, 0, dirXZ.Z * stepDist)
+        remaining = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(curPos.X, 0, curPos.Z)).Magnitude
+
+        local targetLook = curPos + Vector3.new(dirXZ.X * 10, 0, dirXZ.Z * 10)
+        car:SetPrimaryPartCFrame(CFrame.lookAt(curPos, targetLook))
+
+        for _, part in ipairs(car:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.AssemblyLinearVelocity = velocity
+                part.AssemblyAngularVelocity = Vector3.zero
+            end
+        end
+
+        if onProgress then
+            local etaSecs = math.ceil(remaining / maxSpeed)
+            onProgress(remaining, totalDist, etaSecs)
+        end
+
+        task.wait(0.03)
+    end
+
+    -- Phase 3: Safe Feathered Landing (Raycast ground + Tire clearance = 0% Damage)
+    pcall(function() player:RequestStreamAroundAsync(targetPos) end)
+
+    local rayOrigin = Vector3.new(targetPos.X, targetPos.Y + 25, targetPos.Z)
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = { car, player.Character }
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    local groundHit = workspace:Raycast(rayOrigin, Vector3.new(0, -50, 0), rayParams)
+    local groundY = groundHit and groundHit.Position.Y or targetPos.Y
+
+    -- Calculate exact tire clearance to prevent ground clipping or drop impact
+    local lowestPartY = math.huge
+    for _, p in ipairs(car:GetDescendants()) do
+        if p:IsA("BasePart") then
+            local bottom = p.Position.Y - (p.Size.Y / 2)
+            if bottom < lowestPartY then
+                lowestPartY = bottom
+            end
+        end
+    end
+    local tireOffset = math.clamp(car.PrimaryPart.Position.Y - lowestPartY, 0.8, 3.5)
+    local safeLandingPos = Vector3.new(targetPos.X, groundY + tireOffset + 0.12, targetPos.Z)
+
+    -- Decelerate descent gently with feathered cushion
+    local descentStart = car.PrimaryPart.Position
+    local descentSteps = 24
+    for i = 1, descentSteps do
+        local alpha = i / descentSteps
+        local smoothed = 1 - math.cos(alpha * math.pi / 2) -- Soft feathering near ground
+        local currentPos = descentStart:Lerp(safeLandingPos, smoothed)
+        local targetLook = currentPos + Vector3.new(dirXZ.X * 5, 0, dirXZ.Z * 5)
+        car:SetPrimaryPartCFrame(CFrame.lookAt(currentPos, targetLook))
+
+        for _, part in ipairs(car:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.AssemblyLinearVelocity = Vector3.zero
+                part.AssemblyAngularVelocity = Vector3.zero
+            end
+        end
+        task.wait(0.04)
+    end
+
+    -- Final settle: 0 velocity cushion resting softly on wheels
+    car:SetPrimaryPartCFrame(CFrame.new(safeLandingPos))
+    for _, part in ipairs(car:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.AssemblyLinearVelocity = Vector3.zero
+            part.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+
+    return true
+end
+
 local function runOneCustomer()
     local Net = getNet()
     if not Net then return false, "No Net" end
@@ -740,7 +866,6 @@ local function runOneCustomer()
     s = Net.State()
     local m = s.mission
     if m and m.dest then
-        customersToggle.SetStatus("Delivering vehicle to destination...", C_GREEN)
         local dest = Vector3.new(m.dest[1], m.dest[2] + 2, m.dest[3])
         local car = workspace.Vehicles:FindFirstChild(player.Name .. " - Business")
         local seat = car and car:FindFirstChild("DriveSeat", true)
@@ -748,19 +873,15 @@ local function runOneCustomer()
 
         if seat and hum and seat.Occupant ~= hum then
             seat:Sit(hum)
-            task.wait(0.4)
+            task.wait(0.5)
         end
 
         pcall(function() player:RequestStreamAroundAsync(dest) end)
-        if car and car.PrimaryPart then
-            car:SetPrimaryPartCFrame(CFrame.new(dest))
-            for _, p in ipairs(car:GetDescendants()) do
-                if p:IsA("BasePart") then
-                    p.AssemblyLinearVelocity = Vector3.zero
-                    p.AssemblyAngularVelocity = Vector3.zero
-                end
-            end
-        end
+        glideVehicleTo(car, dest, 235, function(left, total, eta)
+            local statusStr = string.format("Delivering order: %d studs left (ETA: %ds)...", math.floor(left), eta)
+            customersToggle.SetStatus(statusStr, C_GREEN)
+            setAutoStatus(statusStr, C_GREEN)
+        end)
         task.wait(2.5)
     end
 
@@ -838,27 +959,18 @@ local function sellAndDeliverToCollector(slot)
 
     if seat and hum and seat.Occupant ~= hum then
         seat:Sit(hum)
-        task.wait(0.4)
+        task.wait(0.5)
     end
 
     pcall(function() player:RequestStreamAroundAsync(dest) end)
-    if car and car.PrimaryPart then
-        car:SetPrimaryPartCFrame(CFrame.new(dest))
-        for _, p in ipairs(car:GetDescendants()) do
-            if p:IsA("BasePart") then
-                p.AssemblyLinearVelocity = Vector3.zero
-                p.AssemblyAngularVelocity = Vector3.zero
-            end
-        end
-    end
+    glideVehicleTo(car, dest, 235, function(left, total, eta)
+        local statusStr = string.format("Delivering to Collector: %d studs left (ETA: %ds)...", math.floor(left), eta)
+        auctionsToggle.SetStatus(statusStr, C_ACCENT)
+        setAutoStatus(statusStr, C_ACCENT)
+    end)
 
     -- Hold still inside ring for 2.5s for server validation
-    for i = 1, 10 do
-        task.wait(0.25)
-        if car and car.PrimaryPart then
-            car.PrimaryPart.AssemblyLinearVelocity = Vector3.zero
-        end
-    end
+    task.wait(2.5)
 
     Net.Call("go")
     refreshBusiness()
@@ -997,25 +1109,26 @@ local function runOneContract()
         local seat = car and car:FindFirstChild("DriveSeat", true)
         if seat and hum then
             seat:Sit(hum)
-            task.wait(0.5)
+            task.wait(0.6)
         end
     end
 
     if dest then
-        setAutoStatus("Delivering vehicle to office garage...", Color3.fromRGB(52, 152, 219))
-        contractsToggle.SetStatus("Delivering vehicle to office garage...", Color3.fromRGB(52, 152, 219))
-        pcall(function() player:RequestStreamAroundAsync(dest) end)
-
         local car = workspace.Vehicles:FindFirstChild(player.Name .. " - Business")
-        if car and car.PrimaryPart then
-            car:SetPrimaryPartCFrame(CFrame.new(dest))
-            for _, p in ipairs(car:GetDescendants()) do
-                if p:IsA("BasePart") then
-                    p.AssemblyLinearVelocity = Vector3.zero
-                    p.AssemblyAngularVelocity = Vector3.zero
-                end
-            end
+        local seat = car and car:FindFirstChild("DriveSeat", true)
+        local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+
+        if seat and hum and seat.Occupant ~= hum then
+            seat:Sit(hum)
+            task.wait(0.5)
         end
+
+        pcall(function() player:RequestStreamAroundAsync(dest) end)
+        glideVehicleTo(car, dest, 235, function(left, total, eta)
+            local statusStr = string.format("Retrieving vehicle: %d studs left (ETA: %ds)...", math.floor(left), eta)
+            contractsToggle.SetStatus(statusStr, Color3.fromRGB(52, 152, 219))
+            setAutoStatus(statusStr, Color3.fromRGB(52, 152, 219))
+        end)
         task.wait(2.5)
     end
 
