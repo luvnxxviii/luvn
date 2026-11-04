@@ -951,6 +951,137 @@ local function glideVehicleTo(car, targetPos, maxSpeed, onProgress, missionObj)
 end
 
 -- ======================================================================
+-- OFFICE PRESENCE CHECKER & GUARANTEED RETURN TELEPORTER
+-- Always verifies character is alive, unseated, and inside the office;
+-- handles respawn wait if player died, unseats from vehicle, and retries
+-- Net.Call("go") (including building-stream two-step) until inside!
+-- ======================================================================
+local function isPlayerInOffice()
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not char or not hum or hum.Health <= 0 or not root then
+        return false
+    end
+
+    local dlHouses = workspace:FindFirstChild("DLHouses")
+    local myOff = dlHouses and dlHouses:FindFirstChild("Office_" .. player.UserId)
+    if myOff and myOff:IsA("Model") then
+        local ok, pivot = pcall(function() return myOff:GetPivot() end)
+        if ok and pivot then
+            local distXZ = (Vector3.new(root.Position.X, 0, root.Position.Z) - Vector3.new(pivot.Position.X, 0, pivot.Position.Z)).Magnitude
+            if distXZ <= 95 then
+                return true
+            else
+                return false
+            end
+        end
+    end
+
+    local Net = getNet()
+    local s = Net and Net.State()
+    if s and type(s.plot) == "table" and tonumber(s.plot.x) and tonumber(s.plot.z) then
+        local distPlot = (Vector3.new(root.Position.X, 0, root.Position.Z) - Vector3.new(tonumber(s.plot.x), 0, tonumber(s.plot.z))).Magnitude
+        if distPlot <= 95 then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function ensureInOffice(statusCallback)
+    local Net = getNet()
+    if not Net then return false end
+
+    -- 1. If player died or is respawning, wait until character & HumanoidRootPart are alive
+    local waitStart = os.clock()
+    while os.clock() - waitStart < 12 and hubAlive do
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if char and hum and hum.Health > 0 and root then
+            break
+        end
+        if statusCallback then
+            statusCallback("Waiting for respawn before returning to Office...")
+        end
+        task.wait(0.4)
+    end
+
+    if isPlayerInOffice() then
+        return true
+    end
+
+    for attempt = 1, 6 do
+        if not hubAlive then break end
+        if isPlayerInOffice() then
+            return true
+        end
+
+        if statusCallback then
+            statusCallback("Teleporting back to Office...")
+        end
+
+        -- 2. Dismount from any vehicle seat so SeatWeld cannot block server teleport
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if hum and (hum.Sit or hum.SeatPart ~= nil) then
+            pcall(function()
+                local seat = hum.SeatPart
+                if seat then
+                    for _, w in ipairs(seat:GetChildren()) do
+                        if w:IsA("Weld") or w:IsA("WeldConstraint") or w.Name == "SeatWeld" then
+                            w:Destroy()
+                        end
+                    end
+                end
+                hum.Sit = false
+                hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+            end)
+            task.wait(0.25)
+        end
+
+        if root then
+            root.Anchored = false
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+
+        -- 3. Invoke Office "go" remote (handles two-step building stream if far away)
+        local res = Net.Call("go")
+        if type(res) == "table" and res.building then
+            local bClock = os.clock()
+            while os.clock() - bClock < 6 and hubAlive do
+                local dlHouses = workspace:FindFirstChild("DLHouses")
+                local myOff = dlHouses and dlHouses:FindFirstChild("Office_" .. player.UserId)
+                if myOff and myOff:GetAttribute("Ready") == true then
+                    break
+                end
+                task.wait(0.25)
+            end
+            res = Net.Call("go")
+        end
+
+        task.wait(0.7)
+        if isPlayerInOffice() then
+            return true
+        end
+
+        -- If server returned "One moment...", wait for cooldown and retry
+        local rMsg = type(res) == "table" and tostring(res.message or "") or ""
+        if rMsg == "One moment..." or rMsg:lower():find("moment") then
+            task.wait(1.2)
+        else
+            task.wait(0.5)
+        end
+    end
+
+    return isPlayerInOffice()
+end
+
+-- ======================================================================
 -- RING HANDOVER WAITER WITH ANTI-CHEAT TIME LOCK
 -- Enforces server minimum road duration + mandatory 6s hold (t.STILL = 6)
 -- ======================================================================
@@ -992,9 +1123,7 @@ local function waitForRingHandover(statusCallback, minSafeDuration, legStartTime
     end
 
     task.wait(0.8)
-    if Net then
-        Net.Call("go")
-    end
+    ensureInOffice(statusCallback)
     refreshBusiness()
     return confirmed
 end
@@ -2602,6 +2731,23 @@ autoEjectToggle = createToggle(
     end
 )
 
+-- Automatic respawn handler: if player dies while Business Automation is active, return to Office!
+player.CharacterAdded:Connect(function()
+    if not hubAlive then return end
+    task.spawn(function()
+        task.wait(1.5)
+        if hubAlive and (autoContractsActive or autoAuctionsActive or autoCustomersActive or autoRestoreActive) then
+            local Net = getNet()
+            local s = Net and Net.State()
+            if not (s and s.mission) and not missionBusy then
+                ensureInOffice(function(txt)
+                    setAutoStatus(txt, C_ACCENT)
+                end)
+            end
+        end
+    end)
+end)
+
 -- ======================================================================
 -- PRIORITY AUTOMATION COORDINATOR (1: CONTRACTS > 2: AUCTIONS > 3: CUSTOMERS)
 -- ======================================================================
@@ -2624,6 +2770,18 @@ task.spawn(function()
         local s = Net.State()
         local slots = getBaySlots(s)
         local hasActiveMission = s and s.mission ~= nil
+
+        -- Always ensure player is inside the Office whenever not on an active road mission!
+        if not hasActiveMission and not isPlayerInOffice() then
+            ensureInOffice(function(txt)
+                setAutoStatus(txt, C_ACCENT)
+                if autoContractsActive then contractsToggle.SetStatus(txt, C_ACCENT) end
+                if autoAuctionsActive then auctionsToggle.SetStatus(txt, C_ACCENT) end
+            end)
+            s = Net.State()
+            slots = getBaySlots(s)
+            hasActiveMission = s and s.mission ~= nil
+        end
 
         -- -------------------------------------------------------------
         -- PRIORITY 1: AUTO CONTRACTS (BATCH RETRIEVAL -> CUSTOMIZE -> DELIVER)
@@ -2692,11 +2850,12 @@ task.spawn(function()
             setAutoStatus("Delivering active contract car to Collector...", C_ACCENT)
             missionBusy = true
             local okSell, sold, msg = pcall(sellAndDeliverToCollector, s.mission.slot or "B1")
+            ensureInOffice(function(txt) contractsToggle.SetStatus(txt, C_ACCENT) end)
             missionBusy = false
 
             if okSell and sold then
-                contractsToggle.SetStatus("Sold to Collector (+30%)!", C_GREEN)
-                setAutoStatus("Sold to Collector (+30%)", C_GREEN)
+                contractsToggle.SetStatus("Sold to Collector (+30%)! • Back in Office", C_GREEN)
+                setAutoStatus("Sold to Collector (+30%) • Back in Office", C_GREEN)
                 task.wait(2)
             else
                 contractsToggle.SetStatus("Sale: " .. tostring(msg), Color3.fromRGB(241, 196, 15))
@@ -2710,6 +2869,7 @@ task.spawn(function()
             contractsToggle.SetStatus(string.format("Priority 1 Active (%d/%d bays) • Retrieving matching contract car...", slots.occupied, slots.total), C_ACCENT)
             missionBusy = true
             local ok, success, code, extra = pcall(runOneContract)
+            ensureInOffice(function(txt) contractsToggle.SetStatus(txt, C_ACCENT) end)
             missionBusy = false
             boardCache.checkedAt = 0
 
@@ -2738,11 +2898,12 @@ task.spawn(function()
                     setAutoStatus("Delivering " .. carName .. " to Collector...", C_ACCENT)
                     missionBusy = true
                     local okSell, sold, msg = pcall(sellAndDeliverToCollector, actualSlot, true)
+                    ensureInOffice(function(txt) contractsToggle.SetStatus(txt, C_ACCENT) end)
                     missionBusy = false
 
                     if okSell and sold then
                         contractsToggle.SetStatus("Sold " .. carName .. " in " .. tostring(actualSlot) .. " to Collector (+30%)! (" .. tostring(custDesc) .. ")", C_GREEN)
-                        setAutoStatus("Sold " .. carName .. " to Collector (+30%)", C_GREEN)
+                        setAutoStatus("Sold " .. carName .. " to Collector (+30%) • Back in Office", C_GREEN)
                         soldAny = true
                         task.wait(2)
                         break
@@ -2790,9 +2951,10 @@ task.spawn(function()
             missionBusy = true
             auctionsToggle.SetStatus("Delivering active auction sale car to Collector (+30%)...", C_ACCENT)
             local okSell, sold, msg = pcall(sellAndDeliverToCollector, s.mission.slot or "B1", true)
+            ensureInOffice(function(txt) auctionsToggle.SetStatus(txt, C_ACCENT) end)
             missionBusy = false
             if okSell and sold then
-                auctionsToggle.SetStatus(tostring(msg), C_GREEN)
+                auctionsToggle.SetStatus(tostring(msg) .. " • Back in Office", C_GREEN)
                 task.wait(2)
             else
                 auctionsToggle.SetStatus("Sale: " .. tostring(msg), Color3.fromRGB(241, 196, 15))
@@ -2809,10 +2971,11 @@ task.spawn(function()
                 missionBusy = true
                 auctionsToggle.SetStatus("Fixing & delivering won car in " .. tostring(projectBay) .. " to Collector (+30%)...", C_ACCENT)
                 local ok, sold, msg = pcall(sellAndDeliverToCollector, projectBay)
+                ensureInOffice(function(txt) auctionsToggle.SetStatus(txt, C_ACCENT) end)
                 missionBusy = false
 
                 if ok and sold then
-                    auctionsToggle.SetStatus(tostring(msg), C_GREEN)
+                    auctionsToggle.SetStatus(tostring(msg) .. " • Back in Office", C_GREEN)
                     task.wait(2)
                     continue
                 else
