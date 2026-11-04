@@ -2310,88 +2310,113 @@ createButton(raceControlsCard, "🔴 Leave Active Race", C_RED, UDim2.new(0, 14,
     end
 end)
 
-local raceAutoCard = createCard(pageRacing, "Calibrated Race & Playlist Auto-Runner", 225)
+local raceAutoCard = createCard(pageRacing, "Calibrated Race & Playlist Auto-Runner", 275)
 local raceAutoRunning = false
-local autoPlaylistLoopActive = false
+local autoContinueActive = false
+local autoRetryActive = false
+local autoDriftActive = false
 local autoWinBtn
+local autoContinueBtn
+local autoRetryBtn
+local autoDriftBtn
 local raceStatusLabel
-local playlistToggleBtn
 
--- Helper to find active race gates (supports Street Races & Playlist Race dynamic tracks)
+-- Helper to find active race gates (supports Street Races, Playlist Races, Reverse tracks)
 local function getActiveRaceGates()
-    local RaceInfo_m
-    pcall(function()
-        RaceInfo_m = require(ReplicatedStorage:WaitForChild("RaceInfo"))
-    end)
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local car = hum and hum.SeatPart and hum.SeatPart:FindFirstAncestorOfClass("Model")
+    local mover = (car and car.PrimaryPart) or (char and char:FindFirstChild("HumanoidRootPart"))
+    local myPos = mover and mover.Position or Vector3.zero
 
-    -- 1. Check workspace.Track (used by Playlist Races)
-    local track = workspace:FindFirstChild("Track")
-    if track and RaceInfo_m then
-        if track:FindFirstChild("FinishLine") then
-            local gates, finish = RaceInfo_m.Gates(track)
-            if gates and #gates > 0 and finish then
-                return gates, finish, track.Name
-            end
-        end
-        for _, c in ipairs(track:GetChildren()) do
-            if c:FindFirstChild("FinishLine") then
-                local gates, finish = RaceInfo_m.Gates(c)
-                if gates and #gates > 0 and finish then
-                    return gates, finish, c.Name
+    -- Collect all candidate race folders across workspace
+    local candidates = {}
+    local function checkFolder(parent)
+        if not parent then return end
+        for _, obj in ipairs(parent:GetChildren()) do
+            if obj:IsA("Folder") or obj:IsA("Model") then
+                local cp1 = obj:FindFirstChild("Checkpoint1")
+                local finish = obj:FindFirstChild("FinishLine")
+                if cp1 or finish then
+                    table.insert(candidates, obj)
                 end
             end
         end
-    end
-
-    -- 2. Check selected race folder in workspace.Races
-    local raceFolder = workspace:FindFirstChild("Races") and workspace.Races:FindFirstChild(selectedRace)
-    if raceFolder and RaceInfo_m and raceFolder:FindFirstChild("FinishLine") then
-        local gates, finish = RaceInfo_m.Gates(raceFolder)
-        if gates and #gates > 0 and finish then
-            return gates, finish, raceFolder.Name
+        if parent:FindFirstChild("Checkpoint1") or parent:FindFirstChild("FinishLine") then
+            table.insert(candidates, parent)
         end
     end
 
-    -- 3. Check any folder in workspace.Races that has FinishLine
-    local races = workspace:FindFirstChild("Races")
-    if races and RaceInfo_m then
-        for _, rf in ipairs(races:GetChildren()) do
-            if rf:FindFirstChild("FinishLine") then
-                local gates, finish = RaceInfo_m.Gates(rf)
-                if gates and #gates > 0 and finish then
-                    return gates, finish, rf.Name
-                end
+    checkFolder(workspace:FindFirstChild("Track"))
+    checkFolder(workspace:FindFirstChild("Races"))
+    checkFolder(workspace)
+
+    -- Find the candidate whose start or checkpoints are closest to the player's current vehicle
+    local bestFolder = nil
+    local bestDist = math.huge
+
+    for _, f in ipairs(candidates) do
+        local cp1 = f:FindFirstChild("Checkpoint1")
+        local finish = f:FindFirstChild("FinishLine")
+        local start = f:FindFirstChild("StartCircle") or f:FindFirstChild("StartPos1") or cp1
+        if start and start:IsA("BasePart") then
+            local dist = (start.Position - myPos).Magnitude
+            if dist < bestDist then
+                bestDist = dist
+                bestFolder = f
+            end
+        elseif cp1 and cp1:IsA("BasePart") then
+            local dist = (cp1.Position - myPos).Magnitude
+            if dist < bestDist then
+                bestDist = dist
+                bestFolder = f
             end
         end
     end
 
-    -- 4. Fallback: manual checkpoint collection
-    local targetFolder = (track and track:FindFirstChild("FinishLine") and track) or raceFolder
-    if targetFolder then
-        local checkpoints = {}
-        for _, c in ipairs(targetFolder:GetChildren()) do
-            if c.Name:match("^Checkpoint%d+$") then
-                local num = tonumber(c.Name:match("%d+"))
-                table.insert(checkpoints, { part = c, num = num })
-            end
+    if not bestFolder then
+        return nil, nil, nil
+    end
+
+    -- Gather all track curve waypoints (following natural road spline)
+    local waypoints = {}
+    for _, c in ipairs(bestFolder:GetChildren()) do
+        if c.Name:match("^Checkpoint%d+$") and c:IsA("BasePart") then
+            local num = tonumber(c.Name:match("%d+"))
+            table.insert(waypoints, {
+                part = c,
+                num = num,
+                isGate = (c:GetAttribute("DLFill") ~= true)
+            })
         end
-        table.sort(checkpoints, function(a, b) return a.num < b.num end)
-        local rawGates = {}
-        for _, cp in ipairs(checkpoints) do
-            table.insert(rawGates, cp.part)
-        end
-        local finish = targetFolder:FindFirstChild("FinishLine")
-        if #rawGates > 0 and finish then
-            return rawGates, finish, targetFolder.Name
+    end
+    table.sort(waypoints, function(a, b) return a.num < b.num end)
+
+    local finish = bestFolder:FindFirstChild("FinishLine")
+
+    -- Detect forward vs reverse track orientation
+    if #waypoints > 1 then
+        local cp1 = waypoints[1].part
+        local cpLast = waypoints[#waypoints].part
+
+        local distToCp1 = cp1 and (cp1.Position - myPos).Magnitude or math.huge
+        local distToCpLast = cpLast and (cpLast.Position - myPos).Magnitude or math.huge
+
+        if distToCpLast < distToCp1 and distToCpLast < 200 then
+            -- Reverse track direction! Sort descending (N down to 1)
+            table.sort(waypoints, function(a, b) return a.num > b.num end)
+        else
+            -- Forward track direction! Sort ascending (1 up to N)
+            table.sort(waypoints, function(a, b) return a.num < b.num end)
         end
     end
 
-    return nil, nil, nil
+    return waypoints, finish, bestFolder.Name
 end
 
 local function executeCalibratedRaceTraversal()
-    local gates, finish, trackName = getActiveRaceGates()
-    if not gates or #gates == 0 or not finish then
+    local waypoints, finish, trackName = getActiveRaceGates()
+    if not waypoints or #waypoints == 0 or not finish then
         if raceStatusLabel then
             raceStatusLabel.Text = "Status: No active race track or checkpoints found"
             raceStatusLabel.TextColor3 = Color3.fromRGB(241, 196, 15)
@@ -2402,28 +2427,15 @@ local function executeCalibratedRaceTraversal()
     local char = player.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     local car = hum and hum.SeatPart and hum.SeatPart:FindFirstAncestorOfClass("Model")
-    local mover = (car and car.PrimaryPart) or (char and char:FindFirstChild("HumanoidRootPart"))
-    if not mover then
+    if not car or not car.PrimaryPart then
         if raceStatusLabel then
-            raceStatusLabel.Text = "Status: Sit in a vehicle or spawn character first"
+            raceStatusLabel.Text = "Status: Sit in a vehicle first"
             raceStatusLabel.TextColor3 = C_RED
         end
         return false, "No vehicle"
     end
 
-    -- Zero-contact enforcement: prevent wall & car impact impulses
-    local collParts = {}
-    if car then
-        for _, p in ipairs(car:GetDescendants()) do
-            if p:IsA("BasePart") and p.CanCollide then
-                table.insert(collParts, p)
-                p.CanCollide = false
-            end
-        end
-    end
-
-    local cruiseSpeed = 195 -- studs/s (~133 mph, legal server pacing, beats all AI rivals)
-    local totalGates = #gates
+    local cruiseSpeed = 180 -- studs/s (~124 mph, smooth centerline curve navigation, legal lap pacing)
     local raceFinished = false
 
     local raceEvents = ReplicatedStorage:FindFirstChild("RaceEvents")
@@ -2436,110 +2448,206 @@ local function executeCalibratedRaceTraversal()
 
     local function cleanup()
         if connFinish then connFinish:Disconnect() end
-        for _, p in ipairs(collParts) do
-            pcall(function() p.CanCollide = true end)
-        end
-    end
-
-    if raceStatusLabel then
-        raceStatusLabel.Text = string.format("Traversing %s • %d Gates (Zero Contact)...", tostring(trackName), totalGates)
-        raceStatusLabel.TextColor3 = C_ACCENT
-    end
-
-    -- Sequentially glide through all checkpoints
-    for idx, gate in ipairs(gates) do
-        if not raceAutoRunning or raceFinished then break end
-
-        -- Elevated +2.8 studs: cleanly clears other cars' hoods/bumpers and guardrail tops
-        local targetPos = gate.Position + Vector3.new(0, 2.8, 0)
-        local startPos = mover.Position
-        local dist = (targetPos - startPos).Magnitude
-
-        if raceStatusLabel then
-            raceStatusLabel.Text = string.format("Gate %d/%d (%s) • %d st/s • Clean (No Contact)", idx, totalGates, gate.Name, cruiseSpeed)
-        end
-
-        local glideStart = os.clock()
-        local duration = dist / cruiseSpeed
-        local dir = dist > 0.1 and (targetPos - startPos).Unit or Vector3.new(0, 0, 1)
-
-        while os.clock() - glideStart < duration do
-            if not raceAutoRunning or raceFinished then break end
-            local alpha = math.clamp((os.clock() - glideStart) / duration, 0, 1)
-            local curPos = startPos:Lerp(targetPos, alpha)
-            local lookCF = CFrame.lookAt(curPos, curPos + dir * 5)
-
-            if car and car.PrimaryPart then
-                car:SetPrimaryPartCFrame(lookCF)
-            else
-                mover.CFrame = lookCF
-            end
-
-            for _, p in ipairs(collParts) do
-                p.AssemblyLinearVelocity = dir * cruiseSpeed
+        for _, p in ipairs(car:GetDescendants()) do
+            if p:IsA("BasePart") then
                 p.AssemblyAngularVelocity = Vector3.zero
             end
-
-            RunService.Heartbeat:Wait()
         end
-
-        -- Trigger checkpoint gate contact
-        pcall(function()
-            if firetouchinterest then
-                firetouchinterest(mover, gate, 0)
-                task.wait(0.015)
-                firetouchinterest(mover, gate, 1)
-            end
-        end)
     end
 
-    -- Finish Line crossing (guarantees 1st place)
-    if raceAutoRunning and not raceFinished and finish then
-        local finishPos = finish.Position + Vector3.new(0, 2.8, 0)
-        local startPos = mover.Position
-        local dist = (finishPos - startPos).Magnitude
-        local glideStart = os.clock()
-        local duration = dist / cruiseSpeed
-        local dir = dist > 0.1 and (finishPos - startPos).Unit or Vector3.new(0, 0, 1)
+    -- 1. COUNTDOWN SYNCHRONIZATION (WAIT FIRMLY UNTIL GREEN LIGHT / GO!)
+    local HttpService = game:GetService("HttpService")
+    local function getPhase()
+        local attr = ReplicatedStorage:GetAttribute("DLTrackRace")
+        if type(attr) == "string" and attr ~= "" then
+            local s, d = pcall(function() return HttpService:JSONDecode(attr) end)
+            if s and type(d) == "table" and d.phase then
+                return tostring(d.phase):lower()
+            end
+        end
+        return nil
+    end
 
-        if raceStatusLabel then
-            raceStatusLabel.Text = "Crossing Finish Line (1st Place)..."
-            raceStatusLabel.TextColor3 = C_GREEN
+    local curPhase = getPhase()
+    if curPhase ~= "racing" then
+        local raceStartedFired = false
+        local connStarted
+        if raceEvents and raceEvents:FindFirstChild("RaceStarted") then
+            connStarted = raceEvents.RaceStarted.OnClientEvent:Connect(function()
+                raceStartedFired = true
+            end)
         end
 
-        while os.clock() - glideStart < duration do
+        local waitStart = os.clock()
+        while raceAutoRunning and not raceStartedFired and (os.clock() - waitStart < 35) do
+            local p = getPhase()
+            if p == "racing" then break end
+
+            local pg = player:FindFirstChild("PlayerGui")
+            local isCountdownGui = false
+            if pg then
+                local preRace = pg:FindFirstChild("DLPreRace")
+                local raceStart = pg:FindFirstChild("DLRaceStart")
+                if (preRace and preRace.Enabled) or (raceStart and raceStart.Enabled) then
+                    isCountdownGui = true
+                end
+            end
+
+            if raceStatusLabel then
+                local labelPhase = p or (isCountdownGui and "countdown" or "grid")
+                raceStatusLabel.Text = string.format("Holding grid • [%s] Waiting for GO!...", labelPhase:upper())
+                raceStatusLabel.TextColor3 = Color3.fromRGB(241, 196, 15)
+            end
+
+            -- Firmly anchor car on starting line during countdown
+            for _, bp in ipairs(car:GetDescendants()) do
+                if bp:IsA("BasePart") then
+                    bp.AssemblyLinearVelocity = Vector3.zero
+                    bp.AssemblyAngularVelocity = Vector3.zero
+                end
+            end
+
+            if not p and not isCountdownGui and (os.clock() - waitStart > 3.0) then
+                break
+            end
+
+            task.wait(0.15)
+        end
+        if connStarted then connStarted:Disconnect() end
+        task.wait(0.4) -- Safety buffer after GO! so game grid barriers drop
+    end
+
+    if not raceAutoRunning then
+        cleanup()
+        return false
+    end
+
+    -- 2. FIND CLOSEST NODE AHEAD OF VEHICLE
+    local myPos = car.PrimaryPart.Position
+    local startIdx = 1
+    local minDist = math.huge
+    for i, wp in ipairs(waypoints) do
+        local d = (wp.part.Position - myPos).Magnitude
+        if d < minDist then
+            minDist = d
+            startIdx = i
+        end
+    end
+
+    -- 3. TRAVERSE ALONG TRACK CENTERLINE (ZERO WALL & CAR CONTACT)
+    local lapNumber = 1
+    while raceAutoRunning and not raceFinished do
+        for idx = startIdx, #waypoints do
             if not raceAutoRunning or raceFinished then break end
-            local alpha = math.clamp((os.clock() - glideStart) / duration, 0, 1)
-            local curPos = startPos:Lerp(finishPos, alpha)
-            local lookCF = CFrame.lookAt(curPos, curPos + dir * 5)
+            local node = waypoints[idx]
+            local targetPos = node.part.Position + Vector3.new(0, 1.2, 0)
+            local startP = car.PrimaryPart.Position
+            local dist = (targetPos - startP).Magnitude
+            local dur = dist / cruiseSpeed
+            local t0 = os.clock()
+            local dir = dist > 0.1 and (targetPos - startP).Unit or Vector3.new(0, 0, 1)
 
-            if car and car.PrimaryPart then
+            -- Drift angle calculation (High-score slides while floating to checkpoints)
+            local driftAngle = 0
+            local driftSide = 1
+            if autoDriftActive then
+                if waypoints[idx + 1] then
+                    local nextP = waypoints[idx + 1].part.Position
+                    local nextDir = (nextP - targetPos).Unit
+                    local crossY = dir.X * nextDir.Z - dir.Z * nextDir.X
+                    if math.abs(crossY) > 0.015 then
+                        driftSide = crossY > 0 and -1 or 1
+                    end
+                else
+                    driftSide = (idx % 2 == 0) and 1 or -1
+                end
+                driftAngle = 38 * driftSide
+            end
+
+            if raceStatusLabel then
+                local modeTag = autoDriftActive and string.format("Drifting %d°", math.abs(driftAngle)) or "Clean Line"
+                raceStatusLabel.Text = string.format("Lap %d • Node %d/%d (%s) • %s • 180 st/s", lapNumber, idx, #waypoints, node.part.Name, modeTag)
+                raceStatusLabel.TextColor3 = autoDriftActive and Color3.fromRGB(155, 89, 182) or C_ACCENT
+            end
+
+            while os.clock() - t0 < dur do
+                if not raceAutoRunning or raceFinished then break end
+                local alpha = math.clamp((os.clock() - t0) / dur, 0, 1)
+                local curPos = startP:Lerp(targetPos, alpha)
+                local baseCF = CFrame.lookAt(curPos, curPos + dir * 5)
+                local lookCF = autoDriftActive and (baseCF * CFrame.Angles(0, math.rad(driftAngle), math.rad(driftSide * 3))) or baseCF
                 car:SetPrimaryPartCFrame(lookCF)
-            else
-                mover.CFrame = lookCF
+
+                for _, p in ipairs(car:GetDescendants()) do
+                    if p:IsA("BasePart") then
+                        p.AssemblyLinearVelocity = dir * cruiseSpeed
+                        p.AssemblyAngularVelocity = autoDriftActive and Vector3.new(0, math.rad(driftSide * 15), 0) or Vector3.zero
+                    end
+                end
+                RunService.Heartbeat:Wait()
             end
 
-            for _, p in ipairs(collParts) do
-                p.AssemblyLinearVelocity = dir * cruiseSpeed
-                p.AssemblyAngularVelocity = Vector3.zero
+            if node.isGate then
+                pcall(function()
+                    if firetouchinterest then
+                        firetouchinterest(car.PrimaryPart, node.part, 0)
+                        task.wait(0.01)
+                        firetouchinterest(car.PrimaryPart, node.part, 1)
+                    end
+                end)
             end
-
-            RunService.Heartbeat:Wait()
         end
 
-        pcall(function()
-            if firetouchinterest then
-                firetouchinterest(mover, finish, 0)
-                task.wait(0.015)
-                firetouchinterest(mover, finish, 1)
+        -- Finish line crossing
+        if raceAutoRunning and not raceFinished and finish then
+            local targetPos = finish.Position + Vector3.new(0, 1.2, 0)
+            local startP = car.PrimaryPart.Position
+            local dist = (targetPos - startP).Magnitude
+            local dur = dist / cruiseSpeed
+            local t0 = os.clock()
+            local dir = dist > 0.1 and (targetPos - startP).Unit or Vector3.new(0, 0, 1)
+
+            if raceStatusLabel then
+                raceStatusLabel.Text = "Crossing Finish Line (1st Place)..."
+                raceStatusLabel.TextColor3 = C_GREEN
             end
-        end)
+
+            local finishDrift = autoDriftActive and 35 or 0
+            while os.clock() - t0 < dur do
+                if not raceAutoRunning or raceFinished then break end
+                local alpha = math.clamp((os.clock() - t0) / dur, 0, 1)
+                local curPos = startP:Lerp(targetPos, alpha)
+                local baseCF = CFrame.lookAt(curPos, curPos + dir * 5)
+                local lookCF = autoDriftActive and (baseCF * CFrame.Angles(0, math.rad(finishDrift), 0)) or baseCF
+                car:SetPrimaryPartCFrame(lookCF)
+
+                for _, p in ipairs(car:GetDescendants()) do
+                    if p:IsA("BasePart") then
+                        p.AssemblyLinearVelocity = dir * cruiseSpeed
+                        p.AssemblyAngularVelocity = autoDriftActive and Vector3.new(0, math.rad(15), 0) or Vector3.zero
+                    end
+                end
+                RunService.Heartbeat:Wait()
+            end
+
+            pcall(function()
+                if firetouchinterest then
+                    firetouchinterest(car.PrimaryPart, finish, 0)
+                    task.wait(0.01)
+                    firetouchinterest(car.PrimaryPart, finish, 1)
+                end
+            end)
+        end
+
+        lapNumber = lapNumber + 1
+        startIdx = 1
+        task.wait(0.3)
+        if not hum or not hum.SeatPart or raceFinished then break end
     end
 
     cleanup()
-
     if raceStatusLabel then
-        raceStatusLabel.Text = "Race Complete! 1st Place • 0 Contact • 3 Stars"
+        raceStatusLabel.Text = "Race Complete! 1st Place • 0 Contact • 3/3 Stars"
         raceStatusLabel.TextColor3 = C_GREEN
     end
     return true
@@ -2570,19 +2678,22 @@ autoWinBtn = createButton(raceAutoCard, "🏆 Auto-Win Current Race (Calibrated 
     end)
 end)
 
--- Toggle: Auto Playlist Race Loop
-playlistToggleBtn = createButton(raceAutoCard, "🔥 Auto Playlist Race Loop: OFF", Color3.fromRGB(30, 34, 42), UDim2.new(0, 14, 0, 70), UDim2.new(0.96, 0, 0, 32), function()
-    autoPlaylistLoopActive = not autoPlaylistLoopActive
-    if autoPlaylistLoopActive then
-        playlistToggleBtn.Text = "🔥 Auto Playlist Race Loop: ON"
-        playlistToggleBtn.BackgroundColor3 = C_GREEN
+-- Toggle 1: Auto Continue Playlist
+autoContinueBtn = createButton(raceAutoCard, "🔄 Auto Continue: OFF", Color3.fromRGB(30, 34, 42), UDim2.new(0, 14, 0, 70), UDim2.new(0.47, 0, 0, 32), function()
+    autoContinueActive = not autoContinueActive
+    if autoContinueActive then
+        autoRetryActive = false
+        autoContinueBtn.Text = "🔄 Auto Continue: ON"
+        autoContinueBtn.BackgroundColor3 = C_GREEN
+        autoRetryBtn.Text = "🔁 Auto Retry: OFF"
+        autoRetryBtn.BackgroundColor3 = Color3.fromRGB(30, 34, 42)
         if raceStatusLabel then
-            raceStatusLabel.Text = "Status: Watching for Playlist Race start..."
+            raceStatusLabel.Text = "Status: Auto Continue ACTIVE • Monitoring playlist..."
             raceStatusLabel.TextColor3 = C_GREEN
         end
     else
-        playlistToggleBtn.Text = "🔥 Auto Playlist Race Loop: OFF"
-        playlistToggleBtn.BackgroundColor3 = Color3.fromRGB(30, 34, 42)
+        autoContinueBtn.Text = "🔄 Auto Continue: OFF"
+        autoContinueBtn.BackgroundColor3 = Color3.fromRGB(30, 34, 42)
         if raceStatusLabel then
             raceStatusLabel.Text = "Status: Idle"
             raceStatusLabel.TextColor3 = C_MUTED
@@ -2590,53 +2701,243 @@ playlistToggleBtn = createButton(raceAutoCard, "🔥 Auto Playlist Race Loop: OF
     end
 end)
 
--- Background loop to auto-run playlist races when started
-task.spawn(function()
-    while true do
-        task.wait(1.0)
-        if autoPlaylistLoopActive and not raceAutoRunning then
-            local gates, finish, trackName = getActiveRaceGates()
-            if gates and #gates > 0 and finish then
-                -- Check if player is seated in a car
-                local char = player.Character
-                local hum = char and char:FindFirstChildOfClass("Humanoid")
-                if hum and hum.SeatPart then
-                    raceAutoRunning = true
-                    autoWinBtn.Text = "⏹ Stop Auto-Win"
-                    autoWinBtn.BackgroundColor3 = C_RED
-                    executeCalibratedRaceTraversal()
-                    raceAutoRunning = false
-                    autoWinBtn.Text = "🏆 Auto-Win Current Race (Calibrated Traversal)"
-                    autoWinBtn.BackgroundColor3 = Color3.fromRGB(241, 196, 15)
-                    task.wait(4.0) -- Cooldown between events / loading next chapter
-                end
-            end
+-- Toggle 2: Auto Retry Race
+autoRetryBtn = createButton(raceAutoCard, "🔁 Auto Retry: OFF", Color3.fromRGB(30, 34, 42), UDim2.new(0.51, 0, 0, 70), UDim2.new(0.46, 0, 0, 32), function()
+    autoRetryActive = not autoRetryActive
+    if autoRetryActive then
+        autoContinueActive = false
+        autoRetryBtn.Text = "🔁 Auto Retry: ON"
+        autoRetryBtn.BackgroundColor3 = C_GREEN
+        autoContinueBtn.Text = "🔄 Auto Continue: OFF"
+        autoContinueBtn.BackgroundColor3 = Color3.fromRGB(30, 34, 42)
+        if raceStatusLabel then
+            raceStatusLabel.Text = "Status: Auto Retry ACTIVE • Will retry at finish..."
+            raceStatusLabel.TextColor3 = C_GREEN
+        end
+    else
+        autoRetryBtn.Text = "🔁 Auto Retry: OFF"
+        autoRetryBtn.BackgroundColor3 = Color3.fromRGB(30, 34, 42)
+        if raceStatusLabel then
+            raceStatusLabel.Text = "Status: Idle"
+            raceStatusLabel.TextColor3 = C_MUTED
+        end
+    end
+end)
+
+-- Toggle 3: Auto Drift Mode
+autoDriftBtn = createButton(raceAutoCard, "💨 Auto Drift Mode: OFF", Color3.fromRGB(30, 34, 42), UDim2.new(0, 14, 0, 108), UDim2.new(0.96, 0, 0, 30), function()
+    autoDriftActive = not autoDriftActive
+    if autoDriftActive then
+        autoDriftBtn.Text = "💨 Auto Drift Mode: ON (High-Score Slides)"
+        autoDriftBtn.BackgroundColor3 = Color3.fromRGB(155, 89, 182)
+        if raceStatusLabel then
+            raceStatusLabel.Text = "Status: Auto Drift ACTIVE • Slip angles enabled"
+            raceStatusLabel.TextColor3 = Color3.fromRGB(155, 89, 182)
+        end
+    else
+        autoDriftBtn.Text = "💨 Auto Drift Mode: OFF"
+        autoDriftBtn.BackgroundColor3 = Color3.fromRGB(30, 34, 42)
+        if raceStatusLabel then
+            raceStatusLabel.Text = "Status: Auto Drift OFF (Clean Grip Line)"
+            raceStatusLabel.TextColor3 = C_MUTED
         end
     end
 end)
 
 raceStatusLabel = Instance.new("TextLabel")
-raceStatusLabel.Text = "Status: Ready • Calibrated 195 st/s (No Wall Contact | No Car Contact)"
+raceStatusLabel.Text = "Status: Ready • Calibrated 180 st/s (No Wall Contact | 3 Stars)"
 raceStatusLabel.Font = Enum.Font.GothamMedium
 raceStatusLabel.TextSize = 11
 raceStatusLabel.TextColor3 = C_MUTED
 raceStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-raceStatusLabel.Position = UDim2.new(0, 14, 0, 110)
+raceStatusLabel.Position = UDim2.new(0, 14, 0, 144)
 raceStatusLabel.Size = UDim2.new(1, -28, 0, 20)
 raceStatusLabel.BackgroundTransparency = 1
 raceStatusLabel.Parent = raceAutoCard
 
 local autoNotice = Instance.new("TextLabel")
-autoNotice.Text = "Elevated (+2.8 studs) centerline traversal prevents car & wall contact. 100% legal lap split times."
+autoNotice.Text = "Auto Drift: Slides through checkpoints with high slip angles for drift points.\nAuto Continue & Retry: Complete automation from countdown to results."
 autoNotice.Font = Enum.Font.Gotham
 autoNotice.TextSize = 10
 autoNotice.TextColor3 = C_MUTED
 autoNotice.TextXAlignment = Enum.TextXAlignment.Left
-autoNotice.Position = UDim2.new(0, 14, 0, 134)
-autoNotice.Size = UDim2.new(1, -28, 0, 30)
+autoNotice.Position = UDim2.new(0, 14, 0, 166)
+autoNotice.Size = UDim2.new(1, -28, 0, 34)
 autoNotice.TextWrapped = true
 autoNotice.BackgroundTransparency = 1
 autoNotice.Parent = raceAutoCard
+
+-- Master Hands-Off Automation Loop (Playlist Continue, Retry, Skip Intros, Car Select, Auto-Race)
+task.spawn(function()
+    local vim = game:GetService("VirtualInputManager")
+
+    local function sendKey(keyCode)
+        pcall(function()
+            vim:SendKeyEvent(true, keyCode, false, game)
+            task.wait(0.08)
+            vim:SendKeyEvent(false, keyCode, false, game)
+        end)
+    end
+
+    local function clickGui(btn)
+        if not btn then return false end
+        pcall(function()
+            if firesignal then
+                firesignal(btn.MouseButton1Click)
+                firesignal(btn.Activated)
+            end
+        end)
+        pcall(function()
+            if btn.AbsolutePosition and btn.AbsoluteSize then
+                local cx = btn.AbsolutePosition.X + btn.AbsoluteSize.X / 2
+                local cy = btn.AbsolutePosition.Y + btn.AbsoluteSize.Y / 2
+                vim:SendMouseButtonEvent(cx, cy, 0, true, game, 1)
+                task.wait(0.05)
+                vim:SendMouseButtonEvent(cx, cy, 0, false, game, 1)
+            end
+        end)
+        return true
+    end
+
+    while true do
+        task.wait(0.6)
+        if (autoContinueActive or autoRetryActive) and not raceAutoRunning then
+            local pg = player:FindFirstChild("PlayerGui")
+
+            -- 1. DETECT RESULTS / PODIUM SCREEN
+            local isResults = false
+            if pg then
+                local endCard = pg:FindFirstChild("DLRaceEndCard")
+                local raceResults = pg:FindFirstChild("DLRaceResults")
+                local raceUI = pg:FindFirstChild("RaceUI")
+                local arrivalGuard = pg:FindFirstChild("DLArrivalGuard")
+
+                if (endCard and endCard.Enabled) or
+                   (raceResults and raceResults.Enabled) or
+                   (raceUI and raceUI.Enabled and raceUI:FindFirstChild("Results") and raceUI.Results.Visible) or
+                   (arrivalGuard and arrivalGuard.Enabled and arrivalGuard:FindFirstChild("Shade") and arrivalGuard.Shade.Visible) then
+                    isResults = true
+                end
+            end
+
+            if isResults then
+                if autoContinueActive then
+                    if raceStatusLabel then
+                        raceStatusLabel.Text = "Status: Results screen • Advancing to next race..."
+                        raceStatusLabel.TextColor3 = C_GREEN
+                    end
+                    local contBtn = nil
+                    if pg:FindFirstChild("DLRaceEndCard") then
+                        contBtn = pg.DLRaceEndCard:FindFirstChild("Primary", true)
+                    end
+                    if not contBtn and pg:FindFirstChild("DLRaceResults") then
+                        contBtn = pg.DLRaceResults:FindFirstChild("Continue", true)
+                    end
+                    if not contBtn and pg:FindFirstChild("RaceUI") then
+                        contBtn = pg.RaceUI:FindFirstChild("Continue", true)
+                    end
+                    if contBtn then clickGui(contBtn) end
+                    sendKey(Enum.KeyCode.Return)
+                    task.wait(1.5)
+                elseif autoRetryActive then
+                    if raceStatusLabel then
+                        raceStatusLabel.Text = "Status: Results screen • Retrying race..."
+                        raceStatusLabel.TextColor3 = C_ACCENT
+                    end
+                    local retryBtn = nil
+                    if pg:FindFirstChild("DLRaceEndCard") then
+                        retryBtn = pg.DLRaceEndCard:FindFirstChild("Retry", true)
+                    end
+                    if not retryBtn and pg:FindFirstChild("DLArrivalGuard") then
+                        retryBtn = pg.DLArrivalGuard:FindFirstChild("Retry", true)
+                    end
+                    if retryBtn then clickGui(retryBtn) end
+                    local raceEvents = ReplicatedStorage:FindFirstChild("RaceEvents")
+                    if raceEvents and raceEvents:FindFirstChild("RaceRetry") then
+                        pcall(function() raceEvents.RaceRetry:FireServer() end)
+                    end
+                    sendKey(Enum.KeyCode.R)
+                    sendKey(Enum.KeyCode.Return)
+                    task.wait(1.5)
+                end
+            end
+
+            -- 2. DETECT TRACK LOBBY & SELECT / CONFIRM CAR
+            local lobbyGui = pg and pg:FindFirstChild("DLTrackLobby")
+            if lobbyGui and lobbyGui.Enabled then
+                if raceStatusLabel then
+                    raceStatusLabel.Text = "Status: Track Lobby • Confirming car..."
+                    raceStatusLabel.TextColor3 = C_ACCENT
+                end
+                local selectBtn = nil
+                for _, b in ipairs(lobbyGui:GetDescendants()) do
+                    if (b:IsA("TextButton") or b:IsA("ImageButton")) and b.Visible then
+                        local txt = b:IsA("TextButton") and b.Text:upper() or ""
+                        if txt:find("SELECT") or txt:find("READY") or txt:find("KEEP") or b.Name == "Select" or b.Name == "Ready" then
+                            selectBtn = b
+                            break
+                        end
+                    end
+                end
+                if selectBtn then clickGui(selectBtn) end
+                sendKey(Enum.KeyCode.Return)
+                task.wait(1.0)
+            end
+
+            -- 3. DETECT CINEMATIC / STORY INTRO SKIP
+            if pg then
+                for _, g in ipairs(pg:GetChildren()) do
+                    if g:IsA("ScreenGui") and g.Enabled and g.Name ~= "DLTrackLobby" and g.Name ~= "DLRaceResults" and g.Name ~= "DLRaceHUD" and g.Name ~= "DLRaceEndCard" and g.Name ~= "DriveLifeHub_UI" then
+                        for _, btn in ipairs(g:GetDescendants()) do
+                            if btn:IsA("TextButton") and btn.Visible and btn.Text ~= "" then
+                                local t = btn.Text:upper()
+                                if t:find("SKIP") or t:find("NEXT") or t:find("CONTINUE") then
+                                    clickGui(btn)
+                                    sendKey(Enum.KeyCode.Return)
+                                    sendKey(Enum.KeyCode.Space)
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            -- 4. DETECT LIVE RACE & RUN CALIBRATED TRAVERSAL
+            local char = player.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum and hum.SeatPart then
+                local raceLive = false
+                if pg then
+                    local rUI = pg:FindFirstChild("RaceUI")
+                    local dlHud = pg:FindFirstChild("DLRaceHUD")
+                    local dlCtrl = pg:FindFirstChild("DLRaceControls")
+                    if (rUI and rUI.Enabled and rUI:FindFirstChild("RaceHud") and rUI.RaceHud.Visible) or
+                       (dlHud and dlHud.Enabled) or
+                       (dlCtrl and dlCtrl.Enabled) then
+                        raceLive = true
+                    end
+                end
+
+                if raceLive then
+                    local gates, finish, trackName = getActiveRaceGates()
+                    if gates and #gates > 0 and finish then
+                        raceAutoRunning = true
+                        autoWinBtn.Text = "⏹ Stop Current Run"
+                        autoWinBtn.BackgroundColor3 = C_RED
+
+                        executeCalibratedRaceTraversal()
+
+                        raceAutoRunning = false
+                        autoWinBtn.Text = "🏆 Auto-Win Current Race (Calibrated Traversal)"
+                        autoWinBtn.BackgroundColor3 = Color3.fromRGB(241, 196, 15)
+                        task.wait(2.0)
+                    end
+                end
+            end
+        end
+    end
+end)
 
 -- ======================================================================
 -- INITIALIZATION
