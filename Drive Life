@@ -4716,6 +4716,636 @@ task.spawn(function()
 end)
 
 -- ======================================================================
+-- 4. CATEGORY: HALLOWEEN EVENT 👻 (SEASON 2)
+-- ======================================================================
+local CollectionService = game:GetService("CollectionService")
+local pageHalloween = createTabButton("Halloween", "👻", 4)
+
+local C_ORANGE = Color3.fromRGB(243, 156, 18)
+local C_PURPLE = Color3.fromRGB(155, 89, 182)
+
+-- State
+local autoGhostRunning = false
+local ghostEspActive = false
+local ghostEspObjects = {}
+local cachedGhosts = {}
+
+-- ----------------------------------------------------------------------
+-- 1. Progress & Ghost Count Detection
+-- ----------------------------------------------------------------------
+local function getGhostCount()
+    local collected = 0
+    local total = 40
+
+    -- Method A: Scan PlayerGui for TopBar / Event Text
+    pcall(function()
+        local pg = player:FindFirstChild("PlayerGui")
+        if pg then
+            for _, desc in ipairs(pg:GetDescendants()) do
+                if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+                    local txt = desc.Text or ""
+                    -- Check "X/40" or "👻 X/40" or "X / 40"
+                    local c, t = txt:match("(%d+)%s*/%s*(%d+)")
+                    if c and t and (tonumber(t) == 40 or txt:find("👻") or desc.Name:lower():find("ghost") or desc.Name:lower():find("event") or (desc.Parent and desc.Parent.Name:lower():find("event"))) then
+                        collected = tonumber(c)
+                        total = tonumber(t)
+                        return
+                    end
+                    -- Check "👻 1"
+                    local single = txt:match("👻%s*(%d+)")
+                    if single then
+                        collected = tonumber(single)
+                        return
+                    end
+                end
+            end
+        end
+    end)
+
+    -- Method B: Scan Player Attributes & Values
+    pcall(function()
+        local attrs = player:GetAttributes()
+        for k, v in pairs(attrs) do
+            local lk = tostring(k):lower()
+            if (lk:find("ghost") or lk:find("halloween")) and type(v) == "number" then
+                collected = math.max(collected, v)
+            end
+        end
+        local ls = player:FindFirstChild("leaderstats") or player:FindFirstChild("Halloween") or player:FindFirstChild("Event")
+        if ls then
+            for _, val in ipairs(ls:GetChildren()) do
+                local ln = val.Name:lower()
+                if (ln:find("ghost") or ln:find("halloween")) and val:IsA("ValueBase") then
+                    collected = math.max(collected, tonumber(val.Value) or 0)
+                end
+            end
+        end
+    end)
+
+    return collected, total
+end
+
+-- ----------------------------------------------------------------------
+-- 2. Multi-Tier Workspace Ghost Locator
+-- ----------------------------------------------------------------------
+local function scanForGhosts()
+    local found = {}
+    local seen = {}
+
+    local function addGhostCandidate(obj)
+        if not obj or seen[obj] then return end
+        if not obj:IsDescendantOf(workspace) then return end
+
+        -- Exclude local player & other player characters
+        local charPlayer = Players:GetPlayerFromCharacter(obj) or (obj.Parent and Players:GetPlayerFromCharacter(obj.Parent))
+        if charPlayer then return end
+        if obj:FindFirstChildOfClass("Humanoid") and not obj.Name:lower():find("ghost") then return end
+
+        -- Exclude vehicles & race checkpoints
+        if obj:FindFirstChild("DriveSeat") or obj:FindFirstChild("A-Chassis") or obj.Name:lower():find("chassis") then return end
+        if obj.Name:lower():find("gate") or obj.Name:lower():find("checkpoint") then return end
+
+        -- Find the primary BasePart
+        local targetPart = nil
+        if obj:IsA("BasePart") then
+            targetPart = obj
+        elseif obj:IsA("Model") then
+            targetPart = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
+        elseif obj:IsA("ProximityPrompt") then
+            local p = obj.Parent
+            if p and p:IsA("BasePart") then
+                targetPart = p
+            elseif p and p:IsA("Model") then
+                targetPart = p.PrimaryPart or p:FindFirstChildWhichIsA("BasePart")
+            end
+        end
+
+        if not targetPart then return end
+
+        -- Check visibility / transparency
+        if targetPart.Transparency >= 0.98 and not targetPart:FindFirstChildOfClass("SpecialMesh") and not obj:FindFirstChildOfClass("ProximityPrompt") then
+            return
+        end
+
+        seen[obj] = true
+        seen[targetPart] = true
+
+        local prompt = obj:FindFirstChildOfClass("ProximityPrompt") 
+            or (obj:IsA("ProximityPrompt") and obj) 
+            or (targetPart:FindFirstChildOfClass("ProximityPrompt"))
+            or (obj.Parent and obj.Parent:FindFirstChildOfClass("ProximityPrompt"))
+
+        table.insert(found, {
+            instance = obj,
+            part = targetPart,
+            position = targetPart.Position,
+            prompt = prompt,
+            name = obj.Name
+        })
+    end
+
+    -- Priority 1: CollectionService tagged instances
+    local tags = {"Ghost", "Ghosts", "EventGhost", "Halloween", "Collectible", "Collectibles", "EventCollectible", "HalloweenGhost"}
+    for _, tag in ipairs(tags) do
+        local list = CollectionService:GetTagged(tag)
+        for _, inst in ipairs(list) do
+            addGhostCandidate(inst)
+        end
+    end
+
+    -- Priority 2: Specific Event Containers in Workspace
+    local folderNames = {"Ghosts", "Ghost", "Halloween", "HalloweenEvent", "Collectibles", "EventCollectibles", "GhostSpawns", "HiddenGhosts", "Event", "Season2"}
+    for _, fn in ipairs(folderNames) do
+        local folder = workspace:FindFirstChild(fn, true)
+        if folder then
+            for _, child in ipairs(folder:GetChildren()) do
+                addGhostCandidate(child)
+            end
+        end
+    end
+
+    -- Priority 3: Workspace Descendant Sweep
+    for _, desc in ipairs(workspace:GetDescendants()) do
+        local lName = desc.Name:lower()
+        if (lName:find("ghost") or lName:find("halloween_ghost") or lName:find("spooky")) and not lName:find("ghostcar") and not lName:find("ghostmode") then
+            if desc:IsA("Model") or desc:IsA("BasePart") or desc:IsA("ProximityPrompt") then
+                addGhostCandidate(desc)
+            end
+        elseif desc:IsA("ProximityPrompt") then
+            local act = (desc.ActionText or ""):lower()
+            local objText = (desc.ObjectText or ""):lower()
+            if act:find("ghost") or objText:find("ghost") or (act:find("collect") and objText:find("event")) then
+                addGhostCandidate(desc)
+            end
+        end
+    end
+
+    cachedGhosts = found
+    return found
+end
+
+-- ----------------------------------------------------------------------
+-- 3. High-Safety Traversal (Vehicle & Character Dual-Engine)
+-- ----------------------------------------------------------------------
+local function glideToGhost(targetPos, onProgress)
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum or hum.Health <= 0 then return false end
+
+    -- Check if player is seated in a car
+    local car = nil
+    if hum.SeatPart and hum.SeatPart:IsA("VehicleSeat") then
+        car = hum.SeatPart:FindFirstAncestorOfClass("Model")
+    end
+
+    pcall(function() player:RequestStreamAroundAsync(targetPos, 5) end)
+
+    if car and car.PrimaryPart then
+        -- Vehicle flight glide
+        return glideVehicleTo(car, targetPos + Vector3.new(0, 3, 0), 180, onProgress)
+    else
+        -- Foot Character safe sky-glide
+        local startPos = root.Position
+        local dirXZ = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(startPos.X, 0, startPos.Z))
+        local horizDist = dirXZ.Magnitude
+        local dirUnit = horizDist > 0 and (dirXZ / horizDist) or Vector3.new(0, 0, -1)
+
+        if (startPos - targetPos).Magnitude < 15 then
+            root.CFrame = CFrame.new(targetPos + Vector3.new(0, 2.5, 0))
+            return true
+        end
+
+        local cruiseY = math.max(startPos.Y + 120, targetPos.Y + 120, 350)
+        local speed = 160
+
+        -- 1. Smooth Ascent
+        local liftSteps = 12
+        for i = 1, liftSteps do
+            if not hubAlive then return false end
+            local alpha = i / liftSteps
+            local curY = startPos.Y + (cruiseY - startPos.Y) * math.sin(alpha * math.pi / 2)
+            root.CFrame = CFrame.new(Vector3.new(startPos.X, curY, startPos.Z), Vector3.new(startPos.X + dirUnit.X, curY, startPos.Z + dirUnit.Z))
+            root.AssemblyLinearVelocity = Vector3.new(0, 20, 0)
+            root.AssemblyAngularVelocity = Vector3.zero
+            task.wait(0.03)
+        end
+
+        -- 2. Cruise
+        local curPos = root.Position
+        local rem = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(curPos.X, 0, curPos.Z)).Magnitude
+        local lastT = os.clock()
+
+        while rem > 25 and hubAlive do
+            local dt = math.clamp(os.clock() - lastT, 0.01, 0.1)
+            lastT = os.clock()
+
+            curPos = curPos + dirUnit * (speed * dt)
+            rem = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(curPos.X, 0, curPos.Z)).Magnitude
+
+            root.CFrame = CFrame.new(curPos, curPos + dirUnit * 10)
+            root.AssemblyLinearVelocity = dirUnit * speed
+            root.AssemblyAngularVelocity = Vector3.zero
+
+            if onProgress then
+                local eta = math.ceil(rem / speed)
+                onProgress(rem, horizDist, eta)
+            end
+            task.wait(0.03)
+        end
+
+        -- 3. Gentle Landing
+        local landStart = root.Position
+        local landEnd = targetPos + Vector3.new(0, 3, 0)
+        local landSteps = 10
+        for i = 1, landSteps do
+            if not hubAlive then return false end
+            local alpha = i / landSteps
+            local p = landStart:Lerp(landEnd, math.sin(alpha * math.pi / 2))
+            root.CFrame = CFrame.new(p)
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            task.wait(0.03)
+        end
+
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        return true
+    end
+end
+
+-- ----------------------------------------------------------------------
+-- 4. Multi-Trigger Ghost Interaction Engine
+-- ----------------------------------------------------------------------
+local function collectGhostTarget(ghost)
+    if not ghost or not ghost.part then return false end
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+
+    -- Trigger 1: ProximityPrompt
+    if ghost.prompt then
+        pcall(function()
+            if fireproximityprompt then
+                fireproximityprompt(ghost.prompt, 0)
+            else
+                ghost.prompt:InputHoldBegin()
+                task.wait(0.1)
+                ghost.prompt:InputHoldEnd()
+            end
+        end)
+    end
+
+    -- Trigger 2: Touch Interest (Physics Trigger)
+    pcall(function()
+        if firetouchinterest then
+            firetouchinterest(ghost.part, root, 0)
+            task.wait(0.05)
+            firetouchinterest(ghost.part, root, 1)
+        end
+    end)
+
+    -- Trigger 3: ClickDetector
+    pcall(function()
+        local cd = ghost.instance:FindFirstChildOfClass("ClickDetector") or ghost.part:FindFirstChildOfClass("ClickDetector")
+        if cd and fireclickdetector then
+            fireclickdetector(cd)
+        end
+    end)
+
+    -- Trigger 4: Remote Event Broadcast
+    pcall(function()
+        local remotes = {"GhostCollect", "CollectGhost", "HalloweenCollect", "EventCollect", "CollectEventItem"}
+        for _, rName in ipairs(remotes) do
+            local rem = ReplicatedStorage:FindFirstChild(rName, true)
+            if rem and rem:IsA("RemoteEvent") then
+                rem:FireServer(ghost.instance)
+            elseif rem and rem:IsA("RemoteFunction") then
+                rem:InvokeServer(ghost.instance)
+            end
+        end
+    end)
+
+    return true
+end
+
+-- ----------------------------------------------------------------------
+-- 5. Ghost ESP System
+-- ----------------------------------------------------------------------
+local function clearGhostEsp()
+    for _, item in ipairs(ghostEspObjects) do
+        pcall(function() item:Destroy() end)
+    end
+    ghostEspObjects = {}
+end
+
+local function updateGhostEsp()
+    clearGhostEsp()
+    if not ghostEspActive then return end
+
+    local ghosts = scanForGhosts()
+    for _, g in ipairs(ghosts) do
+        if g.part and g.part:IsDescendantOf(workspace) then
+            pcall(function()
+                -- Highlight
+                local hl = Instance.new("Highlight")
+                hl.Name = "Ghost_ESP_HL"
+                hl.FillColor = C_PURPLE
+                hl.FillTransparency = 0.4
+                hl.OutlineColor = C_ORANGE
+                hl.OutlineTransparency = 0.1
+                hl.Adornee = g.instance
+                hl.Parent = g.instance
+                table.insert(ghostEspObjects, hl)
+
+                -- BillboardGui
+                local bb = Instance.new("BillboardGui")
+                bb.Name = "Ghost_ESP_BB"
+                bb.Adornee = g.part
+                bb.Size = UDim2.new(0, 140, 0, 42)
+                bb.StudsOffset = Vector3.new(0, 3.5, 0)
+                bb.AlwaysOnTop = true
+                bb.Parent = g.part
+
+                local lbl = Instance.new("TextLabel")
+                lbl.Size = UDim2.new(1, 0, 1, 0)
+                lbl.BackgroundTransparency = 1
+                lbl.Font = Enum.Font.GothamBold
+                lbl.TextSize = 12
+                lbl.TextColor3 = Color3.fromRGB(255, 230, 150)
+                lbl.TextStrokeColor3 = Color3.fromRGB(20, 20, 20)
+                lbl.TextStrokeTransparency = 0.3
+                lbl.Text = "👻 GHOST"
+                lbl.Parent = bb
+
+                table.insert(ghostEspObjects, bb)
+            end)
+        end
+    end
+end
+
+-- ESP Distance loop
+task.spawn(function()
+    while hubAlive do
+        if ghostEspActive and #ghostEspObjects > 0 then
+            local char = player.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if root then
+                for _, obj in ipairs(ghostEspObjects) do
+                    if obj:IsA("BillboardGui") and obj.Adornee then
+                        local lbl = obj:FindFirstChildOfClass("TextLabel")
+                        if lbl then
+                            local d = math.floor((obj.Adornee.Position - root.Position).Magnitude)
+                            lbl.Text = string.format("👻 GHOST\n[%d studs / %dm]", d, math.floor(d * 0.28))
+                        end
+                    end
+                end
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- ----------------------------------------------------------------------
+-- 6. UI CARDS (HALLOWEEN TAB)
+-- ----------------------------------------------------------------------
+-- CARD 1: Event Summary & Status Card
+local hCard = createCard(pageHalloween, "👻 Halloween Event - Ghost Hunt (Season 2)", 140)
+
+local hProgressLabel = Instance.new("TextLabel")
+hProgressLabel.Text = "Collected: 0 / 40 Ghosts"
+hProgressLabel.Font = Enum.Font.GothamBold
+hProgressLabel.TextSize = 15
+hProgressLabel.TextColor3 = C_ORANGE
+hProgressLabel.TextXAlignment = Enum.TextXAlignment.Left
+hProgressLabel.Position = UDim2.new(0, 14, 0, 32)
+hProgressLabel.Size = UDim2.new(1, -28, 0, 20)
+hProgressLabel.BackgroundTransparency = 1
+hProgressLabel.Parent = hCard
+
+local hStatusLabel = Instance.new("TextLabel")
+hStatusLabel.Text = "Status: Ready • 0 Ghosts detected in Workspace"
+hStatusLabel.Font = Enum.Font.Gotham
+hStatusLabel.TextSize = 12
+hStatusLabel.TextColor3 = C_MUTED
+hStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+hStatusLabel.Position = UDim2.new(0, 14, 0, 56)
+hStatusLabel.Size = UDim2.new(1, -28, 0, 18)
+hStatusLabel.BackgroundTransparency = 1
+hStatusLabel.Parent = hCard
+
+-- Visual Progress Bar Container
+local barBg = Instance.new("Frame")
+barBg.Size = UDim2.new(1, -28, 0, 14)
+barBg.Position = UDim2.new(0, 14, 0, 82)
+barBg.BackgroundColor3 = Color3.fromRGB(20, 23, 28)
+barBg.BorderSizePixel = 0
+barBg.Parent = hCard
+
+local barBgCorner = Instance.new("UICorner")
+barBgCorner.CornerRadius = UDim.new(0, 4)
+barBgCorner.Parent = barBg
+
+local barFill = Instance.new("Frame")
+barFill.Size = UDim2.new(0, 0, 1, 0)
+barFill.BackgroundColor3 = C_ORANGE
+barFill.BorderSizePixel = 0
+barFill.Parent = barBg
+
+local barFillCorner = Instance.new("UICorner")
+barFillCorner.CornerRadius = UDim.new(0, 4)
+barFillCorner.Parent = barFill
+
+local hTipLabel = Instance.new("TextLabel")
+hTipLabel.Text = "Tip: Fly via Sky-Glide with 0% damage directly to all 40 hidden ghosts!"
+hTipLabel.Font = Enum.Font.GothamMedium
+hTipLabel.TextSize = 11
+hTipLabel.TextColor3 = C_PURPLE
+hTipLabel.TextXAlignment = Enum.TextXAlignment.Left
+hTipLabel.Position = UDim2.new(0, 14, 0, 106)
+hTipLabel.Size = UDim2.new(1, -28, 0, 18)
+hTipLabel.BackgroundTransparency = 1
+hTipLabel.Parent = hCard
+
+-- Live refresh loop for tracker
+local function refreshHalloweenTracker()
+    local c, t = getGhostCount()
+    local ghosts = scanForGhosts()
+    hProgressLabel.Text = string.format("Collected: %d / %d Ghosts (%d Remaining)", c, t, math.max(0, t - c))
+    hStatusLabel.Text = string.format("Status: Ready • %d Ghosts currently located in map", #ghosts)
+    local pct = math.clamp(c / (t > 0 and t or 40), 0, 1)
+    barFill.Size = UDim2.new(pct, 0, 1, 0)
+end
+
+task.spawn(function()
+    while hubAlive do
+        if currentTab == "Halloween" then
+            pcall(refreshHalloweenTracker)
+        end
+        task.wait(2.5)
+    end
+end)
+
+-- CARD 2: Automation & Actions Card
+local hActionCard = createCard(pageHalloween, "⚡ Ghost Automation Controls", 160)
+
+local autoGhostBtn
+local espGhostBtn
+
+local function setAutoGhostStatus(text, color)
+    hStatusLabel.Text = "Status: " .. text
+    if color then hStatusLabel.TextColor3 = color end
+end
+
+-- 1-Click Auto-Collect All 40
+autoGhostBtn = createButton(hActionCard, "👻 Auto-Collect All 40 Ghosts (Safe Sky Glide)", C_ORANGE, UDim2.new(0, 14, 0, 34), UDim2.new(1, -28, 0, 34), function()
+    if autoGhostRunning then
+        autoGhostRunning = false
+        autoGhostBtn.Text = "👻 Auto-Collect All 40 Ghosts (Safe Sky Glide)"
+        autoGhostBtn.BackgroundColor3 = C_ORANGE
+        setAutoGhostStatus("Stopped by user.", C_RED)
+        return
+    end
+
+    autoGhostRunning = true
+    autoGhostBtn.Text = "⏹ Stop Auto-Collector"
+    autoGhostBtn.BackgroundColor3 = C_RED
+
+    task.spawn(function()
+        setAutoGhostStatus("Scanning for event ghosts...", C_ACCENT)
+        local ghosts = scanForGhosts()
+
+        if #ghosts == 0 then
+            setAutoGhostStatus("No ghost models found in Workspace! Retrying...", C_RED)
+            task.wait(1.5)
+            ghosts = scanForGhosts()
+        end
+
+        local collectedSession = 0
+
+        while autoGhostRunning and hubAlive do
+            -- Re-evaluate ghosts
+            ghosts = scanForGhosts()
+            local curCount, _ = getGhostCount()
+            if curCount >= 40 then
+                setAutoGhostStatus("🎉 CONGRATULATIONS! All 40 Ghosts Collected!", C_GREEN)
+                break
+            end
+
+            local char = player.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if not root then
+                task.wait(1)
+                continue
+            end
+
+            -- Pick nearest ghost
+            local nearest = nil
+            local nearestDist = math.huge
+            for _, g in ipairs(ghosts) do
+                if g.part and g.part:IsDescendantOf(workspace) then
+                    local d = (g.position - root.Position).Magnitude
+                    if d < nearestDist then
+                        nearestDist = d
+                        nearest = g
+                    end
+                end
+            end
+
+            if not nearest then
+                setAutoGhostStatus("Scan complete: No more uncollected ghosts detected in reach!", C_GREEN)
+                break
+            end
+
+            local progressMsg = string.format("Gliding to Ghost '%s' (Distance: %d studs)...", nearest.name, math.floor(nearestDist))
+            setAutoGhostStatus(progressMsg, C_ORANGE)
+
+            local success = glideToGhost(nearest.position, function(rem, total, eta)
+                if not autoGhostRunning then return end
+                setAutoGhostStatus(string.format("Gliding to Ghost: %d studs left (ETA: %ds)...", math.floor(rem), eta), C_ORANGE)
+            end)
+
+            if not autoGhostRunning then break end
+
+            if success then
+                setAutoGhostStatus("Interacting with Ghost...", C_PURPLE)
+                task.wait(0.3)
+                collectGhostTarget(nearest)
+                task.wait(0.8)
+
+                collectedSession = collectedSession + 1
+                pcall(refreshHalloweenTracker)
+            end
+
+            task.wait(0.5)
+        end
+
+        autoGhostRunning = false
+        autoGhostBtn.Text = "👻 Auto-Collect All 40 Ghosts (Safe Sky Glide)"
+        autoGhostBtn.BackgroundColor3 = C_ORANGE
+        refreshHalloweenTracker()
+    end)
+end)
+
+-- Collect Nearest 1 Ghost
+createButton(hActionCard, "📍 Collect Nearest Ghost Now", Color3.fromRGB(52, 152, 219), UDim2.new(0, 14, 0, 74), UDim2.new(0.48, -14, 0, 32), function()
+    local ghosts = scanForGhosts()
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local nearest = nil
+    local nearestDist = math.huge
+    for _, g in ipairs(ghosts) do
+        if g.part and g.part:IsDescendantOf(workspace) then
+            local d = (g.position - root.Position).Magnitude
+            if d < nearestDist then
+                nearestDist = d
+                nearest = g
+            end
+        end
+    end
+
+    if nearest then
+        setAutoGhostStatus(string.format("Gliding to nearest Ghost: %d studs away...", math.floor(nearestDist)), C_ACCENT)
+        task.spawn(function()
+            glideToGhost(nearest.position)
+            task.wait(0.3)
+            collectGhostTarget(nearest)
+            task.wait(0.5)
+            pcall(refreshHalloweenTracker)
+            setAutoGhostStatus("Collected nearest ghost!", C_GREEN)
+        end)
+    else
+        setAutoGhostStatus("No ghosts detected nearby in workspace.", C_RED)
+    end
+end)
+
+-- Toggle ESP
+espGhostBtn = createButton(hActionCard, "👁️ Ghost ESP: OFF", Color3.fromRGB(142, 68, 173), UDim2.new(0.52, 0, 0, 74), UDim2.new(0.48, -14, 0, 32), function()
+    ghostEspActive = not ghostEspActive
+    if ghostEspActive then
+        espGhostBtn.Text = "👁️ Ghost ESP: ON"
+        espGhostBtn.BackgroundColor3 = C_GREEN
+        updateGhostEsp()
+        setAutoGhostStatus("Ghost ESP & 3D Tracker Activated!", C_GREEN)
+    else
+        espGhostBtn.Text = "👁️ Ghost ESP: OFF"
+        espGhostBtn.BackgroundColor3 = Color3.fromRGB(142, 68, 173)
+        clearGhostEsp()
+        setAutoGhostStatus("Ghost ESP Cleared.", C_MUTED)
+    end
+end)
+
+-- Re-Scan Workspace Button
+createButton(hActionCard, "🔄 Re-Scan Workspace for Ghosts", Color3.fromRGB(44, 62, 80), UDim2.new(0, 14, 0, 114), UDim2.new(1, -28, 0, 32), function()
+    local found = scanForGhosts()
+    pcall(refreshHalloweenTracker)
+    if ghostEspActive then updateGhostEsp() end
+    setAutoGhostStatus(string.format("Scan Complete: Located %d Ghost instances in Workspace.", #found), C_GREEN)
+end)
+
+-- ======================================================================
 -- INITIALIZATION
 -- ======================================================================
 switchTab("Business")
