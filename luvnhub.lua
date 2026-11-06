@@ -4,7 +4,7 @@ local placeId = game.PlaceId
 -- Map Place IDs to their respective raw GitHub script links
 local scripts = {
     [130499340995198] = "https://raw.githubusercontent.com/luvnxxviii/luvn/refs/heads/main/Drive%20Life", -- Drive Life
-    [83948710348121] = "https://githubusercontent.com",    -- Da Hood
+    [83948710348121] = "https://raw.githubusercontent.com/luvnxxviii/luvn/refs/heads/main/Be%20a%20Soccer%20Manager",    -- Be a Soccer Manager
     [606849621]  = "https://githubusercontent.com"  -- Jailbreak
 }
 
