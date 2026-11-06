@@ -144,16 +144,25 @@ local function inspectOpponent()
     }
 end
 
--- Create Modern Sleek Window
+-- Create Modern Sleek Window (Acrylic disabled to prevent game screen blur)
 local Window = Fluent:CreateWindow({
     Title = "VELOCITY",
     SubTitle = "Be a Soccer Manager ⚽",
     TabWidth = 150,
     Size = UDim2.fromOffset(590, 480),
-    Acrylic = true,
+    Acrylic = false, -- Disabled so the 3D game world stays crisp and sharp
     Theme = "Dark",
     MinimizeKey = Enum.KeyCode.RightControl
 })
+
+-- Clear any leftover acrylic blur from Lighting
+pcall(function()
+    for _, effect in pairs(game:GetService("Lighting"):GetChildren()) do
+        if effect:IsA("BlurEffect") and (effect.Name == "Blur" or effect.Name == "AcrylicBlur") then
+            effect.Enabled = false
+        end
+    end
+end)
 
 -- UI Tabs
 local Tabs = {
