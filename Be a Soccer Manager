@@ -1,0 +1,905 @@
+--[[
+    ═══════════════════════════════════════════════════════════════
+    VELOCITY // BE A SOCCER MANAGER ⚽
+    Minimalist Modern Automation Hub & Pro Market Sniper
+    ═══════════════════════════════════════════════════════════════
+]]
+
+-- Clean up any previous instance
+if getgenv().VelocityHubLoaded and getgenv().VelocityHubUnload then
+    pcall(getgenv().VelocityHubUnload)
+    task.wait(0.3)
+end
+getgenv().VelocityHubLoaded = true
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local VirtualUser = game:GetService("VirtualUser")
+local SoundService = game:GetService("SoundService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- Game Architecture
+local shared = ReplicatedStorage:WaitForChild("shared")
+local client = ReplicatedStorage:WaitForChild("client")
+local appModules = shared:WaitForChild("modules")
+local controller = require(appModules:WaitForChild("app"):WaitForChild("controller"))
+local net = require(shared:WaitForChild("network"))
+
+-- Controllers
+local collectionController = controller.get("collectionController")
+local matchController = controller.get("matchController")
+local playerDataController = controller.get("playerDataController")
+
+-- Load Modern Fluent UI
+local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+
+-- State Configuration
+local State = {
+    -- Match Engine
+    AutoQueue = false,
+    InstantReplaySkip = true,
+    BypassCutscenes = true,
+    AntiSlowMo = true,
+    AutoFinishVote = true,
+    
+    -- Training Grinder
+    AutoCollectTraining = false,
+    AutoStartTraining = false,
+    TrainingDrill = 6, -- 6 = Full Session
+    
+    -- Packs & Inventory
+    AutoOpenPacks = false,
+    SelectedPack = "basic",
+    OpenDelay = 0.6,
+    AutoQuickSell = false,
+    MaxOvrToSell = 55,
+    
+    -- Pro Market Sniper
+    AutoSnipe = false,
+    SnipeMinOvr = 70,
+    SnipeMaxOvr = 99,
+    ExactOvrOnly = false,
+    SnipeMaxPrice = 15000,
+    SnipeReserveBalance = 5000,
+    SnipePosition = "all", -- all, attacker, defender, goalkeeper
+    SnipeRarity = "rarityAll", -- rarityAll, common, rare, epic, legendary, event
+    SnipeSort = "newest", -- newest, priceAsc, overallDesc
+    AutoRelist = false,
+    RelistMarkup = 30,
+    SnipeAudioAlert = true,
+    
+    -- Stats tracking
+    TotalSnipes = 0,
+    TotalCoinsSpent = 0,
+    LastSnipedText = "No deals sniped yet.",
+    
+    -- Utilities
+    AntiAfk = true,
+    
+    -- Loop Timing Controls
+    LastMatchSearch = 0,
+    IsSniping = false,
+    IsRunning = true
+}
+
+-- Play Chime Sound
+local function playNotificationSound()
+    if not State.SnipeAudioAlert then return end
+    pcall(function()
+        local sound = Instance.new("Sound")
+        sound.SoundId = "rbxassetid://6895079853" -- modern chime
+        sound.Volume = 1.0
+        sound.Parent = SoundService
+        sound:Play()
+        sound.Ended:Connect(function() sound:Destroy() end)
+    end)
+end
+
+-- Anti-AFK Handler
+local AfkConnection
+local function setupAntiAfk()
+    if AfkConnection then AfkConnection:Disconnect() end
+    AfkConnection = LocalPlayer.Idled:Connect(function()
+        if State.AntiAfk then
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end
+    end)
+end
+setupAntiAfk()
+
+-- Helper: Safe Replica Data Getter
+local function getReplicaData()
+    local pd = playerDataController:get()
+    return pd and pd.replica and pd.replica.Data
+end
+
+-- Helper: Safe Opponent Inspection
+local function inspectOpponent()
+    local data = getReplicaData()
+    if not data or not data.activeMatch then
+        return nil, "No active match found! You must be inside a match."
+    end
+    
+    local match = data.activeMatch
+    local ownerSide = match.ownerSide or "home"
+    local oppSide = (ownerSide == "home") and "away" or "home"
+    local opp = match[oppSide]
+    if not opp then return nil, "No opponent data found." end
+    
+    local playersList = {}
+    for _, p in ipairs(opp.players or {}) do
+        table.insert(playersList, string.format("[%s] %s (OVR %d)", p.position or "N/A", p.name or "Player", p.overall or 0))
+    end
+    
+    return {
+        name = opp.displayName or "Unknown",
+        club = opp.club and opp.club.name or "Unknown Club",
+        formation = opp.formation or "Default",
+        fans = opp.fans or 0,
+        players = playersList
+    }
+end
+
+-- Create Modern Sleek Window
+local Window = Fluent:CreateWindow({
+    Title = "VELOCITY",
+    SubTitle = "Be a Soccer Manager ⚽",
+    TabWidth = 150,
+    Size = UDim2.fromOffset(590, 480),
+    Acrylic = true,
+    Theme = "Dark",
+    MinimizeKey = Enum.KeyCode.RightControl
+})
+
+-- UI Tabs
+local Tabs = {
+    Dashboard = Window:AddTab({ Title = "Dashboard", Icon = "layout-grid" }),
+    Market = Window:AddTab({ Title = "Market Sniper", Icon = "shopping-cart" }),
+    Match = Window:AddTab({ Title = "Match Engine", Icon = "zap" }),
+    Training = Window:AddTab({ Title = "Training", Icon = "dumbbell" }),
+    Packs = Window:AddTab({ Title = "Packs & Cards", Icon = "package" }),
+    Utilities = Window:AddTab({ Title = "Utilities", Icon = "settings" })
+}
+
+---------------------------------------------------------------------
+-- DASHBOARD TAB
+---------------------------------------------------------------------
+local StatsParagraph = Tabs.Dashboard:AddParagraph({
+    Title = "Manager Overview",
+    Content = "Loading stats..."
+})
+
+task.spawn(function()
+    while State.IsRunning do
+        task.wait(1.5)
+        pcall(function()
+            local money = collectionController:getMoney() or 0
+            local fans = collectionController:getFans() or 0
+            local inMatch = matchController:isInMatch()
+            local statusText = inMatch and "⚽ In Match" or "🟢 In Lobby (Idle)"
+            
+            StatsParagraph:SetTitle("Manager: " .. LocalPlayer.DisplayName)
+            StatsParagraph:SetDesc(string.format("💰 Coins: %s\n👥 Fans: %s\n📍 Status: %s\n🎯 Sniper Activity: %d deals sniped", 
+                tostring(money):reverse():gsub("%d%d%d", "%1,"):reverse():gsub("^,", ""),
+                tostring(fans),
+                statusText,
+                State.TotalSnipes
+            ))
+        end)
+    end
+end)
+
+Tabs.Dashboard:AddSection("⚡ Quick Actions")
+
+Tabs.Dashboard:AddButton({
+    Title = "Redeem Working Promo Codes",
+    Description = "Automatically tests and redeems known promo codes",
+    Callback = function()
+        local codes = {"WELCOME", "KICKOFF", "ROLANDO", "1M"}
+        local redeemedCount = 0
+        for _, code in ipairs(codes) do
+            local success, ok, msg = pcall(function()
+                return net.codes.redeem:Request(code)
+            end)
+            if success and ok then
+                redeemedCount = redeemedCount + 1
+            end
+            task.wait(0.2)
+        end
+        Fluent:Notify({
+            Title = "Codes Processed",
+            Content = string.format("Tested %d codes. Check your coin balance!", #codes),
+            Duration = 4
+        })
+    end
+})
+
+Tabs.Dashboard:AddButton({
+    Title = "Claim Daily Quests",
+    Description = "Claims all completed daily quest rewards",
+    Callback = function()
+        local data = getReplicaData()
+        local claimed = 0
+        if data and data.dailyQuests and data.dailyQuests.list then
+            for _, q in ipairs(data.dailyQuests.list) do
+                if not q.claimed then
+                    local s, ok = pcall(function()
+                        return net.quests.claim:Request(q.id)
+                    end)
+                    if s and ok then claimed = claimed + 1 end
+                end
+            end
+        end
+        Fluent:Notify({
+            Title = "Quests Claimed",
+            Content = string.format("Claimed %d available daily rewards.", claimed),
+            Duration = 3
+        })
+    end
+})
+
+Tabs.Dashboard:AddButton({
+    Title = "Claim Group Reward",
+    Description = "Claims free rewards if you joined the developer group",
+    Callback = function()
+        local s, ok, msg = pcall(function()
+            return net.groupReward.claim:Request()
+        end)
+        Fluent:Notify({
+            Title = "Group Reward",
+            Content = ok and "Claimed successfully!" or (tostring(msg) ~= "nil" and tostring(msg) or "Not eligible or already claimed."),
+            Duration = 4
+        })
+    end
+})
+
+---------------------------------------------------------------------
+-- PRO MARKET SNIPER TAB
+---------------------------------------------------------------------
+Tabs.Market:AddSection("🎯 Sniper Controls")
+
+local AutoSnipeToggle = Tabs.Market:AddToggle("AutoSnipe", {
+    Title = "Enable Pro Market Sniper",
+    Description = "Continuously scans market listings and instantly auto-buys matches",
+    Default = false
+})
+AutoSnipeToggle:OnChanged(function(v)
+    State.AutoSnipe = v
+    if v then
+        Fluent:Notify({
+            Title = "Market Sniper Activated",
+            Content = string.format("Hunting OVR %d-%d under %s coins", State.SnipeMinOvr, State.SnipeMaxOvr, tostring(State.SnipeMaxPrice)),
+            Duration = 4
+        })
+    end
+end)
+
+Tabs.Market:AddSection("📊 Target OVR & Rating Filter")
+
+local MinOvrSlider = Tabs.Market:AddSlider("MinOvr", {
+    Title = "Minimum Target OVR",
+    Description = "Minimum overall player rating to snipe",
+    Default = 70,
+    Min = 40,
+    Max = 99,
+    Rounding = 0
+})
+MinOvrSlider:OnChanged(function(v)
+    State.SnipeMinOvr = v
+end)
+
+local MaxOvrSlider = Tabs.Market:AddSlider("MaxOvr", {
+    Title = "Maximum Target OVR",
+    Description = "Maximum overall rating (cap to avoid overspending)",
+    Default = 99,
+    Min = 50,
+    Max = 99,
+    Rounding = 0
+})
+MaxOvrSlider:OnChanged(function(v)
+    State.SnipeMaxOvr = v
+end)
+
+local ExactOvrToggle = Tabs.Market:AddToggle("ExactOvr", {
+    Title = "Strict Exact OVR Only",
+    Description = "When enabled, ONLY buys cards matching the exact Min OVR rating",
+    Default = false
+})
+ExactOvrToggle:OnChanged(function(v)
+    State.ExactOvrOnly = v
+end)
+
+Tabs.Market:AddSection("💰 Budget & Safety Thresholds")
+
+local MaxPriceInput = Tabs.Market:AddInput("MaxSnipePrice", {
+    Title = "Max Budget Per Card (Coins)",
+    Default = "15000",
+    Numeric = true,
+    Finished = true,
+    Callback = function(val)
+        local n = tonumber(val)
+        if n and n > 0 then
+            State.SnipeMaxPrice = n
+        end
+    end
+})
+
+local ReserveInput = Tabs.Market:AddInput("ReserveCoins", {
+    Title = "Wallet Safety Reserve (Coins)",
+    Description = "Sniper will pause buying if your coins drop below this reserve",
+    Default = "5000",
+    Numeric = true,
+    Finished = true,
+    Callback = function(val)
+        local n = tonumber(val)
+        if n and n >= 0 then
+            State.SnipeReserveBalance = n
+        end
+    end
+})
+
+Tabs.Market:AddSection("🔍 Positional & Quality Filters")
+
+local PosDropdown = Tabs.Market:AddDropdown("SnipePos", {
+    Title = "Target Position",
+    Values = {"All Positions", "Attacker", "Defender", "Goalkeeper"},
+    Default = "All Positions"
+})
+PosDropdown:OnChanged(function(v)
+    local map = {
+        ["All Positions"] = "all",
+        ["Attacker"] = "attacker",
+        ["Defender"] = "defender",
+        ["Goalkeeper"] = "goalkeeper"
+    }
+    State.SnipePosition = map[v] or "all"
+end)
+
+local RarityDropdown = Tabs.Market:AddDropdown("SnipeRarity", {
+    Title = "Target Rarity",
+    Values = {"All Rarities", "Common", "Rare", "Epic", "Legendary", "Event"},
+    Default = "All Rarities"
+})
+RarityDropdown:OnChanged(function(v)
+    local map = {
+        ["All Rarities"] = "rarityAll",
+        ["Common"] = "common",
+        ["Rare"] = "rare",
+        ["Epic"] = "epic",
+        ["Legendary"] = "legendary",
+        ["Event"] = "event"
+    }
+    State.SnipeRarity = map[v] or "rarityAll"
+end)
+
+local SortDropdown = Tabs.Market:AddDropdown("SnipeSort", {
+    Title = "Market Scan Ordering",
+    Values = {"Newest Listings (Fastest Snipes)", "Lowest Price First", "Highest OVR First"},
+    Default = "Newest Listings (Fastest Snipes)"
+})
+SortDropdown:OnChanged(function(v)
+    local map = {
+        ["Newest Listings (Fastest Snipes)"] = "newest",
+        ["Lowest Price First"] = "priceAsc",
+        ["Highest OVR First"] = "overallDesc"
+    }
+    State.SnipeSort = map[v] or "newest"
+end)
+
+Tabs.Market:AddSection("🔄 Auto-Flip & Alerts")
+
+local AutoRelistToggle = Tabs.Market:AddToggle("AutoRelist", {
+    Title = "Auto-Flip Sniped Cards (Passive Profit)",
+    Description = "Automatically re-lists the sniped card on the market for a markup",
+    Default = false
+})
+AutoRelistToggle:OnChanged(function(v)
+    State.AutoRelist = v
+end)
+
+local MarkupSlider = Tabs.Market:AddSlider("RelistMarkup", {
+    Title = "Flip Markup Percentage (+%)",
+    Description = "Profit markup added to purchase price when re-listing",
+    Default = 30,
+    Min = 10,
+    Max = 100,
+    Rounding = 0
+})
+MarkupSlider:OnChanged(function(v)
+    State.RelistMarkup = v
+end)
+
+local SoundToggle = Tabs.Market:AddToggle("SnipeSound", {
+    Title = "Sound Chime on Snipe",
+    Default = true
+})
+SoundToggle:OnChanged(function(v)
+    State.SnipeAudioAlert = v
+end)
+
+local MarketStatusParagraph = Tabs.Market:AddParagraph({
+    Title = "Sniper Live Feed",
+    Content = "Sniper idle. Configure your budget and OVR above."
+})
+
+---------------------------------------------------------------------
+-- MATCH ENGINE TAB
+---------------------------------------------------------------------
+Tabs.Match:AddSection("Match Automation")
+
+local AutoQueueToggle = Tabs.Match:AddToggle("AutoQueue", {
+    Title = "Auto Queue Matches",
+    Default = false
+})
+AutoQueueToggle:OnChanged(function(v) State.AutoQueue = v end)
+
+local AutoFinishToggle = Tabs.Match:AddToggle("AutoFinish", {
+    Title = "Auto-Vote Match Finish",
+    Description = "Instantly votes finish when the match concludes",
+    Default = true
+})
+AutoFinishToggle:OnChanged(function(v) State.AutoFinishVote = v end)
+
+Tabs.Match:AddSection("⚡ Fast Match Bypasses")
+
+local ReplayToggle = Tabs.Match:AddToggle("ReplaySkip", {
+    Title = "Instant Replay Skip",
+    Description = "Skips goal replays the millisecond they trigger",
+    Default = true
+})
+ReplayToggle:OnChanged(function(v) State.InstantReplaySkip = v end)
+
+local CutsceneToggle = Tabs.Match:AddToggle("CutsceneSkip", {
+    Title = "Bypass Cutscenes & Cinematics",
+    Description = "Suppresses WinCutscene, intro cameras, and press conference",
+    Default = true
+})
+CutsceneToggle:OnChanged(function(v) State.BypassCutscenes = v end)
+
+local SlowMoToggle = Tabs.Match:AddToggle("AntiSlowMo", {
+    Title = "Anti Slow-Motion (Unlock 1x Speed)",
+    Description = "Prevents client from slowing down to 0.22x during iconic/chance shots",
+    Default = true
+})
+SlowMoToggle:OnChanged(function(v) State.AntiSlowMo = v end)
+
+Tabs.Match:AddButton({
+    Title = "Skip Current Replay Now",
+    Description = "Forces a manual replay skip packet",
+    Callback = function()
+        pcall(function() net.match.skipReplay:Fire() end)
+    end
+})
+
+---------------------------------------------------------------------
+-- TRAINING TAB
+---------------------------------------------------------------------
+Tabs.Training:AddSection("Training Automation")
+
+local AutoCollectTrainToggle = Tabs.Training:AddToggle("AutoCollectTrain", {
+    Title = "Auto Collect Finished Training",
+    Description = "Picks up completed XP and stat upgrades automatically",
+    Default = false
+})
+AutoCollectTrainToggle:OnChanged(function(v) State.AutoCollectTraining = v end)
+
+local AutoStartTrainToggle = Tabs.Training:AddToggle("AutoStartTrain", {
+    Title = "Auto Start Idle Slots",
+    Description = "Assigns available non-squad cards to empty training slots",
+    Default = false
+})
+AutoStartTrainToggle:OnChanged(function(v) State.AutoStartTraining = v end)
+
+local DrillDropdown = Tabs.Training:AddDropdown("DrillDropdown", {
+    Title = "Preferred Training Program",
+    Values = {"Full Session (All Stats)", "Sprint (Speed)", "Finishing (Shooting)", "Playmaking (Passing)", "Tackling (Defending)", "Goalkeeping"},
+    Default = "Full Session (All Stats)"
+})
+DrillDropdown:OnChanged(function(v)
+    local mapping = {
+        ["Full Session (All Stats)"] = 6,
+        ["Sprint (Speed)"] = 1,
+        ["Finishing (Shooting)"] = 2,
+        ["Playmaking (Passing)"] = 3,
+        ["Tackling (Defending)"] = 4,
+        ["Goalkeeping"] = 5
+    }
+    State.TrainingDrill = mapping[v] or 6
+end)
+
+---------------------------------------------------------------------
+-- PACKS & INVENTORY TAB
+---------------------------------------------------------------------
+Tabs.Packs:AddSection("⚡ Fast Pack Opener (Animation Skip)")
+
+local PackDropdown = Tabs.Packs:AddDropdown("PackSelect", {
+    Title = "Select Pack",
+    Values = {"basic (4K)", "club (12K)", "pro (35K)", "elite (65K)", "star (120K)", "legend (550K)", "galactico (1.5M)"},
+    Default = "basic (4K)"
+})
+PackDropdown:OnChanged(function(v)
+    State.SelectedPack = v:match("^(%w+)") or "basic"
+end)
+
+local PackDelaySlider = Tabs.Packs:AddSlider("PackDelay", {
+    Title = "Open Delay (Seconds)",
+    Description = "Wait time between consecutive pack purchases",
+    Default = 0.6,
+    Min = 0.2,
+    Max = 3.0,
+    Rounding = 1
+})
+PackDelaySlider:OnChanged(function(v) State.OpenDelay = v end)
+
+local AutoOpenPacksToggle = Tabs.Packs:AddToggle("AutoOpenPacks", {
+    Title = "Fast Auto-Buy Packs",
+    Description = "Continuously buys selected pack directly via API",
+    Default = false
+})
+AutoOpenPacksToggle:OnChanged(function(v) State.AutoOpenPacks = v end)
+
+Tabs.Packs:AddSection("Inventory Filter")
+
+local QuickSellToggle = Tabs.Packs:AddToggle("QuickSell", {
+    Title = "Auto Quick-Sell Low OVR Cards",
+    Description = "Automatically sells non-squad duplicate/trash cards",
+    Default = false
+})
+QuickSellToggle:OnChanged(function(v) State.AutoQuickSell = v end)
+
+local MaxOvrSellSlider = Tabs.Packs:AddSlider("MaxOvrSell", {
+    Title = "Max OVR Threshold to Quick-Sell",
+    Description = "Cards with OVR equal or below this will be quick-sold",
+    Default = 55,
+    Min = 40,
+    Max = 75,
+    Rounding = 0
+})
+MaxOvrSellSlider:OnChanged(function(v) State.MaxOvrToSell = v end)
+
+---------------------------------------------------------------------
+-- UTILITIES & OPPONENT SPY TAB
+---------------------------------------------------------------------
+Tabs.Utilities:AddSection("Opponent Scouting")
+
+Tabs.Utilities:AddButton({
+    Title = "Inspect Current Opponent Deck",
+    Description = "Views current match opponent lineup & ratings",
+    Callback = function()
+        local opp, err = inspectOpponent()
+        if not opp then
+            Fluent:Notify({
+                Title = "Scouting Failed",
+                Content = err,
+                Duration = 4
+            })
+            return
+        end
+        
+        local text = string.format("Opponent: %s\nClub: %s | Formation: %s | Fans: %d\n\nSquad:\n%s",
+            opp.name, opp.club, opp.formation, opp.fans,
+            table.concat(opp.players, "\n")
+        )
+        
+        Fluent:Notify({
+            Title = "Opponent Scouted: " .. opp.name,
+            Content = string.format("Club: %s | Formation: %s | %d Players", opp.club, opp.formation, #opp.players),
+            Duration = 6
+        })
+        print("════════════ OPPONENT DECK ════════════")
+        print(text)
+        print("═══════════════════════════════════════")
+    end
+})
+
+Tabs.Utilities:AddSection("Security & Client")
+
+local AntiAfkToggle = Tabs.Utilities:AddToggle("AntiAfk", {
+    Title = "Anti-AFK 20-Min Protection",
+    Description = "Prevents Roblox idle timeout disconnects",
+    Default = true
+})
+AntiAfkToggle:OnChanged(function(v) State.AntiAfk = v end)
+
+Tabs.Utilities:AddButton({
+    Title = "Unload Velocity Hub",
+    Description = "Closes interface and stops active loops",
+    Callback = function()
+        getgenv().VelocityHubUnload()
+    end
+})
+
+-- Unload handler
+getgenv().VelocityHubUnload = function()
+    State.IsRunning = false
+    State.AutoQueue = false
+    State.AutoCollectTraining = false
+    State.AutoStartTraining = false
+    State.AutoOpenPacks = false
+    State.AutoQuickSell = false
+    State.AutoSnipe = false
+    if AfkConnection then AfkConnection:Disconnect() end
+    pcall(function() Window:Destroy() end)
+    getgenv().VelocityHubLoaded = false
+end
+
+---------------------------------------------------------------------
+-- BACKGROUND AUTOMATION LOOPS
+---------------------------------------------------------------------
+
+-- Cutscene & Cinematic Bypass Loop
+task.spawn(function()
+    while State.IsRunning do
+        task.wait(0.2)
+        if State.BypassCutscenes then
+            pcall(function()
+                local winCut = PlayerGui:FindFirstChild("WinCutscene")
+                if winCut and winCut.Enabled then winCut.Enabled = false end
+                
+                local cine = PlayerGui:FindFirstChild("Cinematic")
+                if cine and cine.Enabled then cine.Enabled = false end
+                
+                local goalFx = PlayerGui:FindFirstChild("GoalFx")
+                if goalFx and goalFx.Enabled then goalFx.Enabled = false end
+                
+                local press = PlayerGui:FindFirstChild("PressConference")
+                if press and press.Enabled then press.Enabled = false end
+            end)
+        end
+    end
+end)
+
+-- Anti Slow-Mo (Lock TimeScale to 1.0)
+local slowMoConn
+slowMoConn = RunService.RenderStepped:Connect(function()
+    if not State.IsRunning then
+        slowMoConn:Disconnect()
+        return
+    end
+    if State.AntiSlowMo then
+        pcall(function()
+            local ups = debug.getupvalues(matchController.start)
+            local u120 = ups and ups[10]
+            if u120 and u120.view then
+                u120.view.targetScale = 1.0
+                if u120.view.timeScale and u120.view.timeScale < 1.0 then
+                    u120.view.timeScale = 1.0
+                end
+            end
+        end)
+    end
+end)
+
+-- Replay Auto-Skip & Vote Finish Listener
+task.spawn(function()
+    while State.IsRunning do
+        task.wait(0.25)
+        local inMatch = false
+        pcall(function() inMatch = matchController:isInMatch() end)
+        
+        if inMatch then
+            -- Auto Skip Replay
+            if State.InstantReplaySkip then
+                pcall(function()
+                    net.match.skipReplay:Fire()
+                end)
+            end
+            
+            -- Auto Vote Finish
+            if State.AutoFinishVote then
+                pcall(function()
+                    net.match.finish:Fire()
+                end)
+            end
+        end
+    end
+end)
+
+-- Match Auto-Queue Loop
+task.spawn(function()
+    while State.IsRunning do
+        task.wait(2.0)
+        if State.AutoQueue then
+            pcall(function()
+                local inMatch = matchController:isInMatch()
+                local now = os.clock()
+                if not inMatch and (now - State.LastMatchSearch > 5.0) then
+                    State.LastMatchSearch = now
+                    net.matchmaking.startSearch:Request(nil)
+                end
+            end)
+        end
+    end
+end)
+
+-- Training Grinder Loop
+task.spawn(function()
+    while State.IsRunning do
+        task.wait(3.5)
+        if State.AutoCollectTraining or State.AutoStartTraining then
+            pcall(function()
+                local training = collectionController:getTraining()
+                local serverTime = workspace:GetServerTimeNow()
+                
+                if training and training.slots then
+                    for index = 1, (training.unlocked or 1) do
+                        local slot = training.slots[index]
+                        
+                        -- Collect
+                        if State.AutoCollectTraining and slot and slot.cardId and slot.cardId ~= "" then
+                            if serverTime >= (slot.endsAt or 0) then
+                                net.training.collect:Request(index)
+                                task.wait(0.5)
+                            end
+                        end
+                        
+                        -- Start
+                        if State.AutoStartTraining and (not slot or slot.cardId == "" or slot.cardId == nil) then
+                            local avail = collectionController:getAvailableCards()
+                            local candidate = nil
+                            for _, c in ipairs(avail or {}) do
+                                if not collectionController:isInSquad(c.id) and not collectionController:isInAnyPreset(c.id) then
+                                    candidate = c
+                                    break
+                                end
+                            end
+                            if candidate then
+                                net.training.start:Request(index, candidate.id, State.TrainingDrill)
+                                task.wait(0.5)
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+-- Pack Auto-Buyer Loop
+task.spawn(function()
+    while State.IsRunning do
+        task.wait(State.OpenDelay)
+        if State.AutoOpenPacks then
+            pcall(function()
+                local ok, res = net.cards.buyPack:Request(State.SelectedPack)
+                if not ok then
+                    State.AutoOpenPacks = false
+                    AutoOpenPacksToggle:SetValue(false)
+                    Fluent:Notify({
+                        Title = "Pack Purchase Stopped",
+                        Content = tostring(res) ~= "nil" and tostring(res) or "Insufficient coins.",
+                        Duration = 4
+                    })
+                end
+            end)
+        end
+    end
+end)
+
+-- Auto Quick-Sell Trash Cards Loop
+task.spawn(function()
+    while State.IsRunning do
+        task.wait(4.0)
+        if State.AutoQuickSell then
+            pcall(function()
+                local cards = collectionController:getCards()
+                for _, card in ipairs(cards or {}) do
+                    if not State.AutoQuickSell or not State.IsRunning then break end
+                    if card and card.overall and card.overall <= State.MaxOvrToSell then
+                        if not collectionController:isInAnyPreset(card.id) and not collectionController:isTraining(card.id) then
+                            net.cards.quickSell:Request(card.id)
+                            task.wait(0.3)
+                        end
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+-- PRO MARKET SNIPER LOOP
+task.spawn(function()
+    while State.IsRunning do
+        task.wait(2.0)
+        if State.AutoSnipe and not State.IsSniping then
+            State.IsSniping = true
+            pcall(function()
+                -- Safety Reserve Check
+                local currentMoney = collectionController:getMoney() or 0
+                if currentMoney <= State.SnipeReserveBalance then
+                    MarketStatusParagraph:SetDesc(string.format("⚠️ Paused: Balance (%d) is at or below safety reserve (%d).", currentMoney, State.SnipeReserveBalance))
+                    return
+                end
+                
+                -- Build Query Filter
+                local queryFilters = {
+                    sort = State.SnipeSort,
+                    rarity = State.SnipeRarity,
+                    search = "",
+                    position = State.SnipePosition
+                }
+                
+                local ok, data = net.market.getListings:Request(queryFilters, 0)
+                if ok and data and data.items then
+                    for _, item in ipairs(data.items) do
+                        if not State.AutoSnipe or not State.IsRunning then break end
+                        
+                        local price = item.price or 999999999
+                        local card = item.card
+                        local ovr = card and card.overall or 0
+                        local pos = card and card.position or ""
+                        local rarity = card and card.rarity or ""
+                        
+                        -- Budget & Reserve Checks
+                        local withinBudget = (price <= State.SnipeMaxPrice) and ((currentMoney - price) >= State.SnipeReserveBalance)
+                        
+                        -- Rating Checks
+                        local ratingMatches = false
+                        if State.ExactOvrOnly then
+                            ratingMatches = (ovr == State.SnipeMinOvr)
+                        else
+                            ratingMatches = (ovr >= State.SnipeMinOvr and ovr <= State.SnipeMaxOvr)
+                        end
+                        
+                        if withinBudget and ratingMatches then
+                            local bought, buyErr = net.market.buyListing:Request(item.id)
+                            if bought then
+                                State.TotalSnipes = State.TotalSnipes + 1
+                                State.TotalCoinsSpent = State.TotalCoinsSpent + price
+                                playNotificationSound()
+                                
+                                local snipeMsg = string.format("✅ SNIPED: %s (OVR %d, %s) for %s coins!", 
+                                    card.name or "Player", ovr, rarity:upper(),
+                                    tostring(price):reverse():gsub("%d%d%d", "%1,"):reverse():gsub("^,", "")
+                                )
+                                State.LastSnipedText = snipeMsg
+                                MarketStatusParagraph:SetDesc(string.format("%s\nTotal Sniped: %d | Spent: %s coins",
+                                    snipeMsg, State.TotalSnipes,
+                                    tostring(State.TotalCoinsSpent):reverse():gsub("%d%d%d", "%1,"):reverse():gsub("^,", "")
+                                ))
+                                
+                                Fluent:Notify({
+                                    Title = "🎯 Deal Sniped!",
+                                    Content = string.format("%s (OVR %d) for %d coins", card.name or "Card", ovr, price),
+                                    Duration = 5
+                                })
+                                
+                                -- Auto-Relist for passive profit
+                                if State.AutoRelist and card.id then
+                                    task.spawn(function()
+                                        task.wait(1.0)
+                                        local markupPrice = math.floor(price * (1 + (State.RelistMarkup / 100)))
+                                        local relisted, relistErr = net.market.listCard:Request(card.id, markupPrice)
+                                        if relisted then
+                                            Fluent:Notify({
+                                                Title = "🔄 Auto-Relisted",
+                                                Content = string.format("%s relisted for %d coins (+%d%%)", card.name, markupPrice, State.RelistMarkup),
+                                                Duration = 4
+                                            })
+                                        end
+                                    end)
+                                end
+                                
+                                task.wait(1.0)
+                            end
+                        end
+                    end
+                end
+            end)
+            State.IsSniping = false
+        end
+    end
+end)
+
+-- Select Default Tab
+Window:SelectTab(2) -- Select Market Sniper tab on load
+
+Fluent:Notify({
+    Title = "VELOCITY Pro Sniper",
+    Content = "Market Sniper configured. Press Right-Ctrl to toggle UI.",
+    Duration = 5
+})
