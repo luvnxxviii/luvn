@@ -1,5 +1,6 @@
 -- Arcane 101 · Monochrome Minimalist Hub
 -- Modular Luau Script | Theme: Monochrome Minimalist Sleek
+local SCRIPT_VERSION = "V1"
 
 local env = (typeof(getgenv) == "function" and getgenv()) or _G
 if type(env.__MonochromeCleanup) == "function" then
@@ -454,7 +455,7 @@ function UI.CreateWindow(opts)
 	local footerLeft = create("TextLabel", {
 		Size = UDim2.new(0.65, 0, 1, 0),
 		BackgroundTransparency = 1,
-		Text = "MONOCHROME · READY",
+		Text = "CREATED BY LUVN · READY",
 		Font = Enum.Font.RobotoMono,
 		TextSize = 10,
 		TextColor3 = Theme.TextMuted,
@@ -1542,7 +1543,7 @@ end
 --// Initialize Window
 local Window = UI.CreateWindow({
 	Title = "ARCANE 101",
-	Subtitle = "MONOCHROME",
+	Subtitle = SCRIPT_VERSION .. " · CREATED BY LUVN",
 	Width = 432,
 	Height = 384,
 	ToggleKey = Enum.KeyCode.RightShift,
@@ -2725,14 +2726,20 @@ local function getAliveEnemies(mods, state, me)
 			local ehp = math.max(1, hp + shield)
 			local isBoss = isBossCombatant(mods, c, id)
 			local evades = false
+			local reprisal = 0
 			for _, stEntry in ipairs(c.statuses or {}) do
 				local sid = (type(stEntry) == "table" and stEntry.id) or stEntry
 				local stDef = type(sid) == "string" and mods.Statuses[sid]
-				if stDef and stDef.evadesNext then
-					evades = true
-					break
+				if stDef then
+					if stDef.evadesNext then
+						evades = true
+					end
+					if type(stDef.reprisal) == "number" then
+						reprisal += stDef.reprisal * ((type(stEntry) == "table" and tonumber(stEntry.power)) or 1)
+					end
 				end
 			end
+			local repCap = (mods.Constants and mods.Constants.REPRISAL_MAX) or 0.75
 			table.insert(enemies, {
 				id = id,
 				combatant = c,
@@ -2742,6 +2749,7 @@ local function getAliveEnemies(mods, state, me)
 				effectiveHp = ehp,
 				isBoss = isBoss,
 				evades = evades,
+				reprisal = math.min(reprisal, repCap),
 			})
 		end
 	end
@@ -2838,14 +2846,14 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 		end
 
 		local overkill = math.max(0, dmg - e.effectiveHp)
-		local s = (eff * (e.isBoss and bossFocusMult or 1)) - (overkill * 0.65)
+		local s = (eff * (e.isBoss and bossFocusMult or 1)) - (overkill * 0.65) - (eff * (e.reprisal or 0) * 0.85)
 		if canKill then
 			s += (e.isBoss and 500 or 140)
 		elseif entry.info.appliesControl and not e.evades then
 			s += 90
 		end
-		if e.evades and (entry.ability.energyCost or 0) <= 1 then
-			s += 30
+		if (e.evades or (e.reprisal or 0) > 0) and (entry.ability.energyCost or 0) <= 1 and not canKill then
+			s += e.evades and 30 or -15
 		end
 		if s > bestScore then
 			bestScore = s
@@ -3201,23 +3209,59 @@ local function pickAttackEntry(mods, state, me, usableEntries, deckRem)
 		return usefulPowerUps[1], nil
 	end
 
-	-- 4. Cast the best damage-dealing card currently payable!
+	-- 4. Cast the best damage-dealing card currently payable! (If Blinded with no Cleanse, spend a 0-1 pip poke first instead of burning a 3+ pip finisher)
 	if #damagers > 0 then
+		local rInfo = getCasterRedirectInfo(mods.Statuses, me)
+		if rInfo.isBlinded and #damagers >= 2 then
+			for _, d in ipairs(damagers) do
+				if (d.ability.energyCost or 0) <= 1 then
+					return d, nil
+				end
+			end
+		end
 		return damagers[1], nil
 	end
 
 	return nil, nil
 end
 
+local function getCasterRedirectInfo(Statuses, me)
+	local hasRedirect = false
+	local redirectName = nil
+	local isBlinded = false
+	for _, entry in ipairs(me and me.statuses or {}) do
+		local sid = (type(entry) == "table" and entry.id) or entry
+		local st = type(sid) == "string" and Statuses[sid]
+		if st then
+			if st.turnsNext == true then
+				hasRedirect = true
+				redirectName = st.name or sid
+			end
+			if st.missesNext == true then
+				isBlinded = true
+			end
+		end
+	end
+	return {
+		hasRedirect = hasRedirect,
+		redirectName = redirectName,
+		isBlinded = isBlinded,
+	}
+end
+
 local function getCombatantDebuffCount(Statuses, c, filterIds)
 	local count = 0
 	local hasSevere = false
+	local hasRedirect = false
 	for _, entry in ipairs(c and c.statuses or {}) do
 		local sid = (type(entry) == "table" and entry.id) or entry
 		local st = type(sid) == "string" and Statuses[sid]
 		if st and not st.cleanseProof then
 			local isDebuff = (
 				st.isDot == true
+				or st.turnsNext == true
+				or st.missesNext == true
+				or st.cleansable == true
 				or hasStatusTag(st, "Debuff")
 				or hasStatusTag(st, "Curse")
 				or hasStatusTag(st, "DoT")
@@ -3228,7 +3272,12 @@ local function getCombatantDebuffCount(Statuses, c, filterIds)
 			)
 			if isDebuff and (not filterIds or table.find(filterIds, sid) ~= nil) then
 				count += 1
+				if st.turnsNext == true then
+					hasRedirect = true
+				end
 				if st.isDot == true
+					or st.turnsNext == true
+					or st.missesNext == true
 					or (type(st.damageDealtMultiplier) == "number" and st.damageDealtMultiplier < 1)
 					or (type(st.damageTakenMultiplier) == "number" and st.damageTakenMultiplier > 1)
 					or sid == "MortalWound"
@@ -3238,7 +3287,7 @@ local function getCombatantDebuffCount(Statuses, c, filterIds)
 			end
 		end
 	end
-	return count, hasSevere
+	return count, hasSevere, hasRedirect
 end
 
 local function getTeamHealthInfo(mods, state, me, lowThreshold)
@@ -3813,30 +3862,32 @@ local function pickCleanseEntry(mods, state, me, entries)
 		local ab = entry.ability
 		if info.hasCleanse and not info.preventsAction and ab.targetKind ~= "SingleEnemy" then
 			local cost = ab.energyCost or 0
-			local myCnt, mySevere = getCombatantDebuffCount(Statuses, me, info.cleanseStatuses)
-			local targetId, targetName, targetCnt, targetSevere = nil, nil, 0, false
+			local myCnt, mySevere, myRedirect = getCombatantDebuffCount(Statuses, me, info.cleanseStatuses)
+			local targetId, targetName, targetCnt, targetSevere, targetRedirect = nil, nil, 0, false, false
 
 			if myCnt > 0 then
-				targetId, targetName, targetCnt, targetSevere = me.id, "me", myCnt, mySevere
+				targetId, targetName, targetCnt, targetSevere, targetRedirect = me.id, "me", myCnt, mySevere, myRedirect
 			elseif ab.targetKind == "SingleAlly" or ab.targetKind == "AllAllies" or ab.targetKind == "SingleAny" then
 				for id, c in pairs(state.combatants) do
 					if id ~= me.id and c.team == me.team and not c.isPet and CombatSim.isAlive(c) then
-						local cnt, sev = getCombatantDebuffCount(Statuses, c, info.cleanseStatuses)
-						if cnt > targetCnt or (cnt == targetCnt and sev and not targetSevere) then
+						local cnt, sev, redir = getCombatantDebuffCount(Statuses, c, info.cleanseStatuses)
+						if cnt > targetCnt or (cnt == targetCnt and (redir and not targetRedirect or (sev and not targetSevere))) then
 							targetId = id
 							targetName = c.name or id
 							targetCnt = cnt
 							targetSevere = sev
+							targetRedirect = redir
 						end
 					end
 				end
 			end
 
 			if targetCnt > 0 then
-				local shouldCast = (targetId == me.id and (cost <= 1 or targetCnt >= 2 or targetSevere or meRatio <= 0.70))
+				local shouldCast = targetRedirect
+					or (targetId == me.id and (cost <= 1 or targetCnt >= 2 or targetSevere or meRatio <= 0.70))
 					or (targetId ~= me.id and (cost <= 0 or CombatAuto.Style == "Support"))
 				if shouldCast then
-					local score = (targetId == me.id and 5000 or 2000) + (targetCnt * 400) + (targetSevere and 600 or 0) - (cost * 300) + (info.healScore or 0)
+					local score = (targetRedirect and 12000 or (targetId == me.id and 5000 or 2000)) + (targetCnt * 400) + (targetSevere and 600 or 0) - (cost * 300) + (info.healScore or 0)
 					if ab.targetKind == "AllAllies" then
 						score += 150
 					end
@@ -3911,44 +3962,70 @@ local function runCombatStep()
 	local me = state.combatants[myId]
 	local entries = collectEntries(mods, state, me, false)
 	local deckRem = getDeckRemainingSummary(mods, state, me)
+	local casterFlags = getCasterRedirectInfo(mods.Statuses, me)
 
 	local chosen
 	local savingForCard = nil
 	local usedEmergencyHeal = false
 	local cleanseTargetId = nil
 	local cleanseTargetName = nil
-	if CombatAuto.Style == "Attack" then
-		chosen = findImmediateLethalEntry(mods, state, me, entries)
-	end
-	if not chosen and CombatAuto.AutoHeal then
-		local hi = getTeamHealthInfo(mods, state, me, CombatAuto.HealThreshold)
-		if hi.revivableCount > 0 or hi.lowestRatio <= 0.25 then
+	local safeRedirectPass = false
+	if casterFlags.hasRedirect then
+		-- Under Beguiled / turn-redirect debuff: NEVER target enemies! Try Cleanse -> Safe Heal -> 0-pip utility -> Safe Skip
+		chosen, cleanseTargetId, cleanseTargetName = pickCleanseEntry(mods, state, me, entries)
+		if not chosen and CombatAuto.AutoHeal then
+			chosen, savingForCard = pickEmergencyHealEntry(mods, state, me, entries, CombatAuto.HealThreshold, deckRem)
+			if chosen then
+				if (chosen.info.directDamage or 0) > 0 then
+					chosen = nil
+				else
+					usedEmergencyHeal = true
+				end
+			end
+		end
+		if not chosen then
+			chosen = pickFreeUtilityCard(mods, state, me, entries, { ability = { school = DeckStrategy.PrimarySchool }, info = { directDamage = 1 } }, deckRem)
+			if chosen and ((chosen.info.directDamage or 0) > 0 or chosen.ability.targetKind == "SingleEnemy" or chosen.ability.targetKind == "AllEnemies") then
+				chosen = nil
+			end
+		end
+		if not chosen then
+			safeRedirectPass = true
+		end
+	else
+		if CombatAuto.Style == "Attack" then
+			chosen = findImmediateLethalEntry(mods, state, me, entries)
+		end
+		if not chosen and CombatAuto.AutoHeal then
+			local hi = getTeamHealthInfo(mods, state, me, CombatAuto.HealThreshold)
+			if hi.revivableCount > 0 or hi.lowestRatio <= 0.25 then
+				chosen, savingForCard = pickEmergencyHealEntry(mods, state, me, entries, CombatAuto.HealThreshold, deckRem)
+				if chosen then
+					usedEmergencyHeal = true
+				end
+			end
+		end
+		if not chosen and not savingForCard and CombatAuto.AutoCleanse then
+			chosen, cleanseTargetId, cleanseTargetName = pickCleanseEntry(mods, state, me, entries)
+		end
+		if not chosen and not savingForCard and CombatAuto.AutoHeal then
 			chosen, savingForCard = pickEmergencyHealEntry(mods, state, me, entries, CombatAuto.HealThreshold, deckRem)
 			if chosen then
 				usedEmergencyHeal = true
 			end
 		end
-	end
-	if not chosen and not savingForCard and CombatAuto.AutoCleanse then
-		chosen, cleanseTargetId, cleanseTargetName = pickCleanseEntry(mods, state, me, entries)
-	end
-	if not chosen and not savingForCard and CombatAuto.AutoHeal then
-		chosen, savingForCard = pickEmergencyHealEntry(mods, state, me, entries, CombatAuto.HealThreshold, deckRem)
-		if chosen then
-			usedEmergencyHeal = true
-		end
-	end
 
-	if not chosen and not savingForCard then
-		if CombatAuto.Style == "Attack" then
-			chosen, savingForCard = pickAttackEntry(mods, state, me, entries, deckRem)
-		else
-			chosen, savingForCard = pickSupportEntry(mods, state, me, entries, deckRem)
+		if not chosen and not savingForCard then
+			if CombatAuto.Style == "Attack" then
+				chosen, savingForCard = pickAttackEntry(mods, state, me, entries, deckRem)
+			else
+				chosen, savingForCard = pickSupportEntry(mods, state, me, entries, deckRem)
+			end
 		end
-	end
 
-	if not chosen and savingForCard then
-		chosen = pickFreeUtilityCard(mods, state, me, entries, savingForCard, deckRem)
+		if not chosen and savingForCard then
+			chosen = pickFreeUtilityCard(mods, state, me, entries, savingForCard, deckRem)
+		end
 	end
 
 	CombatAuto.Busy = true
@@ -4014,6 +4091,16 @@ local function runCombatStep()
 				setCombatStatus(tag .. cardName .. " -> " .. tostring(targetMeta.name) .. multNote)
 			else
 				setCombatStatus("CAST · " .. cardName)
+			end
+		elseif safeRedirectPass then
+			if mods.CombatSim.mayPass(me) then
+				CombatUI.passTurn()
+				if CombatUI.canAct() then
+					mods.Net.fireServer("SubmitAction", { kind = mods.Enums.ActionKind.Pass, targetIds = {} })
+				end
+				setCombatStatus("SKIP · " .. string.upper(tostring(casterFlags.redirectName or "BEGUILED")))
+			else
+				setCombatStatus("WAIT · " .. string.upper(tostring(casterFlags.redirectName or "BEGUILED")))
 			end
 		elseif savingForCard then
 			if mods.CombatSim.mayPass(me) then
