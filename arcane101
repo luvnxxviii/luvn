@@ -1461,6 +1461,13 @@ local function getGameMods(forceReload)
 						end
 					end
 				end
+				if type(area.boss.pair) == "table" then
+					for _, subId in ipairs(area.boss.pair) do
+						if type(subId) == "string" then
+							bossEnemyIds[subId] = true
+						end
+					end
+				end
 			end
 		end
 		if type(Enemies) == "table" then
@@ -1500,6 +1507,9 @@ local function getGameMods(forceReload)
 			},
 			CombatSim = require(Campaign.Systems.CombatSim),
 			CombatMath = safeRequire(Campaign.Systems:FindFirstChild("CombatMath")),
+			CardTiers = safeRequire(Campaign.Systems:FindFirstChild("CardTiers")),
+			Deck = safeRequire(Campaign.Systems:FindFirstChild("Deck")),
+			Loadout = safeRequire(Campaign.Systems:FindFirstChild("Loadout")),
 			Inventory = safeRequire(Campaign.Systems:FindFirstChild("Inventory")),
 			Schools = safeRequire(Campaign.Shared:FindFirstChild("Schools")),
 			Constants = safeRequire(Campaign.Shared:FindFirstChild("Constants")),
@@ -1769,6 +1779,7 @@ local CombatAuto = {
 	SavePipMinCost = 4,
 	AutoHeal = Config.Get("AutoHeal", false),
 	HealThreshold = (tonumber(string.match(tostring(Config.Get("HealBelow", "50%")), "%d+")) or 50) / 100,
+	AutoCleanse = Config.Get("AutoCleanse", true),
 	AutoDiscard = Config.Get("AutoDiscard", false),
 	AutoTrivia = Config.Get("AutoTrivia", true),
 	FastPlayback = Config.Get("FastPlayback", false),
@@ -1854,7 +1865,8 @@ CombatTab:AddToggle({
 })
 
 local origCinemaRemaining = nil
-local function applyFastPlayback(enabled)
+local lastSyncedCombatSpeed = nil
+local function applyFastPlayback(enabled, syncSpeedSetting)
 	local mods = getGameMods()
 	if not mods then
 		return
@@ -1876,6 +1888,15 @@ local function applyFastPlayback(enabled)
 			mods.Cinema.remaining = origCinemaRemaining
 		end
 	end
+	if syncSpeedSetting then
+		local speedVal = enabled and 1 or 0
+		if lastSyncedCombatSpeed ~= speedVal then
+			lastSyncedCombatSpeed = speedVal
+			pcall(function()
+				mods.Net.fireServer("SetSetting", { key = "combatSpeed", value = speedVal })
+			end)
+		end
+	end
 end
 
 trackRestore(function()
@@ -1892,12 +1913,31 @@ end)
 
 CombatTab:AddToggle({
 	Title = "Fast Combat Playback",
-	Description = "Skips cinematic waits & hurries death VFX",
+	Description = "Sets 1.5x combat speed, skips cinematics & hurries deaths",
 	Default = CombatAuto.FastPlayback,
 	Callback = function(enabled)
 		CombatAuto.FastPlayback = enabled
 		Config.Set("FastPlayback", enabled)
-		applyFastPlayback(enabled)
+		applyFastPlayback(enabled, true)
+	end,
+})
+
+if CombatAuto.FastPlayback then
+	task.spawn(function()
+		task.wait(0.4)
+		if State.Alive and CombatAuto.FastPlayback then
+			applyFastPlayback(true, true)
+		end
+	end)
+end
+
+CombatTab:AddToggle({
+	Title = "Auto Cleanse Debuffs",
+	Description = "Auto-uses shown Cleanse cards when you have debuffs",
+	Default = CombatAuto.AutoCleanse,
+	Callback = function(enabled)
+		CombatAuto.AutoCleanse = enabled
+		Config.Set("AutoCleanse", enabled)
 	end,
 })
 
@@ -1926,6 +1966,18 @@ combatStatusCard = CombatTab:AddStatusCard({
 	Value = "IDLE",
 })
 
+local deckStrategyCard
+local function setDeckStrategyStatus(text)
+	if deckStrategyCard then
+		deckStrategyCard:Set(text)
+	end
+end
+
+deckStrategyCard = CombatTab:AddStatusCard({
+	Title = "Deck Strategy",
+	Value = "SCANNING DECK...",
+})
+
 -- Combat Helper Functions
 local function hasStatusTag(statusDef, tag)
 	if not statusDef or type(statusDef.tags) ~= "table" then
@@ -1938,7 +1990,25 @@ local LiveCombat = {
 	State = nil,
 	MyId = nil,
 	TurnActorId = nil,
+	BossCombatantId = nil,
 	LastGcScan = 0,
+	ConsumedCounts = {},
+}
+
+local DeckStrategy = {
+	LastFetchAt = 0,
+	Signature = "",
+	RawCards = {},
+	CardTiers = {},
+	TotalCards = 0,
+	PrimarySchool = nil,
+	DamageBySchool = {},
+	Finishers = {},
+	StrongestFinisher = nil,
+	StrongestHeal = nil,
+	HasStrongHeal = false,
+	TinyHealOnly = false,
+	SummaryText = "SCANNING DECK...",
 }
 
 local function findMyCombatantId(state)
@@ -2084,7 +2154,40 @@ local function getCombatSnapshot(mods)
 	return state, myId, "ACT"
 end
 
-local function analyzeAbility(mods, ability, energy)
+local function getEffectCastScale(mods, abilityId, ef, me, cardTiersFallback)
+	local CardTiers = mods and mods.CardTiers
+	if not CardTiers then
+		return 1
+	end
+	if me and type(CardTiers.powerFor) == "function" then
+		local ok, p = pcall(CardTiers.powerFor, me, abilityId, ef)
+		if ok and type(p) == "number" and p > 0 then
+			return p
+		end
+	end
+	if cardTiersFallback and type(CardTiers.of) == "function" and type(CardTiers.power) == "function" then
+		local okT, tier = pcall(CardTiers.of, cardTiersFallback, abilityId)
+		if okT and type(tier) == "number" then
+			local okP, p = pcall(CardTiers.power, tier, ef, abilityId)
+			if okP and type(p) == "number" and p > 0 then
+				return p
+			end
+		end
+	end
+	return 1
+end
+
+local function computeEffectAmount(mods, ability, ef, me, castScale)
+	if me and type(me.scaling) == "table" and mods.CombatMath and type(mods.CombatMath.shownAmount) == "function" then
+		local ok, amt = pcall(mods.CombatMath.shownAmount, ef, me, ability.school or me.school, castScale)
+		if ok and type(amt) == "number" then
+			return amt
+		end
+	end
+	return (ef.base or 0) * (castScale or 1)
+end
+
+local function analyzeAbility(mods, ability, energy, me, cardTiersFallback)
 	local Statuses = mods.Statuses
 	local directDamage = 0
 	local isAttackPowerUp = false
@@ -2095,21 +2198,29 @@ local function analyzeAbility(mods, ability, energy)
 	local healsTeammates = false
 	local shieldScore = 0
 	local hasCleanse = false
+	local cleanseStatuses = nil
 	local hasDefenseBuff = false
 	local hasEnergyGain = false
 	local gainEnergyAmount = 0
 	local revivesAlly = false
 	local preventsAction = false
+	local appliesControl = false
+	local abId = ability.id or ""
+	local tiers = cardTiersFallback or DeckStrategy.CardTiers
 
 	for _, ef in ipairs(ability.effects or {}) do
 		local kind = ef.kind
 		if kind == "Damage" then
+			local castScale = getEffectCastScale(mods, abId, ef, me, tiers)
 			local mult = ability.spendAll and math.max(1, energy or 1) or 1
-			directDamage += ((ef.base or 0) * (ef.hits or 1) * mult)
+			local perHit = computeEffectAmount(mods, ability, ef, me, castScale)
+			directDamage += (perHit * (ef.hits or 1) * mult)
 		elseif kind == "Detonate" or kind == "ConsumeDot" then
 			directDamage += 25
 		elseif kind == "Heal" then
-			healScore += (ef.base or 30)
+			local castScale = getEffectCastScale(mods, abId, ef, me, tiers)
+			local hAmt = ef.base and computeEffectAmount(mods, ability, ef, me, castScale) or (30 * castScale)
+			healScore += math.max(1, hAmt)
 			if ef.target == "Self" or ability.targetKind == "SelfOnly" then
 				healsSelf = true
 			elseif ef.target == "Allies" or ability.targetKind == "AllAllies" or ability.targetKind == "SingleAlly" then
@@ -2120,20 +2231,30 @@ local function analyzeAbility(mods, ability, energy)
 				revivesAlly = true
 			end
 		elseif kind == "Shield" then
-			shieldScore += (ef.base or 25)
+			local castScale = getEffectCastScale(mods, abId, ef, me, tiers)
+			local sAmt = ef.base and computeEffectAmount(mods, ability, ef, me, castScale) or (25 * castScale)
+			shieldScore += math.max(1, sAmt)
 		elseif kind == "Cleanse" then
 			hasCleanse = true
+			if type(ef.statuses) == "table" and #ef.statuses > 0 then
+				cleanseStatuses = ef.statuses
+			end
 		elseif kind == "GainEnergy" then
 			hasEnergyGain = true
 			gainEnergyAmount += (ef.amount or 1)
 		elseif kind == "ApplyStatus" and ef.statusId then
 			local st = Statuses[ef.statusId]
 			if st then
+				local appliesToSelf = (ef.target == "Self") or (ability.targetKind == "SelfOnly" and ef.target ~= "Enemies")
 				if st.preventsAction then
-					preventsAction = true
+					if appliesToSelf then
+						preventsAction = true
+					else
+						appliesControl = true
+					end
 				end
 				if st.schoolDealt ~= nil or (st.damageDealtMultiplier and st.damageDealtMultiplier > 1) or (st.damageDealtPerStack and st.damageDealtPerStack > 0) then
-					if not st.preventsAction then
+					if not (st.preventsAction and appliesToSelf) then
 						isAttackPowerUp = true
 						powerUpSchool = st.school or ability.school
 						powerUpStatusId = ef.statusId
@@ -2176,6 +2297,7 @@ local function analyzeAbility(mods, ability, energy)
 
 	return {
 		directDamage = directDamage,
+		scaledByCaster = (me ~= nil and type(me.scaling) == "table" and mods.CombatMath ~= nil),
 		isAttackPowerUp = isAttackPowerUp,
 		powerUpSchool = powerUpSchool,
 		powerUpStatusId = powerUpStatusId,
@@ -2185,11 +2307,252 @@ local function analyzeAbility(mods, ability, energy)
 		healsTeammates = healsTeammates,
 		shieldScore = shieldScore,
 		hasCleanse = hasCleanse,
+		cleanseStatuses = cleanseStatuses,
 		hasDefenseBuff = hasDefenseBuff,
 		hasEnergyGain = hasEnergyGain,
 		gainEnergyAmount = gainEnergyAmount,
 		revivesAlly = revivesAlly,
 		preventsAction = preventsAction,
+		appliesControl = appliesControl,
+	}
+end
+
+local function normalizeDeckCardMap(tbl)
+	local out = {}
+	if type(tbl) ~= "table" then
+		return out
+	end
+	if #tbl > 0 then
+		for _, id in ipairs(tbl) do
+			if type(id) == "string" and id ~= "" then
+				out[id] = (out[id] or 0) + 1
+			end
+		end
+	else
+		for id, cnt in pairs(tbl) do
+			local n = tonumber(cnt) or 0
+			if type(id) == "string" and n > 0 then
+				out[id] = math.floor(n)
+			end
+		end
+	end
+	return out
+end
+
+local function readLiveDeckCards(mods, forceProfile, me)
+	if me and type(me.deckCards) == "table" and next(me.deckCards) ~= nil then
+		if type(me.cardTiers) == "table" then
+			DeckStrategy.CardTiers = me.cardTiers
+		end
+		return normalizeDeckCardMap(me.deckCards)
+	end
+	if not forceProfile and next(DeckStrategy.RawCards) ~= nil and (os.clock() - DeckStrategy.LastFetchAt) < 4.0 then
+		return DeckStrategy.RawCards
+	end
+	DeckStrategy.LastFetchAt = os.clock()
+	local ok, prof = pcall(mods.Net.getProfile)
+	if not ok or type(prof) ~= "table" then
+		return DeckStrategy.RawCards
+	end
+	if type(prof.cardTiers) == "table" then
+		DeckStrategy.CardTiers = prof.cardTiers
+	end
+	local activeIdx = tonumber(prof.activeDeck) or 1
+	local deckSrc = (type(prof.decks) == "table" and type(prof.decks[activeIdx]) == "table" and prof.decks[activeIdx].cards)
+		or prof.deck
+		or {}
+	local gear = nil
+	if mods.Loadout and type(mods.Loadout.gearFor) == "function" then
+		local okG, g = pcall(mods.Loadout.gearFor, prof.equipped or {}, prof.inventory or {})
+		if okG and type(g) == "table" then
+			gear = g
+		end
+	end
+	if mods.Deck and type(mods.Deck.cards) == "function" then
+		local okD, cards = pcall(mods.Deck.cards, deckSrc, gear)
+		if okD and type(cards) == "table" then
+			return normalizeDeckCardMap(cards)
+		end
+	end
+	return normalizeDeckCardMap(deckSrc)
+end
+
+local function refreshDeckStrategy(mods, forceProfile, me)
+	if not mods or not mods.Abilities then
+		return DeckStrategy
+	end
+	local cards = readLiveDeckCards(mods, forceProfile, me)
+	local keys = {}
+	for id, cnt in pairs(cards) do
+		if cnt > 0 then
+			table.insert(keys, id .. ":" .. tostring(cnt))
+		end
+	end
+	table.sort(keys)
+	local sig = table.concat(keys, "|")
+	if sig == DeckStrategy.Signature and sig ~= "" then
+		return DeckStrategy
+	end
+
+	DeckStrategy.Signature = sig
+	DeckStrategy.RawCards = cards
+	DeckStrategy.TotalCards = 0
+	DeckStrategy.DamageBySchool = {}
+	DeckStrategy.Finishers = {}
+	DeckStrategy.StrongestFinisher = nil
+	DeckStrategy.StrongestHeal = nil
+	DeckStrategy.HasStrongHeal = false
+	DeckStrategy.TinyHealOnly = false
+
+	local schoolDamageWeight = {}
+	local anyHealCount = 0
+	for id, cnt in pairs(cards) do
+		DeckStrategy.TotalCards += cnt
+		local ab = mods.Abilities[id]
+		if ab then
+			local cost = ab.energyCost or 0
+			local info = analyzeAbility(mods, ab, math.max(99, cost), me, DeckStrategy.CardTiers)
+			if info.directDamage > 0 and not info.preventsAction then
+				local sc = ab.school or "Neutral"
+				DeckStrategy.DamageBySchool[sc] = (DeckStrategy.DamageBySchool[sc] or 0) + cnt
+				schoolDamageWeight[sc] = (schoolDamageWeight[sc] or 0) + (info.directDamage * cnt)
+				if cost >= CombatAuto.SavePipMinCost then
+					local fin = {
+						id = id,
+						name = ab.name or id,
+						cost = cost,
+						dmg = info.directDamage,
+						school = ab.school,
+						isAoe = (ab.targetKind == "AllEnemies"),
+						count = cnt,
+					}
+					table.insert(DeckStrategy.Finishers, fin)
+					if not DeckStrategy.StrongestFinisher or fin.dmg > DeckStrategy.StrongestFinisher.dmg then
+						DeckStrategy.StrongestFinisher = fin
+					end
+				end
+			end
+			if info.healScore > 0 then
+				anyHealCount += cnt
+				if cost >= 2 or info.healScore >= 80 then
+					DeckStrategy.HasStrongHeal = true
+				end
+				if not DeckStrategy.StrongestHeal or info.healScore > DeckStrategy.StrongestHeal.healScore then
+					DeckStrategy.StrongestHeal = {
+						id = id,
+						name = ab.name or id,
+						cost = cost,
+						healScore = info.healScore,
+					}
+				end
+			end
+		end
+	end
+
+	table.sort(DeckStrategy.Finishers, function(a, b)
+		if a.dmg ~= b.dmg then
+			return a.dmg > b.dmg
+		end
+		return a.cost < b.cost
+	end)
+
+	local bestSchool, bestWeight = nil, 0
+	for sc, w in pairs(schoolDamageWeight) do
+		if w > bestWeight then
+			bestWeight = w
+			bestSchool = sc
+		end
+	end
+	DeckStrategy.PrimarySchool = bestSchool
+	DeckStrategy.TinyHealOnly = (anyHealCount > 0 and not DeckStrategy.HasStrongHeal)
+
+	if DeckStrategy.TotalCards == 0 then
+		DeckStrategy.SummaryText = "EMPTY DECK"
+	else
+		local topNote = DeckStrategy.StrongestFinisher
+			and string.format("Top: %s (%dp)", DeckStrategy.StrongestFinisher.name, DeckStrategy.StrongestFinisher.cost)
+			or "No 4p+ Nuke"
+		DeckStrategy.SummaryText = string.format("%dc · %s · %s", DeckStrategy.TotalCards, tostring(bestSchool or "Mixed"), topNote)
+	end
+	setDeckStrategyStatus(DeckStrategy.SummaryText)
+	return DeckStrategy
+end
+
+local function getDeckRemainingSummary(mods, state, me)
+	refreshDeckStrategy(mods, false, me)
+	local handCounts = normalizeDeckCardMap(me and me.hand)
+	local drawCounts
+	if me and type(me.drawPile) == "table" and (#me.drawPile > 0 or #(me.discardPile or {}) > 0) then
+		drawCounts = normalizeDeckCardMap(me.drawPile)
+	else
+		drawCounts = {}
+		for id, fullCnt in pairs(DeckStrategy.RawCards) do
+			local rem = fullCnt - (handCounts[id] or 0) - (LiveCombat.ConsumedCounts[id] or 0)
+			if rem > 0 then
+				drawCounts[id] = rem
+			end
+		end
+	end
+
+	local maxCap = (me and mods.CombatSim.maxEnergy(me)) or 99
+	local drawLeftCount = 0
+	local remDamageBySchool = {}
+	local drawDamageBySchool = {}
+	local bestFinisher = nil
+	local hasStrongHealRemaining = false
+
+	local function scanPool(pool, inHand)
+		for id, cnt in pairs(pool) do
+			if cnt > 0 then
+				if not inHand then
+					drawLeftCount += cnt
+				end
+				local ab = mods.Abilities[id]
+				if ab then
+					local cost = ab.energyCost or 0
+					local info = analyzeAbility(mods, ab, math.max(99, cost), me, DeckStrategy.CardTiers)
+					if info.directDamage > 0 and not info.preventsAction then
+						local sc = ab.school or "Neutral"
+						remDamageBySchool[sc] = (remDamageBySchool[sc] or 0) + cnt
+						if not inHand then
+							drawDamageBySchool[sc] = (drawDamageBySchool[sc] or 0) + cnt
+						end
+						if cost >= CombatAuto.SavePipMinCost and cost <= maxCap then
+							if not bestFinisher or info.directDamage > bestFinisher.dmg or (info.directDamage == bestFinisher.dmg and inHand and not bestFinisher.inHand) then
+								bestFinisher = {
+									id = id,
+									name = ab.name or id,
+									cost = cost,
+									dmg = info.directDamage,
+									school = ab.school,
+									isAoe = (ab.targetKind == "AllEnemies"),
+									inHand = inHand,
+								}
+							end
+						end
+					end
+					if info.healScore > 0 and (cost >= 2 or info.healScore >= 80) then
+						hasStrongHealRemaining = true
+					end
+				end
+			end
+		end
+	end
+
+	scanPool(handCounts, true)
+	scanPool(drawCounts, false)
+
+	local topLive = bestFinisher and string.format("%s %s", bestFinisher.inHand and "Hand:" or "Draw:", bestFinisher.name) or "No 4p+ left"
+	setDeckStrategyStatus(string.format("%dc (%d draw) · %s · %s", DeckStrategy.TotalCards, drawLeftCount, tostring(DeckStrategy.PrimarySchool or "Mixed"), topLive))
+
+	return {
+		drawLeftCount = drawLeftCount,
+		drawCounts = drawCounts,
+		handCounts = handCounts,
+		remainingDamageBySchool = remDamageBySchool,
+		drawDamageBySchool = drawDamageBySchool,
+		bestRemainingFinisher = bestFinisher,
+		hasStrongHealRemaining = hasStrongHealRemaining,
 	}
 end
 
@@ -2200,12 +2563,12 @@ local function isBossCombatant(mods, c, combatantId)
 	if c.isBoss == true or c.boss == true then
 		return true
 	end
-	if combatantId and LiveBossIds[combatantId] then
+	if combatantId and LiveCombat.BossCombatantId and combatantId == LiveCombat.BossCombatantId then
 		return true
 	end
 	local bossIds = mods.BossEnemyIds
 	if bossIds then
-		local eid = c.enemyId or c.defId or c.id
+		local eid = c.enemyId or c.defId
 		if type(eid) == "string" and (bossIds[eid] or LiveBossIds[eid]) then
 			return true
 		end
@@ -2235,7 +2598,7 @@ local function collectEntries(mods, state, me, includeUnaffordable)
 				slot = slot,
 				ability = ab,
 				payable = CombatSim.canPay(me, ab),
-				info = analyzeAbility(mods, ab, me.energy or 0),
+				info = analyzeAbility(mods, ab, me.energy or 0, me, DeckStrategy.CardTiers),
 			})
 		end
 	end
@@ -2249,7 +2612,7 @@ local function collectEntries(mods, state, me, includeUnaffordable)
 				slot = -1,
 				ability = ab,
 				payable = CombatSim.canPay(me, ab),
-				info = analyzeAbility(mods, ab, me.energy or 0),
+				info = analyzeAbility(mods, ab, me.energy or 0, me, DeckStrategy.CardTiers),
 			})
 		end
 	end
@@ -2257,26 +2620,44 @@ local function collectEntries(mods, state, me, includeUnaffordable)
 	return entries
 end
 
-local function getElementMultiplier(mods, attackSchool, defender, me)
+local function getAttackerStatusMult(mods, attackSchool, me)
+	if not me or type(me.statuses) ~= "table" then
+		return 1
+	end
+	local atkSchool = attackSchool or me.school
+	local addBonus = 0
+	local mulFactor = 1
+	for _, entry in ipairs(me.statuses) do
+		local sid = (type(entry) == "table" and entry.id) or entry
+		local st = type(sid) == "string" and mods.Statuses[sid]
+		if st and not st.preventsAction then
+			local stacks = (type(entry) == "table" and tonumber(entry.stacks)) or 1
+			if type(st.schoolDealt) == "number" and (not st.school or st.school == atkSchool) then
+				addBonus += st.schoolDealt * stacks
+			elseif type(st.damageDealtPerStack) == "number" and (not st.school or st.school == atkSchool) then
+				addBonus += st.damageDealtPerStack * stacks
+			elseif type(st.damageDealtMultiplier) == "number" and (not st.school or st.school == atkSchool) then
+				mulFactor *= st.damageDealtMultiplier
+			end
+		end
+	end
+	return math.max(0.05, (1 + addBonus) * mulFactor)
+end
+
+local function getElementMultiplier(mods, attackSchool, defender, me, directAlreadyScaled)
 	if not defender then
 		return 1
 	end
 	local mult = 1
 	local atkSchool = attackSchool or (me and me.school)
 
-	-- 1. Live CombatMath.schoolFactor (uses defender.scaling[resistance] & attacker pierce)
+	-- 1. Defender resistance vs attacker pierce via live CombatMath.schoolFactor
 	local CombatMath = mods.CombatMath
 	local Schools = mods.Schools
 	if CombatMath and type(CombatMath.schoolFactor) == "function" and atkSchool and type(defender.scaling) == "table" then
 		local ok, factor = pcall(CombatMath.schoolFactor, defender, atkSchool, nil, me)
 		if ok and type(factor) == "number" then
 			mult *= factor
-		end
-		if me and type(me.scaling) == "table" and type(CombatMath.offensiveMultiplier) == "function" then
-			local okOff, offMult = pcall(CombatMath.offensiveMultiplier, me, atkSchool)
-			if okOff and type(offMult) == "number" then
-				mult *= offMult
-			end
 		end
 	else
 		local schoolDef = atkSchool and Schools and Schools.defs and Schools.defs[atkSchool]
@@ -2290,34 +2671,49 @@ local function getElementMultiplier(mods, attackSchool, defender, me)
 		end
 	end
 
-	-- 2. Enemy damageModifiers (wards / elemental intake modifiers on defender)
+	-- Apply attacker offensiveMultiplier ONLY if directDamage was NOT already scaled by CombatMath.shownAmount
+	if not directAlreadyScaled and CombatMath and type(CombatMath.offensiveMultiplier) == "function" and me and type(me.scaling) == "table" and atkSchool then
+		local okOff, offMult = pcall(CombatMath.offensiveMultiplier, me, atkSchool)
+		if okOff and type(offMult) == "number" then
+			mult *= offMult
+		end
+	end
+
+	-- 2. Attacker active combat buffs/debuffs (e.g. +40% StormBuff, -20% Weaken)
+	mult *= getAttackerStatusMult(mods, atkSchool, me)
+
+	-- 3. Defender damageModifiers + active wards/shields/Vulnerable
+	local defWardFactor = 1
 	local dmgMods = defender.damageModifiers
 	if type(dmgMods) == "table" and atkSchool then
 		local hitType = (Schools and type(Schools.hitType) == "function" and Schools.hitType(nil, atkSchool)) or atkSchool
 		local dm = dmgMods[hitType] or dmgMods[atkSchool]
 		if type(dm) == "number" then
-			mult *= dm
+			defWardFactor *= dm
 		end
 	end
 
-	-- 3. Active defender statuses (wards, shields/armor, Mirage evade, Vulnerable)
+	local evades = false
 	for _, entry in ipairs(defender.statuses or {}) do
 		local sid = (type(entry) == "table" and entry.id) or entry
 		local st = type(sid) == "string" and mods.Statuses[sid]
 		if st then
 			if st.evadesNext then
-				mult *= 0.05
+				evades = true
 			elseif type(st.damageTakenMultiplier) == "number" then
-				mult *= st.damageTakenMultiplier
+				defWardFactor *= st.damageTakenMultiplier
 			elseif atkSchool and st.school == atkSchool and type(st.schoolTaken) == "number" then
-				mult *= math.max(0.1, 1 - st.schoolTaken)
+				defWardFactor *= math.max(0.1, 1 - st.schoolTaken)
 			elseif sid == "Vulnerable" then
-				mult *= 1.25
+				defWardFactor *= 1.25
 			end
 		end
 	end
 
-	return math.clamp(mult, 0.01, 3.5)
+	local minIncoming = (mods.Constants and mods.Constants.MAX_DAMAGE_REDUCTION) and (1 - mods.Constants.MAX_DAMAGE_REDUCTION) or 0.1
+	mult *= evades and 0.05 or math.max(minIncoming, defWardFactor)
+
+	return math.clamp(mult, 0.01, 15.0)
 end
 
 local function getAliveEnemies(mods, state, me)
@@ -2358,6 +2754,7 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 		return {
 			totalDamage = 0,
 			tacticalScore = 0,
+			bossDamage = 0,
 			killCount = 0,
 			wipesAll = false,
 			killsBoss = false,
@@ -2370,31 +2767,43 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 	local atkSchool = entry.ability.school or me.school
 	local isAoe = (entry.ability.targetKind == "AllEnemies")
 	local totalEnemies = #aliveEnemies
+	local directScaled = entry.info.scaledByCaster == true
+	local bossFocusMult = (CombatAuto.TargetPriority == "Boss First") and 1.65 or 1.25
 
 	if isAoe then
 		local totalDmg = 0
+		local tactical = 0
+		local bossDamage = 0
 		local killCount = 0
 		local killsBoss = false
 		local overkill = 0
 		for _, e in ipairs(aliveEnemies) do
-			local mult = getElementMultiplier(mods, atkSchool, e.combatant, me)
+			local mult = getElementMultiplier(mods, atkSchool, e.combatant, me, directScaled)
 			local dmg = base * mult
-			totalDmg += math.min(dmg, e.effectiveHp * 1.15)
-			overkill += math.max(0, dmg - e.effectiveHp)
-			if not e.evades and dmg >= e.effectiveHp * 0.98 then
+			local eff = math.min(dmg, e.effectiveHp)
+			local okAmt = math.max(0, dmg - e.effectiveHp)
+			totalDmg += eff
+			overkill += okAmt
+			if e.isBoss and eff > bossDamage then
+				bossDamage = eff
+			end
+			tactical += eff * (e.isBoss and bossFocusMult or 1)
+			local canKill = (not e.evades) and (dmg >= e.effectiveHp * 0.99)
+			if canKill then
 				killCount += 1
+				tactical += (e.isBoss and 400 or 120)
 				if e.isBoss then
 					killsBoss = true
 				end
+			elseif entry.info.appliesControl and not e.evades then
+				tactical += 90
 			end
 		end
-		local tactical = totalDmg - (overkill * 0.35)
-		if killCount > 0 then
-			tactical += killCount * 35
-		end
+		tactical -= (overkill * 0.3)
 		return {
 			totalDamage = totalDmg > 0 and totalDmg or base,
 			tacticalScore = tactical,
+			bossDamage = bossDamage,
 			killCount = killCount,
 			wipesAll = (totalEnemies > 0 and killCount >= totalEnemies),
 			killsBoss = killsBoss,
@@ -2409,13 +2818,18 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 	local bestEnemy = nil
 	local bestDmg = 0
 	local bestMult = 1
+	local bossDamage = 0
 	local anyKill = false
 	local killsBoss = false
 
 	for _, e in ipairs(aliveEnemies) do
-		local mult = getElementMultiplier(mods, atkSchool, e.combatant, me)
+		local mult = getElementMultiplier(mods, atkSchool, e.combatant, me, directScaled)
 		local dmg = base * mult
-		local canKill = (not e.evades) and (dmg >= e.effectiveHp * 0.98)
+		local eff = math.min(dmg, e.effectiveHp)
+		if e.isBoss and eff > bossDamage then
+			bossDamage = eff
+		end
+		local canKill = (not e.evades) and (dmg >= e.effectiveHp * 0.99)
 		if canKill then
 			anyKill = true
 			if e.isBoss then
@@ -2423,11 +2837,12 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 			end
 		end
 
-		local capped = math.min(dmg, e.effectiveHp * 1.15)
 		local overkill = math.max(0, dmg - e.effectiveHp)
-		local s = capped - (overkill * 0.65)
+		local s = (eff * (e.isBoss and bossFocusMult or 1)) - (overkill * 0.65)
 		if canKill then
-			s += 60
+			s += (e.isBoss and 500 or 140)
+		elseif entry.info.appliesControl and not e.evades then
+			s += 90
 		end
 		if e.evades and (entry.ability.energyCost or 0) <= 1 then
 			s += 30
@@ -2443,6 +2858,7 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 	return {
 		totalDamage = bestDmg > 0 and bestDmg or base,
 		tacticalScore = bestEnemy and bestScore or base,
+		bossDamage = bossDamage,
 		killCount = anyKill and 1 or 0,
 		wipesAll = (totalEnemies == 1 and anyKill),
 		killsBoss = killsBoss,
@@ -2528,9 +2944,10 @@ local function pickBuffAllyTarget(mods, state, me, powerUpSchool, powerUpStatusI
 			local maxHp = (c.derived and c.derived.maxHp) or c.maxHp or 100
 			local hpRatio = (c.hp or maxHp) / math.max(1, maxHp)
 			score += hpRatio * 20
-			if id ~= me.id then
-				-- Slight preference to buff teammates when equal match in co-op
-				score += 2
+			local mySchool = getCombatantSchool(mods, me)
+			if id == me.id and (not powerUpSchool or mySchool == powerUpSchool) then
+				-- Always prioritize buffing yourself with your own element
+				score += 500
 			end
 
 			if score > bestScore then
@@ -2543,7 +2960,7 @@ local function pickBuffAllyTarget(mods, state, me, powerUpSchool, powerUpStatusI
 	return bestId, bestScore
 end
 
-local function isUsefulPowerUp(mods, state, me, pu, handDamageSchools, targetSchool)
+local function isUsefulPowerUp(mods, state, me, pu, handDamageSchools, targetSchool, deckRem)
 	local s = pu.info.powerUpSchool
 	if not s then
 		return true
@@ -2554,8 +2971,11 @@ local function isUsefulPowerUp(mods, state, me, pu, handDamageSchools, targetSch
 	if handDamageSchools[s] == true then
 		return true
 	end
+	if deckRem and (deckRem.remainingDamageBySchool[s] or 0) > 0 then
+		return true
+	end
 	local tk = pu.ability.targetKind
-	if tk == "SingleAlly" or tk == "AllAllies" or tk == "SingleAny" then
+	if tk == "SingleAlly" or tk == "AllAllies" or tk == "SingleAny" or (tk == "SelfOnly" and pu.ability.ally == true) then
 		local _, matchScore = pickBuffAllyTarget(mods, state, me, s, pu.info.powerUpStatusId)
 		return matchScore and matchScore >= 4000
 	end
@@ -2619,7 +3039,7 @@ local function pickBestFreeShield(freeShields, aliveEnemies, me)
 	return bestEntry
 end
 
-local function pickAttackEntry(mods, state, me, usableEntries)
+local function pickAttackEntry(mods, state, me, usableEntries, deckRem)
 	local powerUps = {}
 	local freeShields = {}
 	local damagers = {}
@@ -2642,19 +3062,16 @@ local function pickAttackEntry(mods, state, me, usableEntries)
 		end
 	end
 
-	-- 1. Lethal Finish Override: immediately finish the fight / boss / free minion kill instead of wasting turns buffing or saving
+	-- 1. Lethal Finish Override: immediately cast any playable card that kills (including 1-2 pip kills!)
+	local bossAlive = hasAliveBoss(mods, state, me)
 	if #damagers > 0 then
-		local wipes, bossKills, freeKills, singleKills = {}, {}, {}, {}
+		local wipes, bossKills, singleKills = {}, {}, {}
 		for _, d in ipairs(damagers) do
 			if d._eval.wipesAll then
 				table.insert(wipes, { entry = d, eval = d._eval })
 			elseif d._eval.killsBoss then
 				table.insert(bossKills, { entry = d, eval = d._eval })
 			elseif d._eval.killCount > 0 then
-				local netCost = (d.ability.energyCost or 0) - (d.info.gainEnergyAmount or 0)
-				if netCost <= 0 then
-					table.insert(freeKills, { entry = d, eval = d._eval })
-				end
 				table.insert(singleKills, { entry = d, eval = d._eval })
 			end
 		end
@@ -2664,50 +3081,73 @@ local function pickAttackEntry(mods, state, me, usableEntries)
 		if #bossKills > 0 then
 			return pickCheapestLethal(bossKills), nil
 		end
-		if #freeKills > 0 then
-			return pickCheapestLethal(freeKills), nil
-		end
-		if #singleKills > 0 and not hasAliveBoss(mods, state, me) then
+		if #singleKills > 0 then
 			return pickCheapestLethal(singleKills), nil
 		end
 	end
 
-	-- 2. Smart Boss Pip Saver: save pips for 4+ pip boss nukes, stacking matching 0-cost/safe buffs first
-	if hasAliveBoss(mods, state, me) then
-		local maxCap = mods.CombatSim.maxEnergy(me) or 99
-		local allReady = collectEntries(mods, state, me, true)
-		local bossFinisher = nil
-		for _, entry in ipairs(allReady) do
-			local cost = entry.ability.energyCost or 0
-			if entry.info.directDamage > 0 and not entry.info.preventsAction and cost >= CombatAuto.SavePipMinCost and cost <= maxCap then
-				if not bossFinisher or entry.info.directDamage > bossFinisher.info.directDamage then
-					bossFinisher = entry
-				end
+	local function scoreCombatAttack(e)
+		local ev = e._eval
+		if not ev then
+			return e.info.directDamage or 0
+		end
+		local lethalBonus = ev.wipesAll and 5000 or (ev.killsBoss and 4000 or (ev.killCount > 0 and 1500 or 0))
+		return ((ev.bossDamage or 0) * 0.35) + (ev.tacticalScore or e.info.directDamage) + lethalBonus
+	end
+
+	table.sort(damagers, function(a, b)
+		local sa, sb = scoreCombatAttack(a), scoreCombatAttack(b)
+		if math.abs(sa - sb) > 0.5 then
+			return sa > sb
+		end
+		return (a.ability.energyCost or 0) < (b.ability.energyCost or 0)
+	end)
+
+	-- 2. Save Pips for Stronger / Lethal Higher-Pip Card Already in Hand (e.g. 4-pip vs 2-pip when 2-pip won't kill)
+	local allReady = collectEntries(mods, state, me, true)
+	local maxCap = mods.CombatSim.maxEnergy(me) or 99
+	local bestInHand = nil
+	local bestInHandScore = -1
+	for _, entry in ipairs(allReady) do
+		local cost = entry.ability.energyCost or 0
+		if entry.info.directDamage > 0 and not entry.info.preventsAction and cost <= maxCap then
+			entry._eval = entry._eval or evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
+			local s = scoreCombatAttack(entry)
+			if not bestInHand or s > bestInHandScore or (math.abs(s - bestInHandScore) < 0.5 and cost < (bestInHand.ability.energyCost or 99)) then
+				bestInHand = entry
+				bestInHandScore = s
 			end
 		end
+	end
 
-		if bossFinisher then
-			local finisherCost = bossFinisher.ability.energyCost or 0
+	if bestInHand and not bestInHand.payable then
+		local bestPayable = damagers[1]
+		local bestPayableScore = bestPayable and scoreCombatAttack(bestPayable) or 0
+		local bestPayableCost = bestPayable and math.max(0, (bestPayable.ability.energyCost or 0) - (bestPayable.info.gainEnergyAmount or 0)) or 0
+		local targetCost = bestInHand.ability.energyCost or 0
+		local myEnergy = me.energy or 0
+		local targetEval = bestInHand._eval
+		local targetKills = targetEval and (targetEval.wipesAll or targetEval.killsBoss or targetEval.killCount > 0)
+		local worthSaving = (#damagers == 0) or targetKills or (bestInHandScore >= bestPayableScore * 1.25)
+		local wouldDelay = (#damagers == 0) or (bestPayableCost > 0 and (myEnergy - bestPayableCost) < targetCost)
+		local meMaxHp = (me.derived and me.derived.maxHp) or me.maxHp or 100
+		local meRatio = (me.hp or meMaxHp) / math.max(1, meMaxHp)
+		local safeToWait = (#damagers == 0) or (meRatio > 0.25) or ((targetCost - myEnergy) <= 1)
+
+		if worthSaving and wouldDelay and safeToWait then
 			local safePowerUps = {}
 			for _, pu in ipairs(powerUps) do
-				if isUsefulPowerUp(mods, state, me, pu, handDamageSchools, bossFinisher.ability.school) then
-					local puCost = pu.ability.energyCost or 0
-					local netCost = puCost - (pu.info.gainEnergyAmount or 0)
-					if netCost <= 0 or ((me.energy or 0) - netCost) >= finisherCost then
+				if isUsefulPowerUp(mods, state, me, pu, handDamageSchools, bestInHand.ability.school, deckRem) then
+					local netCost = (pu.ability.energyCost or 0) - (pu.info.gainEnergyAmount or 0)
+					if netCost <= 0 or (myEnergy - netCost) >= targetCost then
 						table.insert(safePowerUps, pu)
 					end
 				end
 			end
-
 			if #safePowerUps > 0 then
 				table.sort(safePowerUps, function(a, b)
-					local aPure = (a.info.directDamage == 0) and 1 or 0
-					local bPure = (b.info.directDamage == 0) and 1 or 0
-					if aPure ~= bPure then
-						return aPure > bPure
-					end
-					local aMatch = (a.info.powerUpSchool == bossFinisher.ability.school) and 1 or 0
-					local bMatch = (b.info.powerUpSchool == bossFinisher.ability.school) and 1 or 0
+					local aMatch = (a.info.powerUpSchool == bestInHand.ability.school) and 1 or 0
+					local bMatch = (b.info.powerUpSchool == bestInHand.ability.school) and 1 or 0
 					if aMatch ~= bMatch then
 						return aMatch > bMatch
 					end
@@ -2721,25 +3161,26 @@ local function pickAttackEntry(mods, state, me, usableEntries)
 				return bestShield, nil
 			end
 
-			if bossFinisher.payable then
-				return bossFinisher, nil
-			end
-
-			-- Cannot afford the 4+ pip card yet and no safe power-ups or 0-pip shields -> save (pass turn)
-			return nil, bossFinisher
+			return nil, bestInHand
 		end
 	end
 
-	-- 3. Use 0-pip shields/wards when available before or between attacks
+	-- 3. Stack 0-pip shields/wards or matching 0-1 pip power-up buffs before firing our best playable attack
 	local bestFreeShield = pickBestFreeShield(freeShields, aliveEnemies, me)
 	if bestFreeShield then
 		return bestFreeShield, nil
 	end
 
-	-- 4. Stack useful buffs (0-cost / matching school in hand) when no instant kill is available
 	local usefulPowerUps = {}
+	local topPlayable = damagers[1]
+	local topPlayableCost = topPlayable and (topPlayable.ability.energyCost or 0) or 0
 	for _, pu in ipairs(powerUps) do
-		if isUsefulPowerUp(mods, state, me, pu, handDamageSchools, nil) and ((pu.ability.energyCost or 0) <= 1 or #damagers == 0) then
+		local puNet = (pu.ability.energyCost or 0) - (pu.info.gainEnergyAmount or 0)
+		local keepsTopPlayable = (not topPlayable) or (puNet <= 0) or (((me.energy or 0) - puNet) >= topPlayableCost)
+		if isUsefulPowerUp(mods, state, me, pu, handDamageSchools, topPlayable and topPlayable.ability.school, deckRem)
+			and ((pu.ability.energyCost or 0) <= 1 or #damagers == 0)
+			and keepsTopPlayable
+		then
 			table.insert(usefulPowerUps, pu)
 		end
 	end
@@ -2750,8 +3191,8 @@ local function pickAttackEntry(mods, state, me, usableEntries)
 			if aPure ~= bPure then
 				return aPure > bPure
 			end
-			local aMatch = (a.info.powerUpSchool and handDamageSchools[a.info.powerUpSchool]) and 1 or 0
-			local bMatch = (b.info.powerUpSchool and handDamageSchools[b.info.powerUpSchool]) and 1 or 0
+			local aMatch = (a.info.powerUpSchool and (handDamageSchools[a.info.powerUpSchool] or (deckRem and (deckRem.remainingDamageBySchool[a.info.powerUpSchool] or 0) > 0))) and 1 or 0
+			local bMatch = (b.info.powerUpSchool and (handDamageSchools[b.info.powerUpSchool] or (deckRem and (deckRem.remainingDamageBySchool[b.info.powerUpSchool] or 0) > 0))) and 1 or 0
 			if aMatch ~= bMatch then
 				return aMatch > bMatch
 			end
@@ -2760,42 +3201,44 @@ local function pickAttackEntry(mods, state, me, usableEntries)
 		return usefulPowerUps[1], nil
 	end
 
+	-- 4. Cast the best damage-dealing card currently payable!
 	if #damagers > 0 then
-		table.sort(damagers, function(a, b)
-			local aScore = (a._eval and a._eval.tacticalScore) or a.info.directDamage
-			local bScore = (b._eval and b._eval.tacticalScore) or b.info.directDamage
-			if math.abs(aScore - bScore) > 0.5 then
-				return aScore > bScore
-			end
-			local aAoe = (a.ability.targetKind == "AllEnemies" and #aliveEnemies >= 2) and 1 or 0
-			local bAoe = (b.ability.targetKind == "AllEnemies" and #aliveEnemies >= 2) and 1 or 0
-			if aAoe ~= bAoe then
-				return aAoe > bAoe
-			end
-			return (a.ability.energyCost or 0) < (b.ability.energyCost or 0)
-		end)
 		return damagers[1], nil
 	end
 
 	return nil, nil
 end
 
-local function getCombatantDebuffCount(Statuses, c)
+local function getCombatantDebuffCount(Statuses, c, filterIds)
 	local count = 0
-	for _, entry in ipairs(c.statuses or {}) do
+	local hasSevere = false
+	for _, entry in ipairs(c and c.statuses or {}) do
 		local sid = (type(entry) == "table" and entry.id) or entry
 		local st = type(sid) == "string" and Statuses[sid]
-		if st and not st.cleanseProof and (
-			st.isDot == true
-			or hasStatusTag(st, "Debuff")
-			or hasStatusTag(st, "Curse")
-			or hasStatusTag(st, "DoT")
-			or hasStatusTag(st, "Control")
-		) then
-			count += 1
+		if st and not st.cleanseProof then
+			local isDebuff = (
+				st.isDot == true
+				or hasStatusTag(st, "Debuff")
+				or hasStatusTag(st, "Curse")
+				or hasStatusTag(st, "DoT")
+				or hasStatusTag(st, "Control")
+				or (type(st.damageDealtMultiplier) == "number" and st.damageDealtMultiplier < 1)
+				or (type(st.damageTakenMultiplier) == "number" and st.damageTakenMultiplier > 1)
+				or st.debuff == true
+			)
+			if isDebuff and (not filterIds or table.find(filterIds, sid) ~= nil) then
+				count += 1
+				if st.isDot == true
+					or (type(st.damageDealtMultiplier) == "number" and st.damageDealtMultiplier < 1)
+					or (type(st.damageTakenMultiplier) == "number" and st.damageTakenMultiplier > 1)
+					or sid == "MortalWound"
+				then
+					hasSevere = true
+				end
+			end
 		end
 	end
-	return count
+	return count, hasSevere
 end
 
 local function getTeamHealthInfo(mods, state, me, lowThreshold)
@@ -2803,6 +3246,7 @@ local function getTeamHealthInfo(mods, state, me, lowThreshold)
 	local Statuses = mods.Statuses
 	local lowestRatio = 1
 	local lowestId = nil
+	local lowestMaxHp = 100
 	local hurtCount = 0
 	local multiHurtCount = 0
 	local lowCount = 0
@@ -2825,6 +3269,7 @@ local function getTeamHealthInfo(mods, state, me, lowThreshold)
 				if ratio < lowestRatio or (ratio == lowestRatio and id == me.id) then
 					lowestRatio = ratio
 					lowestId = id
+					lowestMaxHp = math.max(1, maxHp)
 				end
 				if ratio < 0.99 then
 					hurtCount += 1
@@ -2860,6 +3305,7 @@ local function getTeamHealthInfo(mods, state, me, lowThreshold)
 	return {
 		lowestRatio = lowestRatio,
 		lowestId = lowestId,
+		lowestMaxHp = lowestMaxHp,
 		hurtCount = hurtCount,
 		multiHurtCount = multiHurtCount,
 		lowCount = lowCount,
@@ -2885,7 +3331,10 @@ local function effectiveHealTotal(entry, healthInfo, forEmergency)
 	return info.healScore * mult * bonus
 end
 
-local function findStrongHealToSave(mods, state, me, entries, healthInfo, threshold)
+local function findStrongHealToSave(mods, state, me, entries, healthInfo, threshold, deckRem)
+	if (deckRem and not deckRem.hasStrongHealRemaining) or (not deckRem and DeckStrategy.TinyHealOnly) then
+		return nil
+	end
 	local maxCap = mods.CombatSim.maxEnergy(me) or 99
 	local myEnergy = me.energy or 0
 	local needTeammate = (healthInfo.lowestId ~= nil and healthInfo.lowestId ~= me.id)
@@ -2947,13 +3396,50 @@ local function findStrongHealToSave(mods, state, me, entries, healthInfo, thresh
 	return bestSaveEntry
 end
 
-local function pickEmergencyHealEntry(mods, state, me, entries, threshold)
+local function findImmediateLethalEntry(mods, state, me, entries)
+	local aliveEnemies = getAliveEnemies(mods, state, me)
+	if #aliveEnemies == 0 then
+		return nil
+	end
+	local healthInfo = getTeamHealthInfo(mods, state, me, CombatAuto.HealThreshold)
+	if healthInfo.revivableCount > 0 then
+		return nil
+	end
+
+	local wipes, bossKills, singleKills = {}, {}, {}
+	local bossAlive = hasAliveBoss(mods, state, me)
+	for _, entry in ipairs(entries) do
+		if entry.info.directDamage > 0 and not entry.info.preventsAction then
+			local ev = evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
+			entry._eval = ev
+			if ev.wipesAll then
+				table.insert(wipes, { entry = entry, eval = ev })
+			elseif ev.killsBoss and healthInfo.lowestRatio > 0.15 then
+				table.insert(bossKills, { entry = entry, eval = ev })
+			elseif ev.killCount > 0 and not bossAlive and healthInfo.lowestRatio > 0.25 then
+				table.insert(singleKills, { entry = entry, eval = ev })
+			end
+		end
+	end
+	if #wipes > 0 then
+		return pickCheapestLethal(wipes)
+	end
+	if #bossKills > 0 then
+		return pickCheapestLethal(bossKills)
+	end
+	if #singleKills > 0 then
+		return pickCheapestLethal(singleKills)
+	end
+	return nil
+end
+
+local function pickEmergencyHealEntry(mods, state, me, entries, threshold, deckRem)
 	local healthInfo = getTeamHealthInfo(mods, state, me, threshold)
 	if healthInfo.revivableCount == 0 and healthInfo.lowestRatio > threshold then
 		return nil, nil
 	end
 
-	local strongHeal = findStrongHealToSave(mods, state, me, entries, healthInfo, threshold)
+	local strongHeal = findStrongHealToSave(mods, state, me, entries, healthInfo, threshold, deckRem)
 	if strongHeal then
 		return nil, strongHeal
 	end
@@ -2993,13 +3479,27 @@ local function pickEmergencyHealEntry(mods, state, me, entries, threshold)
 	table.sort(candidates, function(a, b)
 		return a.score > b.score
 	end)
-	return candidates[1].entry, nil
+
+	local bestHeal = candidates[1].entry
+	-- Avoid an endless tiny-heal loop (e.g. 1-pip +33 Blessing at 40% HP) when a strong 3+ pip nuke is ready and no one is critical
+	if healthInfo.revivableCount == 0 and CombatAuto.Style == "Attack" and healthInfo.lowestRatio > 0.25 then
+		local bestHealFrac = effectiveHealTotal(bestHeal, healthInfo, true) / math.max(1, healthInfo.lowestMaxHp or 100)
+		if bestHealFrac < 0.18 then
+			for _, entry in ipairs(entries) do
+				if entry.info.directDamage > 0 and not entry.info.preventsAction and ((entry.ability.energyCost or 0) >= 3 or entry.info.directDamage >= 250) then
+					return nil, nil
+				end
+			end
+		end
+	end
+
+	return bestHeal, nil
 end
 
-local function pickSupportEntry(mods, state, me, entries)
+local function pickSupportEntry(mods, state, me, entries, deckRem)
 	local healthInfo = getTeamHealthInfo(mods, state, me)
 	local needsHeal = (healthInfo.lowestRatio < 0.99)
-	local strongHeal = findStrongHealToSave(mods, state, me, entries, healthInfo, nil)
+	local strongHeal = findStrongHealToSave(mods, state, me, entries, healthInfo, nil, deckRem)
 	local strongHealCost = strongHeal and (strongHeal.ability.energyCost or 2) or 0
 	local myEnergy = me.energy or 0
 	local candidates = {}
@@ -3051,7 +3551,7 @@ local function pickSupportEntry(mods, state, me, entries)
 					score += 1000
 				end
 				if info.isAttackPowerUp then
-					if ab.targetKind == "SelfOnly" then
+					if ab.targetKind == "SelfOnly" and not ab.ally then
 						local mySchool = getCombatantSchool(mods, me)
 						if not info.powerUpSchool or mySchool == info.powerUpSchool then
 							score += 900
@@ -3085,12 +3585,25 @@ local function pickSupportEntry(mods, state, me, entries)
 	return candidates[1].entry, nil
 end
 
-local function pickTargetId(mods, state, me, ability, info, preferMode)
+local function pickTargetId(mods, state, me, ability, info, preferMode, evalResult)
 	local CombatSim = mods.CombatSim
 	local targetKind = ability.targetKind
 	local mode = preferMode or CombatAuto.Style
 
 	if targetKind == "SingleEnemy" or (targetKind == "SingleAny" and mode == "Attack") then
+		local directScaled = info and info.scaledByCaster == true
+		if CombatAuto.TargetPriority == "Smart Effective" and evalResult and evalResult.bestEnemy and evalResult.bestEnemy.id then
+			local be = evalResult.bestEnemy
+			local c = state.combatants[be.id]
+			if c and CombatSim.isAlive(c) then
+				return be.id, {
+					name = be.name or c.name or be.id,
+					mult = evalResult.bestMult or 1,
+					isKill = (evalResult.killCount or 0) > 0,
+				}
+			end
+		end
+
 		local bestEnemy = nil
 		local bestScore = nil
 		local bestMeta = nil
@@ -3100,24 +3613,24 @@ local function pickTargetId(mods, state, me, ability, info, preferMode)
 			if c.team ~= me.team and not c.isPet and CombatSim.isAlive(c) then
 				local hp = c.hp or 0
 				local shield = tonumber(c.shield) or 0
+				local ehp = math.max(1, hp + shield)
 				local maxHp = (c.derived and c.derived.maxHp) or hp
 				local isBoss = isBossCombatant(mods, c, id)
-				local mult = getElementMultiplier(mods, atkSchool, c, me)
+				local mult = getElementMultiplier(mods, atkSchool, c, me, directScaled)
 				local projDmg = directDmg * mult
-				local canKill = (directDmg > 0) and (projDmg >= (hp + shield) * 0.98)
+				local canKill = (directDmg > 0) and (projDmg >= ehp * 0.99)
 				local score
 				if CombatAuto.TargetPriority == "Highest HP" then
-					score = -(hp + shield) / math.max(0.05, mult)
+					score = -ehp / math.max(0.05, mult)
 				elseif CombatAuto.TargetPriority == "Boss First" then
-					score = (isBoss and -10000000 or 0) - maxHp + ((hp + shield) / math.max(0.05, mult) * 0.01)
+					score = (isBoss and -10000000 or 0) - (canKill and 500000 or 0) - maxHp + (ehp / math.max(0.05, mult) * 0.01)
 				elseif CombatAuto.TargetPriority == "Lowest HP" then
-					score = hp + shield
+					score = ehp
 				else
-					-- Smart Effective: picks easiest kill / most effective element against 2-3 enemies
-					score = (hp + shield) / math.max(0.05, mult)
-					if canKill then
-						score -= 100000 - math.max(0, projDmg - (hp + shield))
-					end
+					-- Smart Effective: maximize real damage & clean kills, focusing Boss when non-lethal
+					local eff = math.min(projDmg, ehp)
+					local okAmt = math.max(0, projDmg - ehp)
+					score = -(eff * (isBoss and 1.25 or 1.0)) + (okAmt * 0.65) - (canKill and (isBoss and 500000 or 100000) or 0)
 				end
 				if not bestScore or score < bestScore then
 					bestScore = score
@@ -3133,7 +3646,7 @@ local function pickTargetId(mods, state, me, ability, info, preferMode)
 		return bestEnemy, bestMeta
 	end
 
-	if targetKind == "SingleAlly" or (targetKind == "SingleAny" and mode == "Support") then
+	if targetKind == "SingleAlly" or (targetKind == "SelfOnly" and ability.ally == true) or (targetKind == "SingleAny" and mode == "Support") then
 		local healthInfo = getTeamHealthInfo(mods, state, me)
 		local pickedId = nil
 		if info.revivesAlly and healthInfo.revivableCount > 0 then
@@ -3162,7 +3675,71 @@ local function pickTargetId(mods, state, me, ability, info, preferMode)
 	return nil, nil
 end
 
-local function tryAutoDiscard(mods, state, me)
+local function scoreDiscardBrick(mods, state, me, ab, info, enemySchools, deckRem)
+	if not ab or not info then
+		return -1000
+	end
+	local cost = ab.energyCost or 0
+	local maxCap = mods.CombatSim.maxEnergy(me) or 99
+	if cost > maxCap then
+		return 1000
+	end
+
+	-- Keep high-impact finishers & multi-target nukes
+	if info.directDamage > 0 and cost >= CombatAuto.SavePipMinCost then
+		return -1000
+	end
+
+	-- Check elemental wards vs alive enemies: useless ward in a non-matching fight is high-priority discard cycling fodder
+	local hasWardEffect = false
+	for _, ef in ipairs(ab.effects or {}) do
+		if ef.kind == "ApplyStatus" and ef.statusId and info.shieldScore == 0 and info.directDamage == 0 then
+			hasWardEffect = true
+			break
+		end
+	end
+	if hasWardEffect and info.hasDefenseBuff and ab.school then
+		if enemySchools[ab.school] then
+			return -200
+		end
+		return 850
+	end
+
+	-- Keep useful power-ups for remaining deck/hand damage
+	if info.isAttackPowerUp then
+		if isUsefulPowerUp(mods, state, me, { ability = ab, info = info }, {}, nil, deckRem) then
+			return -400
+		end
+		return 750
+	end
+
+	if info.hasCleanse and getCombatantDebuffCount(mods.Statuses, me, info.cleanseStatuses) > 0 then
+		return -600
+	end
+
+	if info.healScore > 0 then
+		local meMaxHp = (me.derived and me.derived.maxHp) or me.maxHp or 100
+		local meRatio = (me.hp or meMaxHp) / math.max(1, meMaxHp)
+		if meRatio <= 0.65 or info.revivesAlly then
+			return -500
+		end
+		return (CombatAuto.Style == "Attack" and cost <= 1 and info.healScore < (meMaxHp * 0.18)) and 520 or 100
+	end
+
+	if CombatAuto.Style == "Attack" then
+		if info.directDamage == 0 and not isZeroCostDefense(ab, info) then
+			return 600
+		end
+		return -100
+	else
+		if not info.isSupport then
+			return 600
+		end
+		return -100
+	end
+end
+
+local function tryAutoDiscard(mods, state, me, deckRem, minScore)
 	local turnKey = tostring(state.round or 0) .. ":" .. tostring(state.turnIndex or 0)
 	if CombatAuto.LastDiscardTurnKey == turnKey then
 		return false
@@ -3172,31 +3749,46 @@ local function tryAutoDiscard(mods, state, me)
 		return false
 	end
 
-	local toDiscard = {}
+	local enemySchools = {}
+	for _, e in ipairs(getAliveEnemies(mods, state, me)) do
+		local sc = e.combatant and e.combatant.school
+		if sc then
+			enemySchools[sc] = true
+		end
+	end
+
+	local ranked = {}
+	local cutoff = minScore or 1
 	for slot, abilityId in ipairs(hand) do
 		local ab = mods.Abilities[abilityId]
 		if ab then
-			local info = analyzeAbility(mods, ab, me.energy or 0)
-			local isBrick = false
-			if CombatAuto.Style == "Attack" then
-				isBrick = (info.directDamage == 0 and not info.isAttackPowerUp and not isZeroCostDefense(ab, info))
-			else
-				isBrick = (not info.isSupport)
-			end
-			if isBrick or (ab.energyCost or 0) > (mods.CombatSim.maxEnergy(me) or 99) then
-				table.insert(toDiscard, { abilityId = abilityId, slot = slot })
-				if #toDiscard >= 2 then
-					break
-				end
+			local info = analyzeAbility(mods, ab, me.energy or 0, me, DeckStrategy.CardTiers)
+			local s = scoreDiscardBrick(mods, state, me, ab, info, enemySchools, deckRem)
+			if s >= cutoff then
+				table.insert(ranked, { abilityId = abilityId, slot = slot, score = s })
 			end
 		end
 	end
 
-	if #toDiscard == 0 then
+	if #ranked == 0 then
 		return false
+	end
+	table.sort(ranked, function(a, b)
+		if a.score ~= b.score then
+			return a.score > b.score
+		end
+		return a.slot < b.slot
+	end)
+
+	local toDiscard = {}
+	for i = 1, math.min(2, #ranked) do
+		table.insert(toDiscard, { abilityId = ranked[i].abilityId, slot = ranked[i].slot })
 	end
 
 	CombatAuto.LastDiscardTurnKey = turnKey
+	for _, item in ipairs(toDiscard) do
+		LiveCombat.ConsumedCounts[item.abilityId] = (LiveCombat.ConsumedCounts[item.abilityId] or 0) + 1
+	end
 	mods.Net.fireServer("SubmitAction", {
 		kind = mods.Enums.ActionKind.Discard,
 		cards = toDiscard,
@@ -3205,6 +3797,89 @@ local function tryAutoDiscard(mods, state, me)
 	})
 	setCombatStatus("DISCARD · " .. tostring(#toDiscard) .. " BRICKS")
 	return true
+end
+
+local function pickCleanseEntry(mods, state, me, entries)
+	local Statuses = mods.Statuses
+	local CombatSim = mods.CombatSim
+	local meMaxHp = (me.derived and me.derived.maxHp) or me.maxHp or 100
+	local meRatio = (me.hp or meMaxHp) / math.max(1, meMaxHp)
+
+	local bestEntry, bestTargetId, bestTargetName = nil, nil, nil
+	local bestScore = -math.huge
+
+	for _, entry in ipairs(entries) do
+		local info = entry.info
+		local ab = entry.ability
+		if info.hasCleanse and not info.preventsAction and ab.targetKind ~= "SingleEnemy" then
+			local cost = ab.energyCost or 0
+			local myCnt, mySevere = getCombatantDebuffCount(Statuses, me, info.cleanseStatuses)
+			local targetId, targetName, targetCnt, targetSevere = nil, nil, 0, false
+
+			if myCnt > 0 then
+				targetId, targetName, targetCnt, targetSevere = me.id, "me", myCnt, mySevere
+			elseif ab.targetKind == "SingleAlly" or ab.targetKind == "AllAllies" or ab.targetKind == "SingleAny" then
+				for id, c in pairs(state.combatants) do
+					if id ~= me.id and c.team == me.team and not c.isPet and CombatSim.isAlive(c) then
+						local cnt, sev = getCombatantDebuffCount(Statuses, c, info.cleanseStatuses)
+						if cnt > targetCnt or (cnt == targetCnt and sev and not targetSevere) then
+							targetId = id
+							targetName = c.name or id
+							targetCnt = cnt
+							targetSevere = sev
+						end
+					end
+				end
+			end
+
+			if targetCnt > 0 then
+				local shouldCast = (targetId == me.id and (cost <= 1 or targetCnt >= 2 or targetSevere or meRatio <= 0.70))
+					or (targetId ~= me.id and (cost <= 0 or CombatAuto.Style == "Support"))
+				if shouldCast then
+					local score = (targetId == me.id and 5000 or 2000) + (targetCnt * 400) + (targetSevere and 600 or 0) - (cost * 300) + (info.healScore or 0)
+					if ab.targetKind == "AllAllies" then
+						score += 150
+					end
+					if score > bestScore then
+						bestScore = score
+						bestEntry = entry
+						bestTargetId = targetId
+						bestTargetName = targetName
+					end
+				end
+			end
+		end
+	end
+
+	return bestEntry, bestTargetId, bestTargetName
+end
+
+local function pickFreeUtilityCard(mods, state, me, entries, savingForCard, deckRem)
+	local healthInfo = getTeamHealthInfo(mods, state, me)
+	local aliveEnemies = getAliveEnemies(mods, state, me)
+	local freeShields = {}
+	local targetSchool = savingForCard and savingForCard.ability and savingForCard.ability.school or nil
+	local savingForAttack = savingForCard and savingForCard.info and (savingForCard.info.directDamage or 0) > 0
+
+	local energyEntry, buffEntry, cleanseEntry = nil, nil, nil
+	for _, entry in ipairs(entries) do
+		local info = entry.info
+		local cost = entry.ability.energyCost or 0
+		local netCost = cost - (info.gainEnergyAmount or 0)
+		if info.hasEnergyGain and netCost <= 0 and (not energyEntry or (info.gainEnergyAmount or 0) > (energyEntry.info.gainEnergyAmount or 0)) then
+			energyEntry = entry
+		elseif savingForAttack and cost <= 0 and info.isAttackPowerUp and isUsefulPowerUp(mods, state, me, entry, {}, targetSchool, deckRem) then
+			if not buffEntry or (info.powerUpSchool == targetSchool and buffEntry.info.powerUpSchool ~= targetSchool) then
+				buffEntry = entry
+			end
+		elseif isZeroCostDefense(entry.ability, info) then
+			table.insert(freeShields, entry)
+		elseif cost <= 0 and info.hasCleanse and healthInfo.hasDebuff and not cleanseEntry then
+			cleanseEntry = entry
+		end
+	end
+
+	return energyEntry or buffEntry or pickBestFreeShield(freeShields, aliveEnemies, me) or cleanseEntry
 end
 
 local function runCombatStep()
@@ -3235,40 +3910,62 @@ local function runCombatStep()
 
 	local me = state.combatants[myId]
 	local entries = collectEntries(mods, state, me, false)
+	local deckRem = getDeckRemainingSummary(mods, state, me)
 
 	local chosen
 	local savingForCard = nil
 	local usedEmergencyHeal = false
-	if CombatAuto.AutoHeal then
-		chosen, savingForCard = pickEmergencyHealEntry(mods, state, me, entries, CombatAuto.HealThreshold)
+	local cleanseTargetId = nil
+	local cleanseTargetName = nil
+	if CombatAuto.Style == "Attack" then
+		chosen = findImmediateLethalEntry(mods, state, me, entries)
+	end
+	if not chosen and CombatAuto.AutoHeal then
+		local hi = getTeamHealthInfo(mods, state, me, CombatAuto.HealThreshold)
+		if hi.revivableCount > 0 or hi.lowestRatio <= 0.25 then
+			chosen, savingForCard = pickEmergencyHealEntry(mods, state, me, entries, CombatAuto.HealThreshold, deckRem)
+			if chosen then
+				usedEmergencyHeal = true
+			end
+		end
+	end
+	if not chosen and not savingForCard and CombatAuto.AutoCleanse then
+		chosen, cleanseTargetId, cleanseTargetName = pickCleanseEntry(mods, state, me, entries)
+	end
+	if not chosen and not savingForCard and CombatAuto.AutoHeal then
+		chosen, savingForCard = pickEmergencyHealEntry(mods, state, me, entries, CombatAuto.HealThreshold, deckRem)
 		if chosen then
 			usedEmergencyHeal = true
-		elseif savingForCard then
-			-- Play free 0-pip shields/buffs while saving pips for the stronger emergency heal
-			for _, entry in ipairs(entries) do
-				local netCost = (entry.ability.energyCost or 0) - (entry.info.gainEnergyAmount or 0)
-				if netCost <= 0 and (isZeroCostDefense(entry.ability, entry.info) or entry.info.hasCleanse or entry.info.hasEnergyGain) then
-					chosen = entry
-					break
-				end
-			end
 		end
 	end
 
 	if not chosen and not savingForCard then
 		if CombatAuto.Style == "Attack" then
-			chosen, savingForCard = pickAttackEntry(mods, state, me, entries)
+			chosen, savingForCard = pickAttackEntry(mods, state, me, entries, deckRem)
 		else
-			chosen, savingForCard = pickSupportEntry(mods, state, me, entries)
+			chosen, savingForCard = pickSupportEntry(mods, state, me, entries, deckRem)
 		end
+	end
+
+	if not chosen and savingForCard then
+		chosen = pickFreeUtilityCard(mods, state, me, entries, savingForCard, deckRem)
 	end
 
 	CombatAuto.Busy = true
 	local ok, err = pcall(function()
 		local CombatUI = mods.CombatUI
 		if chosen then
+			if chosen.slot and chosen.slot > 0 then
+				LiveCombat.ConsumedCounts[chosen.id] = (LiveCombat.ConsumedCounts[chosen.id] or 0) + 1
+			end
 			local targetMode = (usedEmergencyHeal or chosen.info.isSupport) and "Support" or CombatAuto.Style
-			local targetId, targetMeta = pickTargetId(mods, state, me, chosen.ability, chosen.info, targetMode)
+			local targetId, targetMeta
+			if cleanseTargetId then
+				targetId = cleanseTargetId
+				targetMeta = { name = cleanseTargetName or "me", mult = 1, isKill = false }
+			else
+				targetId, targetMeta = pickTargetId(mods, state, me, chosen.ability, chosen.info, targetMode, chosen._eval)
+			end
 			local used = CombatUI.use(chosen.id, chosen.slot)
 			if used and CombatUI.isAiming() then
 				if targetId then
@@ -3285,7 +3982,7 @@ local function runCombatStep()
 			elseif not used then
 				-- Direct SubmitAction fallback if CombatUI.use refused due to UI/split-VM state
 				local tk = chosen.ability.targetKind
-				local needsTarget = (tk == "SingleEnemy" or tk == "SingleAlly" or tk == "SingleAny")
+				local needsTarget = (tk == "SingleEnemy" or tk == "SingleAlly" or tk == "SingleAny" or (tk == "SelfOnly" and chosen.ability.ally == true))
 				local targets = (needsTarget and targetId) and { targetId } or {}
 				mods.Net.fireServer("SubmitAction", {
 					kind = mods.Enums.ActionKind.Ability,
@@ -3301,6 +3998,9 @@ local function runCombatStep()
 			if usedEmergencyHeal then
 				local who = (targetMeta and targetMeta.name) and (" -> " .. tostring(targetMeta.name)) or ""
 				setCombatStatus("HEAL · " .. cardName .. who)
+			elseif cleanseTargetId then
+				local who = (targetMeta and targetMeta.name) and (" -> " .. tostring(targetMeta.name)) or ""
+				setCombatStatus("CLEANSE · " .. cardName .. who)
 			elseif chosen.ability.targetKind == "AllEnemies" then
 				local cnt = (ev and ev.enemyCount) or 1
 				local tag = (ev and ev.wipesAll) and "KILL AOE · " or "AOE · "
@@ -3325,7 +4025,7 @@ local function runCombatStep()
 			else
 				setCombatStatus("SAVING PIPS · WAIT")
 			end
-		elseif CombatAuto.AutoDiscard and tryAutoDiscard(mods, state, me) then
+		elseif CombatAuto.AutoDiscard and tryAutoDiscard(mods, state, me, deckRem, 1) then
 			return
 		elseif CombatAuto.AutoPass and mods.CombatSim.mayPass(me) then
 			CombatUI.passTurn()
@@ -3366,19 +4066,40 @@ task.spawn(function()
 	end
 
 	rebuildTriviaLookup(mods)
+	refreshDeckStrategy(mods, true)
+
+	trackConnection(mods.Net.onClientEvent("ProfileChanged", function()
+		if State.Alive then
+			task.delay(0.2, function()
+				if State.Alive then
+					refreshDeckStrategy(mods, true)
+				end
+			end)
+		end
+	end))
 
 	trackConnection(mods.Net.onClientEvent("CombatStarted", function(data)
 		if not State.Alive or type(data) ~= "table" then
 			return
 		end
+		table.clear(LiveCombat.ConsumedCounts)
+		LiveCombat.BossCombatantId = nil
 		if type(data.state) == "table" then
 			LiveCombat.State = data.state
 			LiveCombat.MyId = findMyCombatantId(data.state)
+			local me = LiveCombat.MyId and data.state.combatants and data.state.combatants[LiveCombat.MyId]
+			refreshDeckStrategy(mods, true, me)
 		end
-		if type(data.boss) == "table" and type(data.boss.id) == "string" then
-			LiveBossIds[data.boss.id] = true
-			if mods.BossEnemyIds then
-				mods.BossEnemyIds[data.boss.id] = true
+		if type(data.boss) == "table" then
+			if type(data.boss.id) == "string" then
+				LiveCombat.BossCombatantId = data.boss.id
+			end
+			local bossTmplId = data.boss.enemyId or data.boss.defId
+			if type(bossTmplId) == "string" then
+				LiveBossIds[bossTmplId] = true
+				if mods.BossEnemyIds then
+					mods.BossEnemyIds[bossTmplId] = true
+				end
 			end
 		end
 	end))
@@ -3390,10 +4111,17 @@ task.spawn(function()
 		if type(data.state) == "table" then
 			LiveCombat.State = data.state
 			LiveCombat.MyId = LiveCombat.MyId or findMyCombatantId(data.state)
+			local me = LiveCombat.MyId and data.state.combatants and data.state.combatants[LiveCombat.MyId]
+			if me then
+				getDeckRemainingSummary(mods, data.state, me)
+			end
 		end
 		if data.ended then
 			LiveCombat.State = nil
 			LiveCombat.TurnActorId = nil
+			LiveCombat.BossCombatantId = nil
+			table.clear(LiveCombat.ConsumedCounts)
+			setDeckStrategyStatus(DeckStrategy.SummaryText)
 		end
 	end))
 
@@ -3401,9 +4129,14 @@ task.spawn(function()
 		if not State.Alive or type(data) ~= "table" or not LiveCombat.State then
 			return
 		end
+		if data.reshuffled then
+			table.clear(LiveCombat.ConsumedCounts)
+		end
 		local myId = LiveCombat.MyId or findMyCombatantId(LiveCombat.State)
-		if myId and LiveCombat.State.combatants and LiveCombat.State.combatants[myId] and type(data.hand) == "table" then
-			LiveCombat.State.combatants[myId].hand = table.clone(data.hand)
+		local me = myId and LiveCombat.State.combatants and LiveCombat.State.combatants[myId]
+		if me and type(data.hand) == "table" then
+			me.hand = table.clone(data.hand)
+			getDeckRemainingSummary(mods, LiveCombat.State, me)
 		end
 	end))
 
@@ -3418,6 +4151,9 @@ task.spawn(function()
 		LiveCombat.State = nil
 		LiveCombat.MyId = nil
 		LiveCombat.TurnActorId = nil
+		LiveCombat.BossCombatantId = nil
+		table.clear(LiveCombat.ConsumedCounts)
+		setDeckStrategyStatus(DeckStrategy.SummaryText)
 	end
 	trackConnection(mods.Net.onClientEvent("CombatEnded", clearLiveCombat))
 	trackConnection(mods.Net.onClientEvent("ArenaCleared", clearLiveCombat))
@@ -3593,7 +4329,57 @@ local function scoreOutcomeList(outcomes, hpRatio)
 	return s
 end
 
-local function pickBestChoiceForOffer(offer, def, runState, hpRatio)
+local ENCOUNTER_DELAY_SECONDS = 2.0
+
+local function fireGuiButton(btn)
+	if not btn then
+		return false
+	end
+	if typeof(firesignal) == "function" then
+		local ok = pcall(firesignal, btn.Activated)
+		if ok then
+			return true
+		end
+		local okClick = pcall(firesignal, btn.MouseButton1Click)
+		if okClick then
+			return true
+		end
+	end
+	if typeof(getconnections) == "function" then
+		local okC, conns = pcall(getconnections, btn.Activated)
+		if okC and type(conns) == "table" and #conns > 0 then
+			for _, conn in ipairs(conns) do
+				pcall(function() conn:Fire() end)
+			end
+			return true
+		end
+	end
+	return false
+end
+
+local function findRunUiChoiceButton(offerIdx, choiceIdx)
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	local runUi = pg and pg:FindFirstChild("RunUI")
+	if not runUi then
+		return nil
+	end
+	for _, d in ipairs(runUi:GetDescendants()) do
+		if d:IsA("TextButton")
+			and d:GetAttribute("OfferIndex") == offerIdx
+			and d:GetAttribute("ChoiceIndex") == choiceIdx
+		then
+			return d
+		end
+	end
+	return nil
+end
+
+local function isRunUiChoiceLocked(offerIdx, choiceIdx)
+	local btn = findRunUiChoiceButton(offerIdx, choiceIdx)
+	return btn ~= nil and btn:GetAttribute("Locked") == true
+end
+
+local function pickBestChoiceForOffer(offer, def, runState, hpRatio, offerIdx)
 	local choices = (type(offer) == "table" and type(offer.choices) == "table" and offer.choices)
 		or (type(def) == "table" and type(def.choices) == "table" and def.choices)
 	if not choices or #choices == 0 then
@@ -3601,10 +4387,10 @@ local function pickBestChoiceForOffer(offer, def, runState, hpRatio)
 	end
 
 	local bestStats = (type(runState) == "table" and type(runState.bestStats) == "table" and runState.bestStats) or {}
-	local bestChoiceIdx, bestChoiceScore = 1, -math.huge
+	local bestChoiceIdx, bestChoiceScore = nil, -math.huge
 
 	for idx, ch in ipairs(choices) do
-		if type(ch) == "table" and not ch.locked and not ch.disabled then
+		if type(ch) == "table" and not ch.locked and not ch.disabled and not isRunUiChoiceLocked(offerIdx, idx) then
 			local score = 10 - (idx * 0.1)
 			if ch.outcomes then
 				score += scoreOutcomeList(ch.outcomes, hpRatio)
@@ -3625,7 +4411,7 @@ local function pickBestChoiceForOffer(offer, def, runState, hpRatio)
 			end
 		end
 	end
-	return bestChoiceIdx
+	return bestChoiceIdx or 1
 end
 
 local function pickBestEncounterOffer(mods, offers, hpRatio)
@@ -3648,8 +4434,12 @@ local function pickBestEncounterOffer(mods, offers, hpRatio)
 	local picked = offers[bestIdx]
 	if picked then
 		local def = mods.Encounters and mods.Encounters[picked.id]
-		local choiceIdx = pickBestChoiceForOffer(picked, def, DungeonAuto.RunState, ratio)
-		mods.Net.fireServer("PickEncounter", { offerIndex = bestIdx, choiceIndex = choiceIdx })
+		local choiceIdx = pickBestChoiceForOffer(picked, def, DungeonAuto.RunState, ratio, bestIdx)
+		local btn = findRunUiChoiceButton(bestIdx, choiceIdx)
+		local firedUi = btn and btn:GetAttribute("Locked") ~= true and fireGuiButton(btn)
+		if not firedUi then
+			mods.Net.fireServer("PickEncounter", { offerIndex = bestIdx, choiceIndex = choiceIdx })
+		end
 		DungeonAuto.PendingOffers = nil
 		setDungeonStatus(string.format("PICKED · %s (c%d)", tostring(picked.id or bestIdx), choiceIdx))
 	end
@@ -3734,24 +4524,22 @@ local function findSummaryButton(summaryGui, btnName)
 	return nil
 end
 
-local function fireGuiButton(btn)
-	if typeof(firesignal) == "function" then
-		pcall(firesignal, btn.Activated)
-		if btn.Text ~= "Replaying" then
-			pcall(firesignal, btn.MouseButton1Click)
-		end
-	end
-	if btn.Text ~= "Replaying" and typeof(getconnections) == "function" then
-		local okC, conns = pcall(getconnections, btn.Activated)
-		if okC and type(conns) == "table" then
-			for _, conn in ipairs(conns) do
-				pcall(function() conn:Fire() end)
-			end
-		end
-	end
-end
-
 local REPLAY_DELAY_SECONDS = 2.5
+
+local function isMyNameInVotes(votes)
+	if type(votes) ~= "table" or type(votes.names) ~= "table" then
+		return false
+	end
+	local n1 = string.lower(LocalPlayer.Name or "")
+	local n2 = string.lower(LocalPlayer.DisplayName or "")
+	for _, nm in ipairs(votes.names) do
+		local s = string.lower(tostring(nm))
+		if (n1 ~= "" and s == n1) or (n2 ~= "" and s == n2) then
+			return true
+		end
+	end
+	return false
+end
 
 local function tryVoteReplay(forceFire, ignoreDelay)
 	if not State.Alive or not DungeonAuto.AutoReplay then
@@ -3769,6 +4557,8 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 		DungeonAuto.SeenSummaryAt = nil
 		if forceFire and not DungeonAuto.VotedCurrentSummary then
 			DungeonAuto.VotedCurrentSummary = true
+			DungeonAuto.LastReplayAttemptAt = os.clock()
+			DungeonAuto.ReplayAttempts = (DungeonAuto.ReplayAttempts or 0) + 1
 			mods.Net.fireServer("RequestReplay")
 			setDungeonStatus("REPLAY REQUESTED")
 		end
@@ -3781,11 +4571,6 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 		if not ignoreDelay then
 			setDungeonStatus(string.format("REPLAY IN %.1fs", REPLAY_DELAY_SECONDS))
 		end
-	end
-
-	-- Vote strictly ONCE per RunSummary UI instance so RequestReplay cannot accidentally double-fire / un-vote
-	if DungeonAuto.VotedSummaryGui == summaryGui then
-		return
 	end
 
 	if not ignoreDelay and DungeonAuto.SeenSummaryAt and (os.clock() - DungeonAuto.SeenSummaryAt) < REPLAY_DELAY_SECONDS then
@@ -3801,23 +4586,94 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 		return
 	end
 
-	DungeonAuto.VotedSummaryGui = summaryGui
-	if replayBtn.Text == "Replaying" then
+	-- Initial vote on this RunSummary UI
+	if DungeonAuto.VotedSummaryGui ~= summaryGui then
+		DungeonAuto.VotedSummaryGui = summaryGui
+		DungeonAuto.LastReplayAttemptAt = os.clock()
+		DungeonAuto.ReplayAttempts = 1
+		if replayBtn.Text ~= "Replaying" then
+			fireGuiButton(replayBtn)
+		end
+		if replayBtn.Text ~= "Replaying" and not DungeonAuto.VotedCurrentSummary then
+			mods.Net.fireServer("RequestReplay")
+		end
+		DungeonAuto.VotedCurrentSummary = true
 		setDungeonStatus("REPLAY VOTED")
 		return
 	end
 
-	fireGuiButton(replayBtn)
-	if replayBtn.Text ~= "Replaying" and not DungeonAuto.VotedCurrentSummary then
+	-- If UI says "Replaying" but server RunReplayVotes has NOT confirmed our vote yet, retry up to 3 times safely
+	if not DungeonAuto.ServerConfirmedReplayVote
+		and (DungeonAuto.ReplayAttempts or 0) < 3
+		and (os.clock() - (DungeonAuto.LastReplayAttemptAt or 0)) >= 2.0
+	then
+		DungeonAuto.LastReplayAttemptAt = os.clock()
+		DungeonAuto.ReplayAttempts = (DungeonAuto.ReplayAttempts or 0) + 1
 		mods.Net.fireServer("RequestReplay")
+		setDungeonStatus(string.format("REPLAY RETRY (%d/3)", DungeonAuto.ReplayAttempts))
 	end
-	DungeonAuto.VotedCurrentSummary = true
-	setDungeonStatus("REPLAY VOTED")
+end
+
+local DEATH_CONTINUE_DELAY = 1.2
+
+local function tryContinueAfterDeath(ignoreDelay)
+	if not State.Alive or (not DungeonAuto.AutoReplay and not CombatAuto.Enabled) then
+		return
+	end
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	local combatGui = pg and pg:FindFirstChild("CombatUI")
+	local fallen = combatGui and combatGui:FindFirstChild("Fallen")
+	if not fallen or not fallen:IsA("GuiObject") or not fallen.Visible then
+		DungeonAuto.SeenFallenAt = nil
+		DungeonAuto.DeclineAttempts = 0
+		DungeonAuto.LastDeclineReviveAt = 0
+		return
+	end
+
+	local now = os.clock()
+	if not DungeonAuto.SeenFallenAt then
+		DungeonAuto.SeenFallenAt = now
+		if not ignoreDelay then
+			setDungeonStatus("FALLEN · CONTINUE IN 1.2s")
+			return
+		end
+	end
+	if not ignoreDelay and (now - DungeonAuto.SeenFallenAt) < DEATH_CONTINUE_DELAY then
+		return
+	end
+
+	local attempts = DungeonAuto.DeclineAttempts or 0
+	local lastAt = DungeonAuto.LastDeclineReviveAt or 0
+	if attempts >= 3 or (now - lastAt) < 3.0 then
+		return
+	end
+
+	DungeonAuto.LastDeclineReviveAt = now
+	DungeonAuto.DeclineAttempts = attempts + 1
+
+	local continueBtn = nil
+	for _, d in ipairs(fallen:GetDescendants()) do
+		if d:IsA("GuiButton") and d.Name == "Continue" then
+			continueBtn = d
+			break
+		end
+	end
+
+	local firedUi = continueBtn and fireGuiButton(continueBtn) or false
+	if fallen.Visible or not firedUi then
+		local mods = getGameMods()
+		if mods then
+			pcall(function()
+				mods.Net.fireServer("DeclineRevive")
+			end)
+		end
+	end
+	setDungeonStatus("DEATH CONTINUE · WAIT REPLAY")
 end
 
 DungeonTab:AddToggle({
 	Title = "Auto Replay Run",
-	Description = "Waits 2.5s on Run Summary then votes Replay",
+	Description = "Clicks Continue on death, waits 2.5s & verifies replay vote",
 	Default = DungeonAuto.AutoReplay,
 	Callback = function(enabled)
 		DungeonAuto.AutoReplay = enabled
@@ -3825,6 +4681,9 @@ DungeonTab:AddToggle({
 		if enabled then
 			DungeonAuto.VotedSummaryGui = nil
 			DungeonAuto.VotedCurrentSummary = false
+			DungeonAuto.ServerConfirmedReplayVote = false
+			DungeonAuto.ReplayAttempts = 0
+			task.spawn(tryContinueAfterDeath, true)
 			task.spawn(tryVoteReplay, false, true)
 		end
 	end,
@@ -3927,7 +4786,8 @@ task.spawn(function()
 			setDungeonStatus("OFFERS · " .. tostring(#data.offers))
 			return
 		end
-		task.delay(0.5, function()
+		setDungeonStatus(string.format("OFFERS (%d) · PICK %.1fs", #data.offers, ENCOUNTER_DELAY_SECONDS))
+		task.delay(ENCOUNTER_DELAY_SECONDS, function()
 			if not State.Alive or not DungeonAuto.AutoEncounter or not DungeonAuto.PendingOffers then
 				return
 			end
@@ -3940,7 +4800,7 @@ task.spawn(function()
 			return
 		end
 		if DungeonAuto.AutoSkipMerchant then
-			task.delay(0.4, function()
+			task.delay(0.8, function()
 				if State.Alive and DungeonAuto.AutoSkipMerchant then
 					mods.Net.fireServer("MerchantLeave", {})
 					setDungeonStatus("MERCHANT SKIPPED")
@@ -3954,7 +4814,12 @@ task.spawn(function()
 	local function clearOffers()
 		DungeonAuto.PendingOffers = nil
 	end
-	trackConnection(mods.Net.onClientEvent("EncounterResolved", clearOffers))
+	trackConnection(mods.Net.onClientEvent("EncounterResolved", function(res)
+		clearOffers()
+		if State.Alive and type(res) == "table" then
+			setDungeonStatus("RESOLVED · " .. tostring(res.title or res.choice or "DONE"))
+		end
+	end))
 	trackConnection(mods.Net.onClientEvent("ArenaExited", clearOffers))
 
 	trackConnection(mods.Net.onClientEvent("RunReadyChanged", function(data)
@@ -3973,6 +4838,31 @@ task.spawn(function()
 	trackConnection(mods.Net.onClientEvent("ArenaStaged", function()
 		DungeonAuto.VotedSummaryGui = nil
 		DungeonAuto.VotedCurrentSummary = false
+		DungeonAuto.ServerConfirmedReplayVote = false
+		DungeonAuto.ReplayAttempts = 0
+		DungeonAuto.SeenFallenAt = nil
+		DungeonAuto.DeclineAttempts = 0
+		DungeonAuto.LastDeclineReviveAt = 0
+	end))
+
+	trackConnection(mods.Net.onClientEvent("ReviveWindow", function(data)
+		if not State.Alive then
+			return
+		end
+		if type(data) == "table" and data.open == true then
+			DungeonAuto.SeenFallenAt = os.clock()
+			DungeonAuto.DeclineAttempts = 0
+			DungeonAuto.LastDeclineReviveAt = 0
+			if DungeonAuto.AutoReplay or CombatAuto.Enabled then
+				setDungeonStatus("FALLEN · CONTINUE IN 1.2s")
+				task.delay(DEATH_CONTINUE_DELAY, function()
+					tryContinueAfterDeath(true)
+				end)
+			end
+		else
+			DungeonAuto.SeenFallenAt = nil
+			DungeonAuto.DeclineAttempts = 0
+		end
 	end))
 
 	trackConnection(mods.Net.onClientEvent("RunSummary", function(summary)
@@ -3981,6 +4871,10 @@ task.spawn(function()
 		end
 		DungeonAuto.VotedSummaryGui = nil
 		DungeonAuto.VotedCurrentSummary = false
+		DungeonAuto.ServerConfirmedReplayVote = false
+		DungeonAuto.ReplayAttempts = 0
+		DungeonAuto.SeenFallenAt = nil
+		DungeonAuto.DeclineAttempts = 0
 		if DungeonAuto.AutoReplay and summary.replay == true then
 			setDungeonStatus(string.format("REPLAY IN %.1fs", REPLAY_DELAY_SECONDS))
 			task.delay(REPLAY_DELAY_SECONDS, function()
@@ -3999,6 +4893,11 @@ task.spawn(function()
 		if not State.Alive or type(votes) ~= "table" then
 			return
 		end
+		if votes.starting or isMyNameInVotes(votes) then
+			DungeonAuto.ServerConfirmedReplayVote = true
+		elseif type(votes.names) == "table" then
+			DungeonAuto.ServerConfirmedReplayVote = false
+		end
 		if votes.starting then
 			setDungeonStatus("REPLAY STARTING")
 		elseif type(votes.count) == "number" and type(votes.of) == "number" and votes.count > 0 then
@@ -4013,6 +4912,9 @@ trackThread(function()
 		task.wait(0.8)
 		if not State.Alive then
 			break
+		end
+		if DungeonAuto.AutoReplay or CombatAuto.Enabled then
+			tryContinueAfterDeath(false)
 		end
 		if DungeonAuto.AutoReplay then
 			tryVoteReplay(false, false)
