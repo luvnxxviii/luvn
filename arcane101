@@ -1,0 +1,4390 @@
+-- Arcane 101 · Monochrome Minimalist Hub
+-- Modular Luau Script | Theme: Monochrome Minimalist Sleek
+
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+if type(env.__MonochromeCleanup) == "function" then
+	pcall(env.__MonochromeCleanup)
+end
+
+--// Services
+local function getService(name)
+	local svc = game:GetService(name)
+	if typeof(cloneref) == "function" then
+		local ok, cloned = pcall(cloneref, svc)
+		if ok and cloned then
+			return cloned
+		end
+	end
+	return svc
+end
+
+local Players = getService("Players")
+local TweenService = getService("TweenService")
+local UserInputService = getService("UserInputService")
+local RunService = getService("RunService")
+local VirtualUser = getService("VirtualUser")
+local TeleportService = getService("TeleportService")
+local ReplicatedStorage = getService("ReplicatedStorage")
+local HttpService = getService("HttpService")
+local Lighting = getService("Lighting")
+local CoreGui = getService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+	Players.PlayerAdded:Wait()
+	LocalPlayer = Players.LocalPlayer
+end
+
+--// Lifecycle & State
+local State = {
+	Alive = true,
+	Connections = {},
+	Threads = {},
+	RestoreHooks = {},
+	Gui = nil,
+}
+
+local function trackConnection(conn)
+	table.insert(State.Connections, conn)
+	return conn
+end
+
+local function trackThread(fn)
+	local thread = task.spawn(fn)
+	table.insert(State.Threads, thread)
+	return thread
+end
+
+local function trackRestore(fn)
+	table.insert(State.RestoreHooks, fn)
+end
+
+local function cleanup()
+	if not State.Alive then
+		return
+	end
+	State.Alive = false
+
+	for _, restoreFn in ipairs(State.RestoreHooks) do
+		pcall(restoreFn)
+	end
+	table.clear(State.RestoreHooks)
+
+	for _, conn in ipairs(State.Connections) do
+		pcall(function()
+			conn:Disconnect()
+		end)
+	end
+	table.clear(State.Connections)
+
+	for _, thread in ipairs(State.Threads) do
+		pcall(task.cancel, thread)
+	end
+	table.clear(State.Threads)
+
+	if State.Gui and State.Gui.Parent then
+		pcall(function()
+			State.Gui:Destroy()
+		end)
+	end
+	State.Gui = nil
+end
+
+env.__MonochromeCleanup = cleanup
+
+--// Persistent Config & Auto-Execute on Server Join
+local CONFIG_DIR = "MonochromeHub"
+local CONFIG_PATH = CONFIG_DIR .. "/arcane101_config.json"
+
+local Config = {
+	Data = {},
+	Loading = true,
+}
+
+local function fsReady()
+	return typeof(readfile) == "function" and typeof(writefile) == "function" and typeof(isfile) == "function"
+end
+
+function Config.Load()
+	if not fsReady() then
+		Config.Loading = false
+		return
+	end
+	pcall(function()
+		if isfile(CONFIG_PATH) then
+			local raw = readfile(CONFIG_PATH)
+			local decoded = HttpService:JSONDecode(raw)
+			if type(decoded) == "table" then
+				Config.Data = decoded
+			end
+		end
+	end)
+	Config.Loading = false
+end
+
+function Config.Save()
+	if Config.Loading or not fsReady() then
+		return
+	end
+	pcall(function()
+		if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder(CONFIG_DIR) then
+			makefolder(CONFIG_DIR)
+		end
+		writefile(CONFIG_PATH, HttpService:JSONEncode(Config.Data))
+	end)
+end
+
+function Config.Get(key, default)
+	local v = Config.Data[key]
+	if v == nil then
+		return default
+	end
+	return v
+end
+
+function Config.Set(key, val)
+	Config.Data[key] = val
+	Config.Save()
+end
+
+Config.Load()
+
+local function getTeleportScriptPath()
+	if typeof(isfile) ~= "function" then
+		return nil
+	end
+	if isfile("Arcane101.lua") then
+		return "Arcane101.lua"
+	elseif isfile(CONFIG_DIR .. "/Arcane101.lua") then
+		return CONFIG_DIR .. "/Arcane101.lua"
+	end
+	return nil
+end
+
+local function queueTeleportAutoExec()
+	if env.__MonochromeTeleportQueued then
+		return true
+	end
+	local qfn = (typeof(queue_on_teleport) == "function" and queue_on_teleport)
+		or (typeof(queueonteleport) == "function" and queueonteleport)
+		or (type(syn) == "table" and typeof(syn.queue_on_teleport) == "function" and syn.queue_on_teleport)
+	if not qfn then
+		return false
+	end
+
+	local payload = [[
+repeat task.wait(0.25) until game:IsLoaded()
+task.wait(1)
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+if env.__MonochromeBooted then return end
+env.__MonochromeBooted = true
+local isFn = typeof(isfile) == "function" and isfile
+local readFn = typeof(readfile) == "function" and readfile
+if not isFn or not readFn then return end
+if isFn("MonochromeHub/arcane101_config.json") then
+	local ok, cfg = pcall(function()
+		return game:GetService("HttpService"):JSONDecode(readfile("MonochromeHub/arcane101_config.json"))
+	end)
+	if ok and type(cfg) == "table" and cfg.AutoExecute == false then
+		return
+	end
+end
+local path = isFn("Arcane101.lua") and "Arcane101.lua" or (isFn("MonochromeHub/Arcane101.lua") and "MonochromeHub/Arcane101.lua")
+if path then
+	local src = readFn(path)
+	if type(src) == "string" and #src > 0 then
+		loadstring(src)()
+	end
+end
+]]
+
+	local ok = pcall(qfn, payload)
+	if ok then
+		env.__MonochromeTeleportQueued = true
+	end
+	return ok
+end
+
+if Config.Get("AutoExecute", true) then
+	queueTeleportAutoExec()
+end
+
+--// Theme Tokens (Monochrome)
+local Theme = {
+	Bg = Color3.fromRGB(11, 11, 13),
+	Surface = Color3.fromRGB(18, 18, 22),
+	SurfaceHover = Color3.fromRGB(24, 24, 29),
+	Elevated = Color3.fromRGB(28, 28, 34),
+	Border = Color3.fromRGB(38, 38, 46),
+	BorderSoft = Color3.fromRGB(28, 28, 34),
+	TextPrimary = Color3.fromRGB(244, 244, 246),
+	TextSecondary = Color3.fromRGB(142, 142, 152),
+	TextMuted = Color3.fromRGB(86, 86, 96),
+	Accent = Color3.fromRGB(245, 245, 247),
+	AccentText = Color3.fromRGB(11, 11, 13),
+	ToggleOff = Color3.fromRGB(38, 38, 45),
+	KnobOff = Color3.fromRGB(120, 120, 130),
+	KnobOn = Color3.fromRGB(14, 14, 16),
+}
+
+local TweenFast = TweenInfo.new(0.18, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+local TweenSmooth = TweenInfo.new(0.24, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+
+local function tween(inst, props, info)
+	local t = TweenService:Create(inst, info or TweenFast, props)
+	t:Play()
+	return t
+end
+
+local function create(className, props, children)
+	local inst = Instance.new(className)
+	if props then
+		for k, v in pairs(props) do
+			inst[k] = v
+		end
+	end
+	if children then
+		for _, child in ipairs(children) do
+			child.Parent = inst
+		end
+	end
+	return inst
+end
+
+local function getGuiParent()
+	if typeof(gethui) == "function" then
+		local ok, hui = pcall(gethui)
+		if ok and hui then
+			return hui
+		end
+	end
+	local ok, cg = pcall(function()
+		return CoreGui.Name and CoreGui
+	end)
+	if ok and cg then
+		return cg
+	end
+	return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+--// UI Builder
+local UI = {}
+
+function UI.CreateWindow(opts)
+	opts = opts or {}
+	local titleText = opts.Title or "MONOCHROME"
+	local subtitleText = opts.Subtitle or "v1.0"
+	local width = opts.Width or 432
+	local height = opts.Height or 384
+	local toggleKey = opts.ToggleKey or Enum.KeyCode.RightShift
+
+	local screenGui = create("ScreenGui", {
+		Name = "MonochromeHub",
+		ResetOnSpawn = false,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		IgnoreGuiInset = true,
+		Parent = getGuiParent(),
+	})
+	State.Gui = screenGui
+
+	local mainFrame = create("Frame", {
+		Name = "Window",
+		Size = UDim2.fromOffset(width, height),
+		Position = UDim2.new(0.5, -width / 2, 0.5, -height / 2),
+		BackgroundColor3 = Theme.Bg,
+		BorderSizePixel = 0,
+		ClipsDescendants = true,
+		Parent = screenGui,
+	}, {
+		create("UICorner", { CornerRadius = UDim.new(0, 12) }),
+		create("UIStroke", {
+			Color = Theme.Border,
+			Thickness = 1,
+			Transparency = 0.2,
+		}),
+	})
+
+	-- Top Header
+	local headerHeight = 44
+	local header = create("Frame", {
+		Name = "Header",
+		Size = UDim2.new(1, 0, 0, headerHeight),
+		BackgroundTransparency = 1,
+		Parent = mainFrame,
+	})
+
+	create("Frame", {
+		Size = UDim2.new(1, -90, 1, 0),
+		Position = UDim2.fromOffset(16, 0),
+		BackgroundTransparency = 1,
+		Parent = header,
+	}, {
+		create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			Padding = UDim.new(0, 8),
+		}),
+		create("Frame", {
+			Name = "BrandDot",
+			Size = UDim2.fromOffset(7, 7),
+			BackgroundColor3 = Theme.Accent,
+			BorderSizePixel = 0,
+		}, {
+			create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+		}),
+		create("TextLabel", {
+			Name = "Title",
+			AutomaticSize = Enum.AutomaticSize.X,
+			Size = UDim2.fromOffset(0, 20),
+			BackgroundTransparency = 1,
+			Text = titleText,
+			Font = Enum.Font.GothamBold,
+			TextSize = 13,
+			TextColor3 = Theme.TextPrimary,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}),
+		create("TextLabel", {
+			Name = "Version",
+			AutomaticSize = Enum.AutomaticSize.X,
+			Size = UDim2.fromOffset(0, 16),
+			BackgroundTransparency = 1,
+			Text = subtitleText,
+			Font = Enum.Font.RobotoMono,
+			TextSize = 11,
+			TextColor3 = Theme.TextMuted,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}),
+	})
+
+	local controls = create("Frame", {
+		Size = UDim2.fromOffset(64, 24),
+		Position = UDim2.new(1, -76, 0.5, -12),
+		BackgroundTransparency = 1,
+		Parent = header,
+	}, {
+		create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			HorizontalAlignment = Enum.HorizontalAlignment.Right,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			Padding = UDim.new(0, 6),
+		}),
+	})
+
+	local function makeIconButton(symbol, onClick)
+		local btn = create("TextButton", {
+			Size = UDim2.fromOffset(24, 24),
+			BackgroundColor3 = Theme.Surface,
+			BackgroundTransparency = 0.4,
+			Text = symbol,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 13,
+			TextColor3 = Theme.TextSecondary,
+			AutoButtonColor = false,
+			Parent = controls,
+		}, {
+			create("UICorner", { CornerRadius = UDim.new(0, 6) }),
+		})
+
+		trackConnection(btn.MouseEnter:Connect(function()
+			tween(btn, { BackgroundTransparency = 0, TextColor3 = Theme.TextPrimary })
+		end))
+		trackConnection(btn.MouseLeave:Connect(function()
+			tween(btn, { BackgroundTransparency = 0.4, TextColor3 = Theme.TextSecondary })
+		end))
+		trackConnection(btn.MouseButton1Click:Connect(onClick))
+		return btn
+	end
+
+	local headerDivider = create("Frame", {
+		Size = UDim2.new(1, -24, 0, 1),
+		Position = UDim2.fromOffset(12, headerHeight),
+		BackgroundColor3 = Theme.BorderSoft,
+		BorderSizePixel = 0,
+		Parent = mainFrame,
+	})
+
+	-- Tab Bar
+	local tabBarHeight = 32
+	local tabBar = create("ScrollingFrame", {
+		Name = "TabBar",
+		Size = UDim2.new(1, -24, 0, tabBarHeight),
+		Position = UDim2.fromOffset(12, headerHeight + 8),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 0,
+		ScrollingDirection = Enum.ScrollingDirection.X,
+		AutomaticCanvasSize = Enum.AutomaticSize.X,
+		CanvasSize = UDim2.fromOffset(0, 0),
+		Parent = mainFrame,
+	}, {
+		create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			Padding = UDim.new(0, 5),
+		}),
+	})
+
+	-- Content Container
+	local footerHeight = 28
+	local contentTop = headerHeight + tabBarHeight + 14
+	local contentArea = create("Frame", {
+		Name = "Content",
+		Size = UDim2.new(1, -24, 1, -(contentTop + footerHeight + 4)),
+		Position = UDim2.fromOffset(12, contentTop),
+		BackgroundTransparency = 1,
+		Parent = mainFrame,
+	})
+
+	-- Footer
+	local footer = create("Frame", {
+		Name = "Footer",
+		Size = UDim2.new(1, -24, 0, footerHeight),
+		Position = UDim2.new(0, 12, 1, -footerHeight),
+		BackgroundTransparency = 1,
+		Parent = mainFrame,
+	})
+
+	create("Frame", {
+		Size = UDim2.new(1, 0, 0, 1),
+		BackgroundColor3 = Theme.BorderSoft,
+		BorderSizePixel = 0,
+		Parent = footer,
+	})
+
+	local footerLeft = create("TextLabel", {
+		Size = UDim2.new(0.65, 0, 1, 0),
+		BackgroundTransparency = 1,
+		Text = "MONOCHROME · READY",
+		Font = Enum.Font.RobotoMono,
+		TextSize = 10,
+		TextColor3 = Theme.TextMuted,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = footer,
+	})
+
+	local footerRight = create("TextLabel", {
+		Size = UDim2.new(0.35, 0, 1, 0),
+		Position = UDim2.new(0.65, 0, 0, 0),
+		BackgroundTransparency = 1,
+		Text = "[" .. toggleKey.Name .. "] HIDE",
+		Font = Enum.Font.RobotoMono,
+		TextSize = 10,
+		TextColor3 = Theme.TextMuted,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = footer,
+	})
+
+	-- Dragging
+	do
+		local dragging = false
+		local dragStart, startPos
+
+		trackConnection(header.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				dragStart = input.Position
+				startPos = mainFrame.Position
+			end
+		end))
+
+		trackConnection(UserInputService.InputChanged:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+				local delta = input.Position - dragStart
+				mainFrame.Position = UDim2.new(
+					startPos.X.Scale,
+					startPos.X.Offset + delta.X,
+					startPos.Y.Scale,
+					startPos.Y.Offset + delta.Y
+				)
+			end
+		end))
+
+		trackConnection(UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+			end
+		end))
+	end
+
+	-- Minimize & Visibility Toggle
+	local minimized = false
+	local hidden = false
+
+	local minBtn
+	minBtn = makeIconButton("—", function()
+		minimized = not minimized
+		minBtn.Text = minimized and "+" or "—"
+		local targetHeight = minimized and headerHeight or height
+		headerDivider.Visible = not minimized
+		tabBar.Visible = not minimized
+		contentArea.Visible = not minimized
+		footer.Visible = not minimized
+		tween(mainFrame, { Size = UDim2.fromOffset(width, targetHeight) }, TweenSmooth)
+	end)
+
+	makeIconButton("×", function()
+		cleanup()
+	end)
+
+	trackConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed then
+			return
+		end
+		if input.KeyCode == toggleKey then
+			hidden = not hidden
+			mainFrame.Visible = not hidden
+		end
+	end))
+
+	local Window = {
+		Tabs = {},
+		ActiveTab = nil,
+		SetStatus = function(_, text)
+			footerLeft.Text = text
+		end,
+		SetToggleKey = function(_, newKey)
+			toggleKey = newKey
+			footerRight.Text = "[" .. toggleKey.Name .. "] HIDE"
+		end,
+	}
+
+	function Window:AddTab(name)
+		local tabBtn = create("TextButton", {
+			Name = name .. "Tab",
+			AutomaticSize = Enum.AutomaticSize.X,
+			Size = UDim2.fromOffset(0, 26),
+			BackgroundColor3 = Theme.Elevated,
+			BackgroundTransparency = 1,
+			Text = name,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 11,
+			TextColor3 = Theme.TextSecondary,
+			AutoButtonColor = false,
+			Parent = tabBar,
+		}, {
+			create("UIPadding", {
+				PaddingLeft = UDim.new(0, 10),
+				PaddingRight = UDim.new(0, 10),
+			}),
+			create("UICorner", { CornerRadius = UDim.new(0, 7) }),
+		})
+
+		local page = create("ScrollingFrame", {
+			Name = name .. "Page",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ScrollBarThickness = 2,
+			ScrollBarImageColor3 = Theme.Border,
+			CanvasSize = UDim2.fromOffset(0, 0),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollingDirection = Enum.ScrollingDirection.Y,
+			Visible = false,
+			Parent = contentArea,
+		}, {
+			create("UIListLayout", {
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Padding = UDim.new(0, 7),
+			}),
+			create("UIPadding", {
+				PaddingLeft = UDim.new(0, 1),
+				PaddingRight = UDim.new(0, 5),
+				PaddingTop = UDim.new(0, 2),
+				PaddingBottom = UDim.new(0, 6),
+			}),
+		})
+
+		local tabObj = {
+			Name = name,
+			Button = tabBtn,
+			Page = page,
+		}
+
+		local function selectTab()
+			for _, t in ipairs(Window.Tabs) do
+				local isCurrent = (t == tabObj)
+				t.Page.Visible = isCurrent
+				tween(t.Button, {
+					BackgroundTransparency = isCurrent and 0 or 1,
+					TextColor3 = isCurrent and Theme.TextPrimary or Theme.TextSecondary,
+				})
+			end
+			Window.ActiveTab = tabObj
+		end
+
+		trackConnection(tabBtn.MouseButton1Click:Connect(selectTab))
+		trackConnection(tabBtn.MouseEnter:Connect(function()
+			if Window.ActiveTab ~= tabObj then
+				tween(tabBtn, { TextColor3 = Theme.TextPrimary })
+			end
+		end))
+		trackConnection(tabBtn.MouseLeave:Connect(function()
+			if Window.ActiveTab ~= tabObj then
+				tween(tabBtn, { TextColor3 = Theme.TextSecondary })
+			end
+		end))
+
+		table.insert(Window.Tabs, tabObj)
+		if #Window.Tabs == 1 then
+			selectTab()
+		end
+
+		function tabObj:AddSection(labelText)
+			return create("TextLabel", {
+				Size = UDim2.new(1, 0, 0, 16),
+				BackgroundTransparency = 1,
+				Text = string.upper(labelText),
+				Font = Enum.Font.RobotoMono,
+				TextSize = 10,
+				TextColor3 = Theme.TextMuted,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				Parent = page,
+			}, {
+				create("UIPadding", { PaddingLeft = UDim.new(0, 2) }),
+			})
+		end
+
+		function tabObj:AddToggle(cfg)
+			local state = cfg.Default == true
+			local title = cfg.Title or "Toggle"
+			local desc = cfg.Description
+			local callback = cfg.Callback
+
+			local cardHeight = desc and 54 or 42
+			local card = create("Frame", {
+				Size = UDim2.new(1, 0, 0, cardHeight),
+				BackgroundColor3 = Theme.Surface,
+				BorderSizePixel = 0,
+				Parent = page,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(0, 9) }),
+				create("UIStroke", {
+					Color = Theme.BorderSoft,
+					Thickness = 1,
+				}),
+			})
+
+			local textContainer = create("Frame", {
+				Size = UDim2.new(1, -68, 1, 0),
+				Position = UDim2.fromOffset(14, 0),
+				BackgroundTransparency = 1,
+				Parent = card,
+			})
+
+			if desc then
+				create("TextLabel", {
+					Size = UDim2.new(1, 0, 0, 17),
+					Position = UDim2.fromOffset(0, 9),
+					BackgroundTransparency = 1,
+					Text = title,
+					Font = Enum.Font.GothamMedium,
+					TextSize = 12,
+					TextColor3 = Theme.TextPrimary,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					Parent = textContainer,
+				})
+
+				create("TextLabel", {
+					Size = UDim2.new(1, 0, 0, 14),
+					Position = UDim2.fromOffset(0, 29),
+					BackgroundTransparency = 1,
+					Text = desc,
+					Font = Enum.Font.Gotham,
+					TextSize = 11,
+					TextColor3 = Theme.TextSecondary,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					TextTruncate = Enum.TextTruncate.AtEnd,
+					Parent = textContainer,
+				})
+			else
+				create("TextLabel", {
+					Size = UDim2.new(1, 0, 1, 0),
+					BackgroundTransparency = 1,
+					Text = title,
+					Font = Enum.Font.GothamMedium,
+					TextSize = 12,
+					TextColor3 = Theme.TextPrimary,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					Parent = textContainer,
+				})
+			end
+
+			local track = create("Frame", {
+				Size = UDim2.fromOffset(38, 20),
+				Position = UDim2.new(1, -52, 0.5, -10),
+				BackgroundColor3 = state and Theme.Accent or Theme.ToggleOff,
+				BorderSizePixel = 0,
+				Parent = card,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+			})
+
+			local knob = create("Frame", {
+				Size = UDim2.fromOffset(14, 14),
+				Position = state and UDim2.fromOffset(21, 3) or UDim2.fromOffset(3, 3),
+				BackgroundColor3 = state and Theme.KnobOn or Theme.KnobOff,
+				BorderSizePixel = 0,
+				Parent = track,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+			})
+
+			local hit = create("TextButton", {
+				Size = UDim2.fromScale(1, 1),
+				BackgroundTransparency = 1,
+				Text = "",
+				AutoButtonColor = false,
+				Parent = card,
+			})
+
+			local function render()
+				tween(track, { BackgroundColor3 = state and Theme.Accent or Theme.ToggleOff })
+				tween(knob, {
+					Position = state and UDim2.fromOffset(21, 3) or UDim2.fromOffset(3, 3),
+					BackgroundColor3 = state and Theme.KnobOn or Theme.KnobOff,
+				})
+			end
+
+			trackConnection(hit.MouseEnter:Connect(function()
+				tween(card, { BackgroundColor3 = Theme.SurfaceHover })
+			end))
+			trackConnection(hit.MouseLeave:Connect(function()
+				tween(card, { BackgroundColor3 = Theme.Surface })
+			end))
+
+			local api = {}
+			function api:Set(val, silent)
+				state = val == true
+				render()
+				if not silent and callback then
+					task.spawn(callback, state)
+				end
+			end
+			function api:Get()
+				return state
+			end
+
+			trackConnection(hit.MouseButton1Click:Connect(function()
+				api:Set(not state, false)
+			end))
+
+			if state and callback then
+				task.spawn(callback, true)
+			end
+
+			return api
+		end
+
+		function tabObj:AddSegmented(cfg)
+			local options = cfg.Options or {}
+			local current = cfg.Default or options[1]
+			local title = cfg.Title or "Mode"
+			local callback = cfg.Callback
+
+			local card = create("Frame", {
+				Size = UDim2.new(1, 0, 0, 44),
+				BackgroundColor3 = Theme.Surface,
+				BorderSizePixel = 0,
+				Parent = page,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(0, 9) }),
+				create("UIStroke", {
+					Color = Theme.BorderSoft,
+					Thickness = 1,
+				}),
+			})
+
+			create("TextLabel", {
+				Size = UDim2.new(0.42, -14, 1, 0),
+				Position = UDim2.fromOffset(14, 0),
+				BackgroundTransparency = 1,
+				Text = title,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 12,
+				TextColor3 = Theme.TextSecondary,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				Parent = card,
+			})
+
+			local segHolder = create("Frame", {
+				Size = UDim2.new(0.58, -10, 0, 28),
+				Position = UDim2.new(0.42, 0, 0.5, -14),
+				BackgroundColor3 = Theme.Bg,
+				BorderSizePixel = 0,
+				Parent = card,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(0, 7) }),
+				create("UIPadding", {
+					PaddingLeft = UDim.new(0, 3),
+					PaddingRight = UDim.new(0, 3),
+					PaddingTop = UDim.new(0, 3),
+					PaddingBottom = UDim.new(0, 3),
+				}),
+				create("UIListLayout", {
+					FillDirection = Enum.FillDirection.Horizontal,
+					VerticalAlignment = Enum.VerticalAlignment.Center,
+					Padding = UDim.new(0, 3),
+				}),
+			})
+
+			local buttons = {}
+			local segWidth = 1 / math.max(1, #options)
+
+			local function selectOption(opt, silent)
+				current = opt
+				for name, btn in pairs(buttons) do
+					local active = (name == opt)
+					tween(btn, {
+						BackgroundColor3 = active and Theme.Accent or Theme.Bg,
+						BackgroundTransparency = active and 0 or 1,
+						TextColor3 = active and Theme.AccentText or Theme.TextSecondary,
+					})
+				end
+				if not silent and callback then
+					task.spawn(callback, opt)
+				end
+			end
+
+			for _, opt in ipairs(options) do
+				local btn = create("TextButton", {
+					Size = UDim2.new(segWidth, -2, 1, 0),
+					BackgroundColor3 = Theme.Bg,
+					BackgroundTransparency = 1,
+					Text = opt,
+					Font = Enum.Font.GothamMedium,
+					TextSize = 11,
+					TextColor3 = Theme.TextSecondary,
+					AutoButtonColor = false,
+					Parent = segHolder,
+				}, {
+					create("UICorner", { CornerRadius = UDim.new(0, 5) }),
+				})
+				buttons[opt] = btn
+				trackConnection(btn.MouseButton1Click:Connect(function()
+					selectOption(opt, false)
+				end))
+			end
+
+			selectOption(current, true)
+
+			return {
+				Set = function(_, opt, silent)
+					selectOption(opt, silent)
+				end,
+				Get = function()
+					return current
+				end,
+			}
+		end
+
+		function tabObj:AddSlider(cfg)
+			local title = cfg.Title or "Value"
+			local minVal = cfg.Min or 0
+			local maxVal = cfg.Max or 100
+			local step = cfg.Step or 1
+			local suffix = cfg.Suffix or ""
+			local current = math.clamp(cfg.Default or minVal, minVal, maxVal)
+			local callback = cfg.Callback
+
+			local card = create("Frame", {
+				Size = UDim2.new(1, 0, 0, 52),
+				BackgroundColor3 = Theme.Surface,
+				BorderSizePixel = 0,
+				Parent = page,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(0, 9) }),
+				create("UIStroke", {
+					Color = Theme.BorderSoft,
+					Thickness = 1,
+				}),
+			})
+
+			create("TextLabel", {
+				Size = UDim2.new(0.6, -14, 0, 18),
+				Position = UDim2.fromOffset(14, 8),
+				BackgroundTransparency = 1,
+				Text = title,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 12,
+				TextColor3 = Theme.TextPrimary,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				Parent = card,
+			})
+
+			local valLabel = create("TextLabel", {
+				Size = UDim2.new(0.4, -14, 0, 18),
+				Position = UDim2.new(0.6, 0, 0, 8),
+				BackgroundTransparency = 1,
+				Text = tostring(current) .. suffix,
+				Font = Enum.Font.RobotoMono,
+				TextSize = 11,
+				TextColor3 = Theme.TextSecondary,
+				TextXAlignment = Enum.TextXAlignment.Right,
+				Parent = card,
+			})
+
+			local trackBg = create("Frame", {
+				Size = UDim2.new(1, -28, 0, 5),
+				Position = UDim2.fromOffset(14, 34),
+				BackgroundColor3 = Theme.ToggleOff,
+				BorderSizePixel = 0,
+				Parent = card,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+			})
+
+			local pct = (current - minVal) / math.max(0.0001, maxVal - minVal)
+			local fill = create("Frame", {
+				Size = UDim2.fromScale(pct, 1),
+				BackgroundColor3 = Theme.Accent,
+				BorderSizePixel = 0,
+				Parent = trackBg,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+			})
+
+			local knob = create("Frame", {
+				Size = UDim2.fromOffset(11, 11),
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(pct, 0.5),
+				BackgroundColor3 = Theme.Accent,
+				BorderSizePixel = 0,
+				Parent = trackBg,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+			})
+
+			local hit = create("TextButton", {
+				Size = UDim2.new(1, -20, 0, 22),
+				Position = UDim2.fromOffset(10, 25),
+				BackgroundTransparency = 1,
+				Text = "",
+				AutoButtonColor = false,
+				Parent = card,
+			})
+
+			local function setVal(val, silent)
+				local snapped = math.floor((val - minVal) / step + 0.5) * step + minVal
+				current = math.clamp(snapped, minVal, maxVal)
+				local alpha = (current - minVal) / math.max(0.0001, maxVal - minVal)
+				fill.Size = UDim2.fromScale(alpha, 1)
+				knob.Position = UDim2.fromScale(alpha, 0.5)
+				valLabel.Text = tostring(current) .. suffix
+				if not silent and callback then
+					task.spawn(callback, current)
+				end
+			end
+
+			local sliding = false
+			local function updateFromInput(posX)
+				local absPos = trackBg.AbsolutePosition.X
+				local absWidth = math.max(1, trackBg.AbsoluteSize.X)
+				local alpha = math.clamp((posX - absPos) / absWidth, 0, 1)
+				setVal(minVal + alpha * (maxVal - minVal), false)
+			end
+
+			trackConnection(hit.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+					sliding = true
+					updateFromInput(input.Position.X)
+				end
+			end))
+			trackConnection(UserInputService.InputChanged:Connect(function(input)
+				if sliding and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+					updateFromInput(input.Position.X)
+				end
+			end))
+			trackConnection(UserInputService.InputEnded:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+					sliding = false
+				end
+			end))
+
+			return {
+				Set = function(_, v, silent)
+					setVal(v, silent)
+				end,
+				Get = function()
+					return current
+				end,
+			}
+		end
+
+		function tabObj:AddStatusCard(cfg)
+			local title = cfg.Title or "Status"
+			local value = cfg.Value or "—"
+
+			local card = create("Frame", {
+				Size = UDim2.new(1, 0, 0, 36),
+				BackgroundColor3 = Theme.Surface,
+				BorderSizePixel = 0,
+				Parent = page,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(0, 9) }),
+				create("UIStroke", {
+					Color = Theme.BorderSoft,
+					Thickness = 1,
+				}),
+			})
+
+			create("TextLabel", {
+				Size = UDim2.new(0.42, -14, 1, 0),
+				Position = UDim2.fromOffset(14, 0),
+				BackgroundTransparency = 1,
+				Text = title,
+				Font = Enum.Font.Gotham,
+				TextSize = 11,
+				TextColor3 = Theme.TextSecondary,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				Parent = card,
+			})
+
+			local valLabel = create("TextLabel", {
+				Size = UDim2.new(0.58, -14, 1, 0),
+				Position = UDim2.new(0.42, 0, 0, 0),
+				BackgroundTransparency = 1,
+				Text = value,
+				Font = Enum.Font.RobotoMono,
+				TextSize = 11,
+				TextColor3 = Theme.TextPrimary,
+				TextXAlignment = Enum.TextXAlignment.Right,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Parent = card,
+			})
+
+			local pendingText = value
+			local dirty = false
+
+			local function flushLabel()
+				if not dirty then
+					return
+				end
+				if pcall(function()
+					valLabel.Text = pendingText
+				end) then
+					dirty = false
+				end
+			end
+
+			State.StatusFlushers = State.StatusFlushers or {}
+			table.insert(State.StatusFlushers, flushLabel)
+
+			return {
+				Set = function(_, text)
+					pendingText = tostring(text)
+					if not pcall(function()
+						valLabel.Text = pendingText
+					end) then
+						dirty = true
+					else
+						dirty = false
+					end
+				end,
+			}
+		end
+
+		function tabObj:AddButton(cfg)
+			local title = cfg.Title or "Action"
+			local callback = cfg.Callback
+
+			local btn = create("TextButton", {
+				Size = UDim2.new(1, 0, 0, 36),
+				BackgroundColor3 = Theme.Surface,
+				Text = title,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 12,
+				TextColor3 = Theme.TextPrimary,
+				AutoButtonColor = false,
+				Parent = page,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(0, 9) }),
+				create("UIStroke", {
+					Color = Theme.BorderSoft,
+					Thickness = 1,
+				}),
+			})
+
+			trackConnection(btn.MouseEnter:Connect(function()
+				tween(btn, { BackgroundColor3 = Theme.SurfaceHover })
+			end))
+			trackConnection(btn.MouseLeave:Connect(function()
+				tween(btn, { BackgroundColor3 = Theme.Surface })
+			end))
+			trackConnection(btn.MouseButton1Click:Connect(function()
+				if callback then
+					task.spawn(callback)
+				end
+			end))
+
+			return btn
+		end
+
+		function tabObj:AddInput(cfg)
+			local placeholder = cfg.Placeholder or "Enter text..."
+			local buttonText = cfg.ButtonText or "Run"
+			local callback = cfg.Callback
+
+			local card = create("Frame", {
+				Size = UDim2.new(1, 0, 0, 40),
+				BackgroundColor3 = Theme.Surface,
+				BorderSizePixel = 0,
+				Parent = page,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(0, 9) }),
+				create("UIStroke", {
+					Color = Theme.BorderSoft,
+					Thickness = 1,
+				}),
+			})
+
+			local box = create("TextBox", {
+				Size = UDim2.new(1, -92, 0, 26),
+				Position = UDim2.fromOffset(8, 7),
+				BackgroundColor3 = Theme.Bg,
+				PlaceholderText = placeholder,
+				PlaceholderColor3 = Theme.TextMuted,
+				Text = "",
+				Font = Enum.Font.RobotoMono,
+				TextSize = 11,
+				TextColor3 = Theme.TextPrimary,
+				ClearTextOnFocus = false,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				Parent = card,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(0, 6) }),
+				create("UIPadding", {
+					PaddingLeft = UDim.new(0, 8),
+					PaddingRight = UDim.new(0, 8),
+				}),
+			})
+
+			local runBtn = create("TextButton", {
+				Size = UDim2.fromOffset(70, 26),
+				Position = UDim2.new(1, -78, 0, 7),
+				BackgroundColor3 = Theme.Accent,
+				Text = buttonText,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 11,
+				TextColor3 = Theme.AccentText,
+				AutoButtonColor = false,
+				Parent = card,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(0, 6) }),
+			})
+
+			trackConnection(runBtn.MouseButton1Click:Connect(function()
+				if callback then
+					task.spawn(callback, box.Text, box)
+				end
+			end))
+
+			return box
+		end
+
+		function tabObj:AddDropdown(cfg)
+			local title = cfg.Title or "Select"
+			local options = cfg.Options or {}
+			local current = cfg.Default or options[1]
+			local callback = cfg.Callback
+			local expanded = false
+
+			local headerH = 42
+			local rowH = 28
+			local listPad = 6
+			local maxVisibleRows = math.min(#options, 5)
+			local listHeight = (maxVisibleRows * rowH) + (math.max(0, maxVisibleRows - 1) * 4) + (listPad * 2)
+			local expandedHeight = headerH + listHeight + 2
+
+			local card = create("Frame", {
+				Size = UDim2.new(1, 0, 0, headerH),
+				BackgroundColor3 = Theme.Surface,
+				BorderSizePixel = 0,
+				ClipsDescendants = true,
+				Parent = page,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(0, 9) }),
+				create("UIStroke", {
+					Color = Theme.BorderSoft,
+					Thickness = 1,
+				}),
+			})
+
+			local topBtn = create("TextButton", {
+				Size = UDim2.new(1, 0, 0, headerH),
+				BackgroundTransparency = 1,
+				Text = "",
+				AutoButtonColor = false,
+				Parent = card,
+			})
+
+			create("TextLabel", {
+				Size = UDim2.new(0.45, -14, 1, 0),
+				Position = UDim2.fromOffset(14, 0),
+				BackgroundTransparency = 1,
+				Text = title,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 12,
+				TextColor3 = Theme.TextPrimary,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				Parent = topBtn,
+			})
+
+			local valueLabel = create("TextLabel", {
+				Size = UDim2.new(0.55, -34, 1, 0),
+				Position = UDim2.new(0.45, 0, 0, 0),
+				BackgroundTransparency = 1,
+				Text = tostring(current or "—"),
+				Font = Enum.Font.RobotoMono,
+				TextSize = 11,
+				TextColor3 = Theme.TextSecondary,
+				TextXAlignment = Enum.TextXAlignment.Right,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Parent = topBtn,
+			})
+
+			local chevron = create("TextLabel", {
+				Size = UDim2.fromOffset(18, headerH),
+				Position = UDim2.new(1, -28, 0, 0),
+				BackgroundTransparency = 1,
+				Text = "▾",
+				Font = Enum.Font.GothamMedium,
+				TextSize = 12,
+				TextColor3 = Theme.TextMuted,
+				Parent = topBtn,
+			})
+
+			create("Frame", {
+				Size = UDim2.new(1, -20, 0, 1),
+				Position = UDim2.fromOffset(10, headerH),
+				BackgroundColor3 = Theme.BorderSoft,
+				BorderSizePixel = 0,
+				Parent = card,
+			})
+
+			local listHolder = create("ScrollingFrame", {
+				Size = UDim2.new(1, -16, 0, listHeight),
+				Position = UDim2.fromOffset(8, headerH + 1),
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				ScrollBarThickness = 2,
+				ScrollBarImageColor3 = Theme.Border,
+				AutomaticCanvasSize = Enum.AutomaticSize.Y,
+				CanvasSize = UDim2.fromOffset(0, 0),
+				ScrollingDirection = Enum.ScrollingDirection.Y,
+				Parent = card,
+			}, {
+				create("UIPadding", {
+					PaddingTop = UDim.new(0, listPad),
+					PaddingBottom = UDim.new(0, listPad),
+				}),
+				create("UIListLayout", {
+					SortOrder = Enum.SortOrder.LayoutOrder,
+					Padding = UDim.new(0, 4),
+				}),
+			})
+
+			local optionBtns = {}
+
+			local function setExpanded(isOpen)
+				expanded = isOpen
+				chevron.Text = expanded and "▴" or "▾"
+				tween(card, {
+					Size = UDim2.new(1, 0, 0, expanded and expandedHeight or headerH),
+				}, TweenSmooth)
+			end
+
+			local function selectValue(opt, silent)
+				current = opt
+				valueLabel.Text = tostring(opt)
+				for name, btn in pairs(optionBtns) do
+					local active = (name == opt)
+					tween(btn, {
+						BackgroundColor3 = active and Theme.Accent or Theme.Bg,
+						BackgroundTransparency = active and 0 or 0.35,
+						TextColor3 = active and Theme.AccentText or Theme.TextSecondary,
+					})
+				end
+				if not silent and callback then
+					task.spawn(callback, opt)
+				end
+			end
+
+			local function rebuildOptions(newOptions)
+				options = newOptions or {}
+				for _, child in ipairs(listHolder:GetChildren()) do
+					if child:IsA("TextButton") then
+						child:Destroy()
+					end
+				end
+				table.clear(optionBtns)
+
+				local visibleRows = math.min(#options, 5)
+				listHeight = (visibleRows * rowH) + (math.max(0, visibleRows - 1) * 4) + (listPad * 2)
+				expandedHeight = headerH + listHeight + 2
+				listHolder.Size = UDim2.new(1, -16, 0, listHeight)
+
+				for idx, opt in ipairs(options) do
+					local optBtn = create("TextButton", {
+						LayoutOrder = idx,
+						Size = UDim2.new(1, 0, 0, rowH),
+						BackgroundColor3 = Theme.Bg,
+						BackgroundTransparency = 0.35,
+						Text = "  " .. tostring(opt),
+						Font = Enum.Font.GothamMedium,
+						TextSize = 11,
+						TextColor3 = Theme.TextSecondary,
+						TextXAlignment = Enum.TextXAlignment.Left,
+						AutoButtonColor = false,
+						Parent = listHolder,
+					}, {
+						create("UICorner", { CornerRadius = UDim.new(0, 7) }),
+					})
+
+					optionBtns[opt] = optBtn
+
+					trackConnection(optBtn.MouseEnter:Connect(function()
+						if current ~= opt then
+							tween(optBtn, { BackgroundTransparency = 0, TextColor3 = Theme.TextPrimary })
+						end
+					end))
+					trackConnection(optBtn.MouseLeave:Connect(function()
+						if current ~= opt then
+							tween(optBtn, { BackgroundTransparency = 0.35, TextColor3 = Theme.TextSecondary })
+						end
+					end))
+					trackConnection(optBtn.MouseButton1Click:Connect(function()
+						selectValue(opt, false)
+						setExpanded(false)
+					end))
+				end
+
+				if expanded then
+					card.Size = UDim2.new(1, 0, 0, expandedHeight)
+				end
+			end
+
+			rebuildOptions(options)
+
+			trackConnection(topBtn.MouseEnter:Connect(function()
+				tween(card, { BackgroundColor3 = Theme.SurfaceHover })
+			end))
+			trackConnection(topBtn.MouseLeave:Connect(function()
+				tween(card, { BackgroundColor3 = Theme.Surface })
+			end))
+			trackConnection(topBtn.MouseButton1Click:Connect(function()
+				setExpanded(not expanded)
+			end))
+
+			selectValue(current, true)
+
+			return {
+				Set = function(_, opt, silent)
+					selectValue(opt, silent)
+				end,
+				SetOptions = function(_, newOptions, newDefault)
+					rebuildOptions(newOptions)
+					local target = newDefault
+					if not target or not optionBtns[target] then
+						target = optionBtns[current] and current or newOptions[1]
+					end
+					if target ~= nil then
+						selectValue(target, true)
+					end
+				end,
+				Get = function()
+					return current
+				end,
+			}
+		end
+
+		return tabObj
+	end
+
+	return Window
+end
+
+--// Shared Arcane 101 Module Loader (Auto-Discovers Live Game Data)
+local GameMods
+local GameModsError = nil
+local LiveBossIds = {}
+
+local function safeRequire(inst)
+	if not inst then
+		return nil
+	end
+	local ok, mod = pcall(require, inst)
+	if ok then
+		return mod
+	end
+	return nil
+end
+
+local function countKeys(tbl)
+	local n = 0
+	if type(tbl) == "table" then
+		for _ in pairs(tbl) do
+			n += 1
+		end
+	end
+	return n
+end
+
+local function getGameMods(forceReload)
+	if GameMods and not forceReload then
+		return GameMods
+	end
+	local ok, result = pcall(function()
+		local Campaign = ReplicatedStorage:WaitForChild("Campaign", 5)
+		local playerScripts = LocalPlayer:WaitForChild("PlayerScripts", 5)
+		local client = playerScripts:WaitForChild("CampaignClient", 5)
+
+		local Areas = safeRequire(Campaign.Data:FindFirstChild("Areas")) or {}
+		local Enemies = safeRequire(Campaign.Data:FindFirstChild("Enemies"))
+		local Carnival = safeRequire(Campaign.Data:FindFirstChild("Carnival")) or {}
+		local Version = safeRequire(Campaign.Shared:FindFirstChild("Version"))
+		local Build = safeRequire(Campaign.Shared:FindFirstChild("Build"))
+
+		local bossEnemyIds = {}
+		for k, v in pairs(LiveBossIds) do
+			bossEnemyIds[k] = v
+		end
+		for _, area in pairs(Areas) do
+			if type(area) == "table" and type(area.boss) == "table" then
+				if type(area.boss.enemyId) == "string" then
+					bossEnemyIds[area.boss.enemyId] = true
+				end
+				if type(area.boss.with) == "table" then
+					for _, subId in ipairs(area.boss.with) do
+						if type(subId) == "string" then
+							bossEnemyIds[subId] = true
+						end
+					end
+				end
+			end
+		end
+		if type(Enemies) == "table" then
+			for id, e in pairs(Enemies) do
+				if type(e) == "table" and (e.isBoss == true or e.boss == true or e.kind == "Boss" or e.tier == "Boss") then
+					bossEnemyIds[id] = true
+				end
+			end
+		end
+
+		local Abilities = require(Campaign.Data.Abilities)
+		local Statuses = require(Campaign.Data.Statuses)
+		local Items = safeRequire(Campaign.Data:FindFirstChild("Items")) or {}
+		local Encounters = safeRequire(Campaign.Data:FindFirstChild("Encounters")) or {}
+		local Trivia = safeRequire(Campaign.Data:FindFirstChild("Trivia")) or {}
+		local NewLandsSpots = safeRequire(Campaign.Data:FindFirstChild("NewLandsSpots")) or {}
+
+		return {
+			Campaign = Campaign,
+			Net = require(Campaign.Shared.Net),
+			Enums = require(Campaign.Shared.Enums),
+			Abilities = Abilities,
+			Statuses = Statuses,
+			Items = Items,
+			Encounters = Encounters,
+			Trivia = Trivia,
+			Carnival = Carnival,
+			NewLandsSpots = NewLandsSpots,
+			BossEnemyIds = bossEnemyIds,
+			VersionId = (type(Version) == "table" and Version.id) or (Build and tostring(Build)) or "?",
+			Stats = {
+				Abilities = countKeys(Abilities),
+				Bosses = countKeys(bossEnemyIds),
+				Trivia = #Trivia,
+				Encounters = countKeys(Encounters),
+				Items = countKeys(Items),
+			},
+			CombatSim = require(Campaign.Systems.CombatSim),
+			CombatMath = safeRequire(Campaign.Systems:FindFirstChild("CombatMath")),
+			Inventory = safeRequire(Campaign.Systems:FindFirstChild("Inventory")),
+			Schools = safeRequire(Campaign.Shared:FindFirstChild("Schools")),
+			Constants = safeRequire(Campaign.Shared:FindFirstChild("Constants")),
+			MinigamesSys = safeRequire(Campaign.Systems:FindFirstChild("Minigames")),
+			CombatUI = require(client.UI.CombatUI),
+			Place = safeRequire(client:FindFirstChild("Place")),
+			Vfx = safeRequire(client.Effects and client.Effects:FindFirstChild("Vfx")),
+			Cinema = safeRequire(client.Effects and client.Effects:FindFirstChild("Cinema")),
+		}
+	end)
+	if ok and result then
+		GameMods = result
+		GameModsError = nil
+		return GameMods
+	end
+	GameModsError = tostring(result)
+	return nil
+end
+
+local function teleportToPosition(pos)
+	local char = LocalPlayer.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if root and root:IsA("BasePart") then
+		root.CFrame = CFrame.new(pos + Vector3.new(0, 3.5, 0))
+		return true
+	end
+	return false
+end
+
+--// Initialize Window
+local Window = UI.CreateWindow({
+	Title = "ARCANE 101",
+	Subtitle = "MONOCHROME",
+	Width = 432,
+	Height = 384,
+	ToggleKey = Enum.KeyCode.RightShift,
+})
+
+--// =========================================================================
+--// TAB 1: GENERAL (Anti-AFK, Movement, FPS Boost)
+--// =========================================================================
+local GeneralTab = Window:AddTab("General")
+
+local AntiAFK = {
+	Enabled = true,
+	Mode = "Idled + Pulse",
+	BlockedCount = 0,
+	StartedAt = os.clock(),
+	IdledConn = nil,
+}
+
+local function sendVirtualNudge()
+	pcall(function()
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.new(0, 0))
+	end)
+end
+
+GeneralTab:AddSection("Protection")
+
+local antiAfkStatus
+
+local function updateAntiAfkReadout()
+	if not antiAfkStatus then
+		return
+	end
+	if not AntiAFK.Enabled then
+		antiAfkStatus:Set("PAUSED · " .. tostring(AntiAFK.BlockedCount) .. " blocked")
+		Window:SetStatus("ANTI-AFK · PAUSED")
+	else
+		local elapsed = math.floor(os.clock() - AntiAFK.StartedAt)
+		antiAfkStatus:Set(string.format("%02dm %02ds · %d blocked", math.floor(elapsed / 60), elapsed % 60, AntiAFK.BlockedCount))
+		Window:SetStatus("ANTI-AFK · ACTIVE")
+	end
+end
+
+local function setAntiAfkEnabled(enabled)
+	AntiAFK.Enabled = enabled
+	if AntiAFK.IdledConn then
+		pcall(function()
+			AntiAFK.IdledConn:Disconnect()
+		end)
+		AntiAFK.IdledConn = nil
+	end
+	if enabled then
+		AntiAFK.StartedAt = os.clock()
+		AntiAFK.IdledConn = trackConnection(LocalPlayer.Idled:Connect(function()
+			if not State.Alive or not AntiAFK.Enabled then
+				return
+			end
+			sendVirtualNudge()
+			AntiAFK.BlockedCount += 1
+			updateAntiAfkReadout()
+		end))
+	end
+	updateAntiAfkReadout()
+end
+
+GeneralTab:AddToggle({
+	Title = "Anti-AFK",
+	Description = "Prevents 20-minute idle disconnect silently",
+	Default = Config.Get("AntiAFK", true),
+	Callback = function(enabled)
+		Config.Set("AntiAFK", enabled)
+		setAntiAfkEnabled(enabled)
+	end,
+})
+
+GeneralTab:AddSegmented({
+	Title = "Method",
+	Options = { "Idled", "Hybrid" },
+	Default = Config.Get("AntiAFKMethod", "Hybrid"),
+	Callback = function(mode)
+		Config.Set("AntiAFKMethod", mode)
+		AntiAFK.Mode = (mode == "Idled") and "Idled" or "Idled + Pulse"
+	end,
+})
+
+antiAfkStatus = GeneralTab:AddStatusCard({
+	Title = "AFK Telemetry",
+	Value = "00m 00s · 0 blocked",
+})
+updateAntiAfkReadout()
+
+GeneralTab:AddSection("Movement & Performance")
+
+local Movement = {
+	SpeedEnabled = Config.Get("SpeedEnabled", false),
+	WalkSpeed = Config.Get("WalkSpeed", 32),
+	DefaultWalkSpeed = 16,
+}
+
+local function applyWalkSpeed()
+	local char = LocalPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum then
+		if Movement.SpeedEnabled then
+			hum.WalkSpeed = Movement.WalkSpeed
+		else
+			hum.WalkSpeed = Movement.DefaultWalkSpeed
+		end
+	end
+end
+
+GeneralTab:AddToggle({
+	Title = "Custom WalkSpeed",
+	Description = "Overrides lobby & exploration movement speed",
+	Default = Movement.SpeedEnabled,
+	Callback = function(enabled)
+		Movement.SpeedEnabled = enabled
+		Config.Set("SpeedEnabled", enabled)
+		applyWalkSpeed()
+	end,
+})
+
+GeneralTab:AddSlider({
+	Title = "WalkSpeed",
+	Min = 16,
+	Max = 80,
+	Step = 2,
+	Default = Movement.WalkSpeed,
+	Suffix = " ws",
+	Callback = function(val)
+		Movement.WalkSpeed = val
+		Config.Set("WalkSpeed", val)
+		if Movement.SpeedEnabled then
+			applyWalkSpeed()
+		end
+	end,
+})
+
+trackConnection(LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(0.25)
+	if State.Alive and Movement.SpeedEnabled then
+		applyWalkSpeed()
+	end
+end))
+
+local savedFxState = {}
+GeneralTab:AddToggle({
+	Title = "FPS Boost (Low FX)",
+	Description = "Disables world particles & global shadows",
+	Default = Config.Get("FastFX", false),
+	Callback = function(enabled)
+		Config.Set("FastFX", enabled)
+		if enabled then
+			savedFxState.GlobalShadows = Lighting.GlobalShadows
+			Lighting.GlobalShadows = false
+			for _, inst in ipairs(workspace:GetDescendants()) do
+				if inst:IsA("ParticleEmitter") or inst:IsA("Trail") then
+					if savedFxState[inst] == nil then
+						savedFxState[inst] = inst.Enabled
+					end
+					inst.Enabled = false
+				end
+			end
+		else
+			if savedFxState.GlobalShadows ~= nil then
+				Lighting.GlobalShadows = savedFxState.GlobalShadows
+			end
+			for inst, wasEnabled in pairs(savedFxState) do
+				if typeof(inst) == "Instance" and inst.Parent then
+					inst.Enabled = wasEnabled
+				end
+			end
+			table.clear(savedFxState)
+		end
+	end,
+})
+
+trackRestore(function()
+	if Movement.SpeedEnabled then
+		Movement.SpeedEnabled = false
+		applyWalkSpeed()
+	end
+	if savedFxState.GlobalShadows ~= nil then
+		Lighting.GlobalShadows = savedFxState.GlobalShadows
+	end
+	for inst, wasEnabled in pairs(savedFxState) do
+		if typeof(inst) == "Instance" and inst.Parent then
+			inst.Enabled = wasEnabled
+		end
+	end
+end)
+
+GeneralTab:AddButton({
+	Title = "Rejoin Current Server",
+	Callback = function()
+		TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+	end,
+})
+
+trackThread(function()
+	local lastPulse = os.clock()
+	while State.Alive do
+		task.wait(1)
+		if not State.Alive then
+			break
+		end
+		if Movement.SpeedEnabled then
+			local char = LocalPlayer.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if hum and hum.WalkSpeed ~= Movement.WalkSpeed then
+				hum.WalkSpeed = Movement.WalkSpeed
+			end
+		end
+		if AntiAFK.Enabled then
+			if AntiAFK.Mode == "Idled + Pulse" and (os.clock() - lastPulse) >= 90 then
+				lastPulse = os.clock()
+				sendVirtualNudge()
+				AntiAFK.BlockedCount += 1
+			end
+			updateAntiAfkReadout()
+		end
+	end
+end)
+
+--// =========================================================================
+--// TAB 2: COMBAT AUTOMATION (Attack/Support, Heal Override, Discard, Trivia, Speedup)
+--// =========================================================================
+local CombatTab = Window:AddTab("Combat")
+
+local CombatAuto = {
+	Enabled = Config.Get("AutoCombat", false),
+	Style = Config.Get("AttackStyle", "Attack"),
+	TargetPriority = Config.Get("TargetPriority", "Smart Effective"),
+	SavePipMinCost = 4,
+	AutoHeal = Config.Get("AutoHeal", false),
+	HealThreshold = (tonumber(string.match(tostring(Config.Get("HealBelow", "50%")), "%d+")) or 50) / 100,
+	AutoDiscard = Config.Get("AutoDiscard", false),
+	AutoTrivia = Config.Get("AutoTrivia", true),
+	FastPlayback = Config.Get("FastPlayback", false),
+	AutoPass = Config.Get("AutoPass", true),
+	Busy = false,
+	LastActionAt = 0,
+	LastDiscardTurnKey = nil,
+}
+
+CombatTab:AddSection("Combat Automation")
+
+local combatStatusCard
+local function setCombatStatus(text)
+	if combatStatusCard then
+		combatStatusCard:Set(text)
+	end
+end
+
+CombatTab:AddToggle({
+	Title = "Auto Combat",
+	Description = "Smart AI: lethal finish, no-overkill, buffs & boss pip saver",
+	Default = CombatAuto.Enabled,
+	Callback = function(enabled)
+		CombatAuto.Enabled = enabled
+		Config.Set("AutoCombat", enabled)
+		setCombatStatus(enabled and "READY · WAITING TURN" or "IDLE")
+		if enabled then
+			CombatAuto.LastActionAt = 0
+		end
+	end,
+})
+
+CombatTab:AddDropdown({
+	Title = "Attack Style",
+	Options = { "Attack", "Support" },
+	Default = CombatAuto.Style,
+	Callback = function(choice)
+		CombatAuto.Style = choice
+		Config.Set("AttackStyle", choice)
+	end,
+})
+
+CombatTab:AddDropdown({
+	Title = "Target Priority",
+	Options = { "Smart Effective", "Lowest HP", "Highest HP", "Boss First" },
+	Default = CombatAuto.TargetPriority,
+	Callback = function(choice)
+		CombatAuto.TargetPriority = choice
+		Config.Set("TargetPriority", choice)
+	end,
+})
+
+CombatTab:AddToggle({
+	Title = "Auto Use Healing Cards",
+	Description = "Bypasses style to heal self or low-HP allies",
+	Default = CombatAuto.AutoHeal,
+	Callback = function(enabled)
+		CombatAuto.AutoHeal = enabled
+		Config.Set("AutoHeal", enabled)
+	end,
+})
+
+CombatTab:AddSegmented({
+	Title = "Heal Below",
+	Options = { "35%", "50%", "65%" },
+	Default = Config.Get("HealBelow", "50%"),
+	Callback = function(pct)
+		Config.Set("HealBelow", pct)
+		CombatAuto.HealThreshold = (tonumber(string.match(pct, "%d+")) or 50) / 100
+	end,
+})
+
+CombatTab:AddSection("OP Combat Helpers")
+
+CombatTab:AddToggle({
+	Title = "Auto Trivia Solver",
+	Description = "Auto-votes guaranteed correct answer for free pips",
+	Default = CombatAuto.AutoTrivia,
+	Callback = function(enabled)
+		CombatAuto.AutoTrivia = enabled
+		Config.Set("AutoTrivia", enabled)
+	end,
+})
+
+local origCinemaRemaining = nil
+local function applyFastPlayback(enabled)
+	local mods = getGameMods()
+	if not mods then
+		return
+	end
+	if mods.Vfx and type(mods.Vfx.hurryDeaths) == "function" then
+		pcall(function()
+			mods.Vfx.hurryDeaths(enabled)
+		end)
+	end
+	if mods.Cinema then
+		if enabled then
+			if not origCinemaRemaining and type(mods.Cinema.remaining) == "function" then
+				origCinemaRemaining = mods.Cinema.remaining
+			end
+			mods.Cinema.remaining = function()
+				return 0
+			end
+		elseif origCinemaRemaining then
+			mods.Cinema.remaining = origCinemaRemaining
+		end
+	end
+end
+
+trackRestore(function()
+	if origCinemaRemaining then
+		local mods = getGameMods()
+		if mods and mods.Cinema then
+			mods.Cinema.remaining = origCinemaRemaining
+		end
+		if mods and mods.Vfx then
+			pcall(mods.Vfx.hurryDeaths, false)
+		end
+	end
+end)
+
+CombatTab:AddToggle({
+	Title = "Fast Combat Playback",
+	Description = "Skips cinematic waits & hurries death VFX",
+	Default = CombatAuto.FastPlayback,
+	Callback = function(enabled)
+		CombatAuto.FastPlayback = enabled
+		Config.Set("FastPlayback", enabled)
+		applyFastPlayback(enabled)
+	end,
+})
+
+CombatTab:AddToggle({
+	Title = "Auto Discard Bricks",
+	Description = "Discards off-style cards when stuck before passing",
+	Default = CombatAuto.AutoDiscard,
+	Callback = function(enabled)
+		CombatAuto.AutoDiscard = enabled
+		Config.Set("AutoDiscard", enabled)
+	end,
+})
+
+CombatTab:AddToggle({
+	Title = "Auto Pass",
+	Description = "Pass turn if no matching cards are playable",
+	Default = CombatAuto.AutoPass,
+	Callback = function(enabled)
+		CombatAuto.AutoPass = enabled
+		Config.Set("AutoPass", enabled)
+	end,
+})
+
+combatStatusCard = CombatTab:AddStatusCard({
+	Title = "Combat Status",
+	Value = "IDLE",
+})
+
+-- Combat Helper Functions
+local function hasStatusTag(statusDef, tag)
+	if not statusDef or type(statusDef.tags) ~= "table" then
+		return false
+	end
+	return table.find(statusDef.tags, tag) ~= nil
+end
+
+local LiveCombat = {
+	State = nil,
+	MyId = nil,
+	TurnActorId = nil,
+	LastGcScan = 0,
+}
+
+local function findMyCombatantId(state)
+	if type(state) ~= "table" or type(state.combatants) ~= "table" then
+		return nil
+	end
+	for id, c in pairs(state.combatants) do
+		if c.userId == LocalPlayer.UserId and c.hand ~= nil then
+			return id
+		end
+	end
+	for id, c in pairs(state.combatants) do
+		if c.userId == LocalPlayer.UserId then
+			return id
+		end
+	end
+	return nil
+end
+
+local function extractStateFromUpvalues(fn)
+	if type(fn) ~= "function" then
+		return nil, nil
+	end
+	local getUpv = (type(debug) == "table" and type(debug.getupvalues) == "function" and debug.getupvalues)
+		or (typeof(getupvalues) == "function" and getupvalues)
+	if not getUpv then
+		return nil, nil
+	end
+	local ok, uvs = pcall(getUpv, fn)
+	if not ok or type(uvs) ~= "table" then
+		return nil, nil
+	end
+	local state, myId
+	for _, val in pairs(uvs) do
+		if type(val) == "table" and type(val.combatants) == "table" and type(val.turnOrder) == "table" then
+			state = val
+		elseif type(val) == "string" then
+			myId = val
+		end
+	end
+	if state and (not myId or not state.combatants[myId]) then
+		myId = findMyCombatantId(state)
+	end
+	return state, myId
+end
+
+local function scanGcCombatState()
+	if typeof(getgc) ~= "function" then
+		return nil, nil
+	end
+	if (os.clock() - LiveCombat.LastGcScan) < 1.5 then
+		return nil, nil
+	end
+	LiveCombat.LastGcScan = os.clock()
+
+	local ok, gcList = pcall(getgc, true)
+	if not ok or type(gcList) ~= "table" then
+		return nil, nil
+	end
+
+	local bestState, bestMyId = nil, nil
+	for _, v in ipairs(gcList) do
+		if type(v) == "table"
+			and rawget(v, "isOver") == false
+			and type(rawget(v, "combatants")) == "table"
+			and type(rawget(v, "turnOrder")) == "table"
+			and type(rawget(v, "turnIndex")) == "number"
+		then
+			local myId = findMyCombatantId(v)
+			if myId then
+				bestState = v
+				bestMyId = myId
+				if v.turnOrder[v.turnIndex] == myId then
+					break
+				end
+			end
+		end
+	end
+	if bestState and bestMyId then
+		LiveCombat.State = bestState
+		LiveCombat.MyId = bestMyId
+	end
+	return bestState, bestMyId
+end
+
+local function getCombatSnapshot(mods)
+	local CombatUI = mods.CombatUI
+	if CombatUI.isAiming() then
+		return nil, nil, "AIMING"
+	end
+
+	local uiState, uiMyId = extractStateFromUpvalues(CombatUI.canAct)
+	local state, myId = uiState, uiMyId
+	if not state or not myId then
+		state, myId = extractStateFromUpvalues(CombatUI.dealHand)
+	end
+	if not state or not myId then
+		state, myId = extractStateFromUpvalues(CombatUI.render)
+	end
+	if not state or not myId then
+		state, myId = extractStateFromUpvalues(CombatUI.passTurn)
+	end
+	if (not state or not myId) and LiveCombat.State then
+		state = LiveCombat.State
+		myId = LiveCombat.MyId or findMyCombatantId(state)
+	end
+
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	local combatGui = playerGui and playerGui:FindFirstChild("CombatUI")
+	local guiVisible = combatGui and combatGui:IsA("ScreenGui") and combatGui.Enabled
+
+	if (not state or not myId or state.isOver) and guiVisible then
+		local gcState, gcMyId = scanGcCombatState()
+		if gcState and gcMyId then
+			state, myId = gcState, gcMyId
+		end
+	end
+
+	-- If CombatUI has live state attached, trust CombatUI.canAct(); if split-VM (uiState == nil), evaluate turn from state + guiVisible
+	local canActNow = CombatUI.canAct()
+	if not canActNow and not uiState and guiVisible and state and myId and not state.isOver then
+		local me = state.combatants and state.combatants[myId]
+		local actorId = (state.turnOrder and state.turnIndex and state.turnOrder[state.turnIndex]) or LiveCombat.TurnActorId
+		if me and not me.isIncapacitated and (me.hp or 0) > 0 and actorId == myId then
+			canActNow = true
+		end
+	end
+
+	if not canActNow then
+		if state and not state.isOver then
+			local actorId = (state.turnOrder and state.turnIndex and state.turnOrder[state.turnIndex]) or LiveCombat.TurnActorId
+			if actorId and myId and actorId ~= myId then
+				return nil, nil, "ENEMY TURN"
+			end
+			return nil, nil, "BUSY / ANIM"
+		end
+		return nil, nil, "WAITING"
+	end
+
+	if not state or not myId or not state.combatants or not state.combatants[myId] then
+		return nil, nil, "SYNCING"
+	end
+	return state, myId, "ACT"
+end
+
+local function analyzeAbility(mods, ability, energy)
+	local Statuses = mods.Statuses
+	local directDamage = 0
+	local isAttackPowerUp = false
+	local powerUpSchool = nil
+	local healScore = 0
+	local healsSelf = false
+	local healsTeammates = false
+	local shieldScore = 0
+	local hasCleanse = false
+	local hasDefenseBuff = false
+	local hasEnergyGain = false
+	local gainEnergyAmount = 0
+	local revivesAlly = false
+	local preventsAction = false
+
+	for _, ef in ipairs(ability.effects or {}) do
+		local kind = ef.kind
+		if kind == "Damage" then
+			local mult = ability.spendAll and math.max(1, energy or 1) or 1
+			directDamage += ((ef.base or 0) * (ef.hits or 1) * mult)
+		elseif kind == "Detonate" or kind == "ConsumeDot" then
+			directDamage += 25
+		elseif kind == "Heal" then
+			healScore += (ef.base or 30)
+			if ef.target == "Self" or ability.targetKind == "SelfOnly" then
+				healsSelf = true
+			elseif ef.target == "Allies" or ability.targetKind == "AllAllies" or ability.targetKind == "SingleAlly" then
+				healsSelf = true
+				healsTeammates = true
+			end
+			if ef.target ~= "Self" and (ability.targetKind == "SingleAlly" or ability.targetKind == "AllAllies") then
+				revivesAlly = true
+			end
+		elseif kind == "Shield" then
+			shieldScore += (ef.base or 25)
+		elseif kind == "Cleanse" then
+			hasCleanse = true
+		elseif kind == "GainEnergy" then
+			hasEnergyGain = true
+			gainEnergyAmount += (ef.amount or 1)
+		elseif kind == "ApplyStatus" and ef.statusId then
+			local st = Statuses[ef.statusId]
+			if st then
+				if st.preventsAction then
+					preventsAction = true
+				end
+				if st.schoolDealt ~= nil or (st.damageDealtMultiplier and st.damageDealtMultiplier > 1) or (st.damageDealtPerStack and st.damageDealtPerStack > 0) then
+					if not st.preventsAction then
+						isAttackPowerUp = true
+						powerUpSchool = st.school or ability.school
+					end
+				end
+				if hasStatusTag(st, "Buff") and not st.preventsAction then
+					if st.damageTakenMultiplier or st.schoolTaken or st.evadesNext or st.reprisal or ef.statusId == "Regrowth" then
+						hasDefenseBuff = true
+					end
+				end
+			end
+		end
+	end
+
+	local targetsAllyOrSelf = (
+		ability.targetKind == "SelfOnly"
+		or ability.targetKind == "SingleAlly"
+		or ability.targetKind == "AllAllies"
+		or ability.ally == true
+		or (ability.targetKind == "SingleAny" and directDamage == 0)
+	)
+
+	local isSupport = targetsAllyOrSelf and directDamage == 0 and not preventsAction and (
+		healScore > 0
+		or shieldScore > 0
+		or hasCleanse
+		or hasDefenseBuff
+		or hasEnergyGain
+		or isAttackPowerUp
+	)
+
+	return {
+		directDamage = directDamage,
+		isAttackPowerUp = isAttackPowerUp,
+		powerUpSchool = powerUpSchool,
+		isSupport = isSupport,
+		healScore = healScore,
+		healsSelf = healsSelf,
+		healsTeammates = healsTeammates,
+		shieldScore = shieldScore,
+		hasCleanse = hasCleanse,
+		hasDefenseBuff = hasDefenseBuff,
+		hasEnergyGain = hasEnergyGain,
+		gainEnergyAmount = gainEnergyAmount,
+		revivesAlly = revivesAlly,
+		preventsAction = preventsAction,
+	}
+end
+
+local function isBossCombatant(mods, c, combatantId)
+	if not c then
+		return false
+	end
+	if c.isBoss == true or c.boss == true then
+		return true
+	end
+	if combatantId and LiveBossIds[combatantId] then
+		return true
+	end
+	local bossIds = mods.BossEnemyIds
+	if bossIds then
+		local eid = c.enemyId or c.defId or c.id
+		if type(eid) == "string" and (bossIds[eid] or LiveBossIds[eid]) then
+			return true
+		end
+	end
+	return false
+end
+
+local function hasAliveBoss(mods, state, me)
+	for id, c in pairs(state.combatants) do
+		if c.team ~= me.team and not c.isPet and mods.CombatSim.isAlive(c) and isBossCombatant(mods, c, id) then
+			return true
+		end
+	end
+	return false
+end
+
+local function collectEntries(mods, state, me, includeUnaffordable)
+	local entries = {}
+	local CombatSim = mods.CombatSim
+	local Abilities = mods.Abilities
+
+	for slot, abilityId in ipairs(me.hand or {}) do
+		local ab = Abilities[abilityId]
+		if ab and CombatSim.ready(state.combatants, me, ab) and (includeUnaffordable or CombatSim.canPay(me, ab)) then
+			table.insert(entries, {
+				id = abilityId,
+				slot = slot,
+				ability = ab,
+				payable = CombatSim.canPay(me, ab),
+				info = analyzeAbility(mods, ab, me.energy or 0),
+			})
+		end
+	end
+
+	for _, abilityId in ipairs(me.talentCards or {}) do
+		local used = me.talentCardsUsed and me.talentCardsUsed[abilityId]
+		local ab = not used and Abilities[abilityId]
+		if ab and CombatSim.ready(state.combatants, me, ab) and (includeUnaffordable or CombatSim.canPay(me, ab)) then
+			table.insert(entries, {
+				id = abilityId,
+				slot = -1,
+				ability = ab,
+				payable = CombatSim.canPay(me, ab),
+				info = analyzeAbility(mods, ab, me.energy or 0),
+			})
+		end
+	end
+
+	return entries
+end
+
+local function getElementMultiplier(mods, attackSchool, defender, me)
+	if not defender then
+		return 1
+	end
+	local mult = 1
+	local atkSchool = attackSchool or (me and me.school)
+
+	-- 1. Live CombatMath.schoolFactor (uses defender.scaling[resistance] & attacker pierce)
+	local CombatMath = mods.CombatMath
+	local Schools = mods.Schools
+	if CombatMath and type(CombatMath.schoolFactor) == "function" and atkSchool and type(defender.scaling) == "table" then
+		local ok, factor = pcall(CombatMath.schoolFactor, defender, atkSchool, nil, me)
+		if ok and type(factor) == "number" then
+			mult *= factor
+		end
+		if me and type(me.scaling) == "table" and type(CombatMath.offensiveMultiplier) == "function" then
+			local okOff, offMult = pcall(CombatMath.offensiveMultiplier, me, atkSchool)
+			if okOff and type(offMult) == "number" then
+				mult *= offMult
+			end
+		end
+	else
+		local schoolDef = atkSchool and Schools and Schools.defs and Schools.defs[atkSchool]
+		local statsTbl = defender.scaling or defender.derived
+		if type(statsTbl) == "table" then
+			local res = (statsTbl.AllResistance or statsTbl.allResistance or 0)
+			if schoolDef and type(statsTbl[schoolDef.resistance]) == "number" then
+				res += statsTbl[schoolDef.resistance]
+			end
+			mult *= math.clamp(1 - res, 0.2, 2.5)
+		end
+	end
+
+	-- 2. Enemy damageModifiers (wards / elemental intake modifiers on defender)
+	local dmgMods = defender.damageModifiers
+	if type(dmgMods) == "table" and atkSchool then
+		local hitType = (Schools and type(Schools.hitType) == "function" and Schools.hitType(nil, atkSchool)) or atkSchool
+		local dm = dmgMods[hitType] or dmgMods[atkSchool]
+		if type(dm) == "number" then
+			mult *= dm
+		end
+	end
+
+	-- 3. Active defender statuses (wards, shields/armor, Mirage evade, Vulnerable)
+	for _, entry in ipairs(defender.statuses or {}) do
+		local sid = (type(entry) == "table" and entry.id) or entry
+		local st = type(sid) == "string" and mods.Statuses[sid]
+		if st then
+			if st.evadesNext then
+				mult *= 0.05
+			elseif type(st.damageTakenMultiplier) == "number" then
+				mult *= st.damageTakenMultiplier
+			elseif atkSchool and st.school == atkSchool and type(st.schoolTaken) == "number" then
+				mult *= math.max(0.1, 1 - st.schoolTaken)
+			elseif sid == "Vulnerable" then
+				mult *= 1.25
+			end
+		end
+	end
+
+	return math.clamp(mult, 0.01, 3.5)
+end
+
+local function getAliveEnemies(mods, state, me)
+	local enemies = {}
+	for id, c in pairs(state.combatants) do
+		if c.team ~= me.team and not c.isPet and mods.CombatSim.isAlive(c) then
+			local hp = c.hp or 0
+			local shield = tonumber(c.shield) or 0
+			local ehp = math.max(1, hp + shield)
+			local isBoss = isBossCombatant(mods, c, id)
+			local evades = false
+			for _, stEntry in ipairs(c.statuses or {}) do
+				local sid = (type(stEntry) == "table" and stEntry.id) or stEntry
+				local stDef = type(sid) == "string" and mods.Statuses[sid]
+				if stDef and stDef.evadesNext then
+					evades = true
+					break
+				end
+			end
+			table.insert(enemies, {
+				id = id,
+				combatant = c,
+				name = c.name or c.enemyId or id,
+				hp = hp,
+				shield = shield,
+				effectiveHp = ehp,
+				isBoss = isBoss,
+				evades = evades,
+			})
+		end
+	end
+	return enemies
+end
+
+local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
+	local base = entry.info.directDamage or 0
+	if base <= 0 then
+		return {
+			totalDamage = 0,
+			tacticalScore = 0,
+			killCount = 0,
+			wipesAll = false,
+			killsBoss = false,
+			bestEnemy = nil,
+			bestEnemyDamage = 0,
+			bestMult = 1,
+		}
+	end
+
+	local atkSchool = entry.ability.school or me.school
+	local isAoe = (entry.ability.targetKind == "AllEnemies")
+	local totalEnemies = #aliveEnemies
+
+	if isAoe then
+		local totalDmg = 0
+		local killCount = 0
+		local killsBoss = false
+		local overkill = 0
+		for _, e in ipairs(aliveEnemies) do
+			local mult = getElementMultiplier(mods, atkSchool, e.combatant, me)
+			local dmg = base * mult
+			totalDmg += math.min(dmg, e.effectiveHp * 1.15)
+			overkill += math.max(0, dmg - e.effectiveHp)
+			if not e.evades and dmg >= e.effectiveHp * 0.98 then
+				killCount += 1
+				if e.isBoss then
+					killsBoss = true
+				end
+			end
+		end
+		local tactical = totalDmg - (overkill * 0.35)
+		if killCount > 0 then
+			tactical += killCount * 35
+		end
+		return {
+			totalDamage = totalDmg > 0 and totalDmg or base,
+			tacticalScore = tactical,
+			killCount = killCount,
+			wipesAll = (totalEnemies > 0 and killCount >= totalEnemies),
+			killsBoss = killsBoss,
+			bestEnemy = aliveEnemies[1],
+			bestEnemyDamage = totalDmg,
+			bestMult = 1,
+			enemyCount = totalEnemies,
+		}
+	end
+
+	local bestScore = -math.huge
+	local bestEnemy = nil
+	local bestDmg = 0
+	local bestMult = 1
+	local anyKill = false
+	local killsBoss = false
+
+	for _, e in ipairs(aliveEnemies) do
+		local mult = getElementMultiplier(mods, atkSchool, e.combatant, me)
+		local dmg = base * mult
+		local canKill = (not e.evades) and (dmg >= e.effectiveHp * 0.98)
+		if canKill then
+			anyKill = true
+			if e.isBoss then
+				killsBoss = true
+			end
+		end
+
+		local capped = math.min(dmg, e.effectiveHp * 1.15)
+		local overkill = math.max(0, dmg - e.effectiveHp)
+		local s = capped - (overkill * 0.65)
+		if canKill then
+			s += 60
+		end
+		if e.evades and (entry.ability.energyCost or 0) <= 1 then
+			s += 30
+		end
+		if s > bestScore then
+			bestScore = s
+			bestEnemy = e
+			bestDmg = dmg
+			bestMult = mult
+		end
+	end
+
+	return {
+		totalDamage = bestDmg > 0 and bestDmg or base,
+		tacticalScore = bestEnemy and bestScore or base,
+		killCount = anyKill and 1 or 0,
+		wipesAll = (totalEnemies == 1 and anyKill),
+		killsBoss = killsBoss,
+		bestEnemy = bestEnemy,
+		bestEnemyDamage = bestDmg,
+		bestMult = bestMult,
+		enemyCount = totalEnemies,
+	}
+end
+
+local function pickCheapestLethal(list)
+	table.sort(list, function(a, b)
+		local ca = a.entry.ability.energyCost or 0
+		local cb = b.entry.ability.energyCost or 0
+		if ca ~= cb then
+			return ca < cb
+		end
+		return a.eval.tacticalScore > b.eval.tacticalScore
+	end)
+	return list[1].entry
+end
+
+local function isUsefulPowerUp(pu, handDamageSchools, targetSchool)
+	local s = pu.info.powerUpSchool
+	if not s then
+		return true
+	end
+	if targetSchool and s == targetSchool then
+		return true
+	end
+	return handDamageSchools[s] == true
+end
+
+local function pickAttackEntry(mods, state, me, usableEntries)
+	local powerUps = {}
+	local damagers = {}
+	local handDamageSchools = {}
+	local aliveEnemies = getAliveEnemies(mods, state, me)
+
+	for _, entry in ipairs(usableEntries) do
+		if entry.info.directDamage > 0 and not entry.info.preventsAction then
+			entry._eval = evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
+			table.insert(damagers, entry)
+			if entry.ability.school then
+				handDamageSchools[entry.ability.school] = true
+			end
+		end
+		if entry.info.isAttackPowerUp then
+			table.insert(powerUps, entry)
+		end
+	end
+
+	-- 1. Lethal Finish Override: immediately finish the fight / boss / free minion kill instead of wasting turns buffing or saving
+	if #damagers > 0 then
+		local wipes, bossKills, freeKills, singleKills = {}, {}, {}, {}
+		for _, d in ipairs(damagers) do
+			if d._eval.wipesAll then
+				table.insert(wipes, { entry = d, eval = d._eval })
+			elseif d._eval.killsBoss then
+				table.insert(bossKills, { entry = d, eval = d._eval })
+			elseif d._eval.killCount > 0 then
+				local netCost = (d.ability.energyCost or 0) - (d.info.gainEnergyAmount or 0)
+				if netCost <= 0 then
+					table.insert(freeKills, { entry = d, eval = d._eval })
+				end
+				table.insert(singleKills, { entry = d, eval = d._eval })
+			end
+		end
+		if #wipes > 0 then
+			return pickCheapestLethal(wipes), nil
+		end
+		if #bossKills > 0 then
+			return pickCheapestLethal(bossKills), nil
+		end
+		if #freeKills > 0 then
+			return pickCheapestLethal(freeKills), nil
+		end
+		if #singleKills > 0 and not hasAliveBoss(mods, state, me) then
+			return pickCheapestLethal(singleKills), nil
+		end
+	end
+
+	-- 2. Smart Boss Pip Saver: save pips for 4+ pip boss nukes, stacking matching 0-cost/safe buffs first
+	if hasAliveBoss(mods, state, me) then
+		local maxCap = mods.CombatSim.maxEnergy(me) or 99
+		local allReady = collectEntries(mods, state, me, true)
+		local bossFinisher = nil
+		for _, entry in ipairs(allReady) do
+			local cost = entry.ability.energyCost or 0
+			if entry.info.directDamage > 0 and not entry.info.preventsAction and cost >= CombatAuto.SavePipMinCost and cost <= maxCap then
+				if not bossFinisher or entry.info.directDamage > bossFinisher.info.directDamage then
+					bossFinisher = entry
+				end
+			end
+		end
+
+		if bossFinisher then
+			local finisherCost = bossFinisher.ability.energyCost or 0
+			local safePowerUps = {}
+			for _, pu in ipairs(powerUps) do
+				if isUsefulPowerUp(pu, handDamageSchools, bossFinisher.ability.school) then
+					local puCost = pu.ability.energyCost or 0
+					local netCost = puCost - (pu.info.gainEnergyAmount or 0)
+					if netCost <= 0 or ((me.energy or 0) - netCost) >= finisherCost then
+						table.insert(safePowerUps, pu)
+					end
+				end
+			end
+
+			if #safePowerUps > 0 then
+				table.sort(safePowerUps, function(a, b)
+					local aPure = (a.info.directDamage == 0) and 1 or 0
+					local bPure = (b.info.directDamage == 0) and 1 or 0
+					if aPure ~= bPure then
+						return aPure > bPure
+					end
+					local aMatch = (a.info.powerUpSchool == bossFinisher.ability.school) and 1 or 0
+					local bMatch = (b.info.powerUpSchool == bossFinisher.ability.school) and 1 or 0
+					if aMatch ~= bMatch then
+						return aMatch > bMatch
+					end
+					return (a.ability.energyCost or 0) < (b.ability.energyCost or 0)
+				end)
+				return safePowerUps[1], nil
+			end
+
+			if bossFinisher.payable then
+				return bossFinisher, nil
+			end
+
+			-- Cannot afford the 4+ pip card yet and no safe power-ups to play -> save (pass turn)
+			return nil, bossFinisher
+		end
+	end
+
+	-- 3. Stack useful buffs (0-cost / matching school in hand) when no instant kill is available
+	local usefulPowerUps = {}
+	for _, pu in ipairs(powerUps) do
+		if isUsefulPowerUp(pu, handDamageSchools, nil) and ((pu.ability.energyCost or 0) <= 1 or #damagers == 0) then
+			table.insert(usefulPowerUps, pu)
+		end
+	end
+	if #usefulPowerUps > 0 then
+		table.sort(usefulPowerUps, function(a, b)
+			local aPure = (a.info.directDamage == 0) and 1 or 0
+			local bPure = (b.info.directDamage == 0) and 1 or 0
+			if aPure ~= bPure then
+				return aPure > bPure
+			end
+			local aMatch = (a.info.powerUpSchool and handDamageSchools[a.info.powerUpSchool]) and 1 or 0
+			local bMatch = (b.info.powerUpSchool and handDamageSchools[b.info.powerUpSchool]) and 1 or 0
+			if aMatch ~= bMatch then
+				return aMatch > bMatch
+			end
+			return (a.ability.energyCost or 0) < (b.ability.energyCost or 0)
+		end)
+		return usefulPowerUps[1], nil
+	end
+
+	if #damagers > 0 then
+		table.sort(damagers, function(a, b)
+			local aScore = (a._eval and a._eval.tacticalScore) or a.info.directDamage
+			local bScore = (b._eval and b._eval.tacticalScore) or b.info.directDamage
+			if math.abs(aScore - bScore) > 0.5 then
+				return aScore > bScore
+			end
+			local aAoe = (a.ability.targetKind == "AllEnemies" and #aliveEnemies >= 2) and 1 or 0
+			local bAoe = (b.ability.targetKind == "AllEnemies" and #aliveEnemies >= 2) and 1 or 0
+			if aAoe ~= bAoe then
+				return aAoe > bAoe
+			end
+			return (a.ability.energyCost or 0) < (b.ability.energyCost or 0)
+		end)
+		return damagers[1], nil
+	end
+
+	return nil, nil
+end
+
+local function getCombatantDebuffCount(Statuses, c)
+	local count = 0
+	for _, entry in ipairs(c.statuses or {}) do
+		local sid = (type(entry) == "table" and entry.id) or entry
+		local st = type(sid) == "string" and Statuses[sid]
+		if st and not st.cleanseProof and (
+			st.isDot == true
+			or hasStatusTag(st, "Debuff")
+			or hasStatusTag(st, "Curse")
+			or hasStatusTag(st, "DoT")
+			or hasStatusTag(st, "Control")
+		) then
+			count += 1
+		end
+	end
+	return count
+end
+
+local function getTeamHealthInfo(mods, state, me, lowThreshold)
+	local CombatSim = mods.CombatSim
+	local Statuses = mods.Statuses
+	local lowestRatio = 1
+	local lowestId = nil
+	local hurtCount = 0
+	local multiHurtCount = 0
+	local lowCount = 0
+	local revivableCount = 0
+	local hasDebuff = false
+	local debuffedId = nil
+	local bestDebuffScore = -1
+	local debuffedCount = 0
+	local unshieldedId = nil
+	local bestShieldScore = math.huge
+	local threshold = lowThreshold or 0.50
+
+	for id, c in pairs(state.combatants) do
+		if c.team == me.team and not c.isPet then
+			if CombatSim.revivable(c) then
+				revivableCount += 1
+			elseif CombatSim.isAlive(c) then
+				local maxHp = (c.derived and c.derived.maxHp) or c.maxHp or 100
+				local ratio = (c.hp or maxHp) / math.max(1, maxHp)
+				if ratio < lowestRatio or (ratio == lowestRatio and id == me.id) then
+					lowestRatio = ratio
+					lowestId = id
+				end
+				if ratio < 0.99 then
+					hurtCount += 1
+				end
+				if ratio < 0.85 then
+					multiHurtCount += 1
+				end
+				if ratio <= threshold then
+					lowCount += 1
+				end
+
+				local shieldVal = tonumber(c.shield) or 0
+				local shieldRank = shieldVal * 1000 + ratio
+				if shieldRank < bestShieldScore then
+					bestShieldScore = shieldRank
+					unshieldedId = id
+				end
+
+				local debuffs = getCombatantDebuffCount(Statuses, c)
+				if debuffs > 0 then
+					hasDebuff = true
+					debuffedCount += 1
+					local debuffScore = debuffs * 10 + (1 - ratio) + (id == me.id and 0.01 or 0)
+					if debuffScore > bestDebuffScore then
+						bestDebuffScore = debuffScore
+						debuffedId = id
+					end
+				end
+			end
+		end
+	end
+
+	return {
+		lowestRatio = lowestRatio,
+		lowestId = lowestId,
+		hurtCount = hurtCount,
+		multiHurtCount = multiHurtCount,
+		lowCount = lowCount,
+		revivableCount = revivableCount,
+		hasDebuff = hasDebuff,
+		debuffedId = debuffedId,
+		debuffedCount = debuffedCount,
+		unshieldedId = unshieldedId,
+	}
+end
+
+local function pickEmergencyHealEntry(mods, state, me, entries, threshold)
+	local healthInfo = getTeamHealthInfo(mods, state, me, threshold)
+	if healthInfo.revivableCount == 0 and healthInfo.lowestRatio > threshold then
+		return nil
+	end
+
+	local needTeammate = (healthInfo.lowestId ~= nil and healthInfo.lowestId ~= me.id)
+	local candidates = {}
+
+	for _, entry in ipairs(entries) do
+		local info = entry.info
+		if info.healScore > 0 then
+			local canTargetNeed = false
+			if healthInfo.revivableCount > 0 then
+				canTargetNeed = info.revivesAlly == true
+			elseif needTeammate then
+				canTargetNeed = info.healsTeammates == true
+			else
+				canTargetNeed = info.healsSelf == true
+			end
+
+			if canTargetNeed then
+				local score = info.healScore
+				score += (info.directDamage == 0) and 2000 or 500
+				if entry.ability.targetKind == "AllAllies" and (healthInfo.lowCount >= 2 or healthInfo.hurtCount >= 2) then
+					score += 600
+				end
+				if healthInfo.revivableCount > 0 and info.revivesAlly then
+					score += 5000
+				end
+				table.insert(candidates, { entry = entry, score = score })
+			end
+		end
+	end
+
+	if #candidates == 0 then
+		return nil
+	end
+	table.sort(candidates, function(a, b)
+		return a.score > b.score
+	end)
+	return candidates[1].entry
+end
+
+local function pickSupportEntry(mods, state, me, entries)
+	local healthInfo = getTeamHealthInfo(mods, state, me)
+	local needsHeal = (healthInfo.lowestRatio < 0.99)
+	local candidates = {}
+
+	for _, entry in ipairs(entries) do
+		if entry.info.isSupport then
+			local info = entry.info
+			local ab = entry.ability
+			local score = 0
+
+			-- 1. Revive downed party members first
+			if healthInfo.revivableCount > 0 and info.revivesAlly then
+				score += 20000
+			end
+
+			-- 2. Cleanse whenever self or any teammate has a debuff
+			if info.hasCleanse and healthInfo.hasDebuff then
+				score += 8000
+				if ab.targetKind == "AllAllies" and healthInfo.debuffedCount >= 2 then
+					score += 600
+				end
+			end
+
+			-- 3. Heal the lowest-HP player when anyone needs healing
+			if info.healScore > 0 and needsHeal then
+				score += 4000 + info.healScore
+				if ab.targetKind == "AllAllies" and (healthInfo.multiHurtCount >= 2 or healthInfo.hurtCount >= 2) then
+					score += 500
+				end
+			end
+
+			-- 4. Always use shields & defensive buffs (especially when no player needs healing)
+			if info.shieldScore > 0 then
+				score += 2500 + info.shieldScore
+			end
+			if info.hasDefenseBuff then
+				score += 2000
+			end
+
+			-- 5. Energy & offensive buffs
+			if info.hasEnergyGain then
+				score += 1000
+			end
+			if info.isAttackPowerUp then
+				score += 800
+			end
+
+			if ab.targetKind == "AllAllies" and score > 0 then
+				score += 40
+			end
+
+			-- Do not waste pure heals if everyone is full HP and no debuff needs cleansing
+			if score > 0 then
+				table.insert(candidates, { entry = entry, score = score })
+			end
+		end
+	end
+
+	if #candidates == 0 then
+		return nil
+	end
+	table.sort(candidates, function(a, b)
+		return a.score > b.score
+	end)
+	return candidates[1].entry
+end
+
+local function pickTargetId(mods, state, me, ability, info, preferMode)
+	local CombatSim = mods.CombatSim
+	local targetKind = ability.targetKind
+	local mode = preferMode or CombatAuto.Style
+
+	if targetKind == "SingleEnemy" or (targetKind == "SingleAny" and mode == "Attack") then
+		local bestEnemy = nil
+		local bestScore = nil
+		local bestMeta = nil
+		local atkSchool = ability.school or me.school
+		local directDmg = (info and info.directDamage) or 0
+		for id, c in pairs(state.combatants) do
+			if c.team ~= me.team and not c.isPet and CombatSim.isAlive(c) then
+				local hp = c.hp or 0
+				local shield = tonumber(c.shield) or 0
+				local maxHp = (c.derived and c.derived.maxHp) or hp
+				local isBoss = isBossCombatant(mods, c, id)
+				local mult = getElementMultiplier(mods, atkSchool, c, me)
+				local projDmg = directDmg * mult
+				local canKill = (directDmg > 0) and (projDmg >= (hp + shield) * 0.98)
+				local score
+				if CombatAuto.TargetPriority == "Highest HP" then
+					score = -(hp + shield) / math.max(0.05, mult)
+				elseif CombatAuto.TargetPriority == "Boss First" then
+					score = (isBoss and -10000000 or 0) - maxHp + ((hp + shield) / math.max(0.05, mult) * 0.01)
+				elseif CombatAuto.TargetPriority == "Lowest HP" then
+					score = hp + shield
+				else
+					-- Smart Effective: picks easiest kill / most effective element against 2-3 enemies
+					score = (hp + shield) / math.max(0.05, mult)
+					if canKill then
+						score -= 100000 - math.max(0, projDmg - (hp + shield))
+					end
+				end
+				if not bestScore or score < bestScore then
+					bestScore = score
+					bestEnemy = id
+					bestMeta = {
+						name = c.name or c.enemyId or id,
+						mult = mult,
+						isKill = canKill,
+					}
+				end
+			end
+		end
+		return bestEnemy, bestMeta
+	end
+
+	if targetKind == "SingleAlly" or (targetKind == "SingleAny" and mode == "Support") then
+		local healthInfo = getTeamHealthInfo(mods, state, me)
+		local pickedId = nil
+		if info.revivesAlly and healthInfo.revivableCount > 0 then
+			for id, c in pairs(state.combatants) do
+				if c.team == me.team and not c.isPet and CombatSim.revivable(c) then
+					pickedId = id
+					break
+				end
+			end
+		elseif info.hasCleanse and healthInfo.debuffedId and (info.healScore == 0 or healthInfo.lowestRatio >= 0.99) then
+			pickedId = healthInfo.debuffedId
+		elseif info.healScore > 0 and healthInfo.lowestId then
+			pickedId = healthInfo.lowestId
+		elseif info.shieldScore > 0 and (healthInfo.unshieldedId or healthInfo.lowestId) then
+			pickedId = healthInfo.unshieldedId or healthInfo.lowestId
+		else
+			pickedId = healthInfo.lowestId or me.id
+		end
+		local ally = pickedId and state.combatants[pickedId]
+		local allyName = (pickedId == me.id and "me") or (ally and ally.name) or pickedId
+		return pickedId, { name = allyName, mult = 1, isKill = false }
+	end
+
+	return nil, nil
+end
+
+local function tryAutoDiscard(mods, state, me)
+	local turnKey = tostring(state.round or 0) .. ":" .. tostring(state.turnIndex or 0)
+	if CombatAuto.LastDiscardTurnKey == turnKey then
+		return false
+	end
+	local hand = me.hand or {}
+	if #hand == 0 then
+		return false
+	end
+
+	local toDiscard = {}
+	for slot, abilityId in ipairs(hand) do
+		local ab = mods.Abilities[abilityId]
+		if ab then
+			local info = analyzeAbility(mods, ab, me.energy or 0)
+			local isBrick = false
+			if CombatAuto.Style == "Attack" then
+				isBrick = (info.directDamage == 0 and not info.isAttackPowerUp)
+			else
+				isBrick = (not info.isSupport)
+			end
+			if isBrick or not mods.CombatSim.canPay(me, ab) then
+				table.insert(toDiscard, { abilityId = abilityId, slot = slot })
+				if #toDiscard >= 2 then
+					break
+				end
+			end
+		end
+	end
+
+	if #toDiscard == 0 then
+		return false
+	end
+
+	CombatAuto.LastDiscardTurnKey = turnKey
+	mods.Net.fireServer("SubmitAction", {
+		kind = mods.Enums.ActionKind.Discard,
+		cards = toDiscard,
+		targetIds = {},
+		seen = mods.CombatUI.shownHandVersion(),
+	})
+	setCombatStatus("DISCARD · " .. tostring(#toDiscard) .. " BRICKS")
+	return true
+end
+
+local function runCombatStep()
+	if not CombatAuto.Enabled or CombatAuto.Busy then
+		return
+	end
+	if (os.clock() - CombatAuto.LastActionAt) < 0.45 then
+		return
+	end
+
+	local mods = getGameMods()
+	if not mods then
+		setCombatStatus("ERR · " .. tostring(GameModsError or "MODS"))
+		return
+	end
+
+	local state, myId, snapStatus = getCombatSnapshot(mods)
+	if not state or not myId then
+		if snapStatus == "ENEMY TURN" then
+			setCombatStatus("WAIT · ENEMY TURN")
+		elseif snapStatus == "BUSY / ANIM" then
+			setCombatStatus("WAIT · ANIMATING")
+		elseif snapStatus == "SYNCING" then
+			setCombatStatus("WAIT · SYNCING STATE")
+		end
+		return
+	end
+
+	local me = state.combatants[myId]
+	local entries = collectEntries(mods, state, me, false)
+
+	local chosen
+	local savingForCard = nil
+	local usedEmergencyHeal = false
+	if CombatAuto.AutoHeal then
+		chosen = pickEmergencyHealEntry(mods, state, me, entries, CombatAuto.HealThreshold)
+		if chosen then
+			usedEmergencyHeal = true
+		end
+	end
+
+	if not chosen then
+		if CombatAuto.Style == "Attack" then
+			chosen, savingForCard = pickAttackEntry(mods, state, me, entries)
+		else
+			chosen = pickSupportEntry(mods, state, me, entries)
+		end
+	end
+
+	CombatAuto.Busy = true
+	local ok, err = pcall(function()
+		local CombatUI = mods.CombatUI
+		if chosen then
+			local targetMode = usedEmergencyHeal and "Support" or CombatAuto.Style
+			local targetId, targetMeta = pickTargetId(mods, state, me, chosen.ability, chosen.info, targetMode)
+			local used = CombatUI.use(chosen.id, chosen.slot)
+			if used and CombatUI.isAiming() then
+				if targetId then
+					CombatUI.aimAt(targetId)
+				end
+				if CombatUI.isAiming() then
+					local aimable = CombatUI.aimableNow()
+					if aimable and aimable[1] then
+						CombatUI.aimAt(aimable[1])
+					else
+						CombatUI.stopAiming()
+					end
+				end
+			elseif not used then
+				-- Direct SubmitAction fallback if CombatUI.use refused due to UI/split-VM state
+				local tk = chosen.ability.targetKind
+				local needsTarget = (tk == "SingleEnemy" or tk == "SingleAlly" or tk == "SingleAny")
+				local targets = (needsTarget and targetId) and { targetId } or {}
+				mods.Net.fireServer("SubmitAction", {
+					kind = mods.Enums.ActionKind.Ability,
+					abilityId = chosen.id,
+					slot = (chosen.slot and chosen.slot > 0) and chosen.slot or nil,
+					fromTalents = (chosen.slot == -1) and true or nil,
+					targetIds = targets,
+				})
+				CombatAuto.LastActionAt = os.clock() + 0.85
+			end
+			local cardName = chosen.ability.name or chosen.id
+			local ev = chosen._eval
+			if usedEmergencyHeal then
+				local who = (targetMeta and targetMeta.name) and (" -> " .. tostring(targetMeta.name)) or ""
+				setCombatStatus("HEAL · " .. cardName .. who)
+			elseif chosen.ability.targetKind == "AllEnemies" then
+				local cnt = (ev and ev.enemyCount) or 1
+				local tag = (ev and ev.wipesAll) and "KILL AOE · " or "AOE · "
+				setCombatStatus(string.format("%s%s (x%d)", tag, cardName, cnt))
+			elseif targetMeta and targetMeta.name then
+				local tag = targetMeta.isKill and "KILL · " or "CAST · "
+				local multNote = ""
+				if targetMeta.mult and math.abs(targetMeta.mult - 1) >= 0.05 then
+					multNote = string.format(" (%.2fx)", targetMeta.mult)
+				end
+				setCombatStatus(tag .. cardName .. " -> " .. tostring(targetMeta.name) .. multNote)
+			else
+				setCombatStatus("CAST · " .. cardName)
+			end
+		elseif savingForCard then
+			if mods.CombatSim.mayPass(me) then
+				CombatUI.passTurn()
+				if CombatUI.canAct() then
+					mods.Net.fireServer("SubmitAction", { kind = mods.Enums.ActionKind.Pass, targetIds = {} })
+				end
+				setCombatStatus("SAVING PIPS · " .. (savingForCard.ability.name or savingForCard.id))
+			else
+				setCombatStatus("SAVING PIPS · WAIT")
+			end
+		elseif CombatAuto.AutoDiscard and tryAutoDiscard(mods, state, me) then
+			return
+		elseif CombatAuto.AutoPass and mods.CombatSim.mayPass(me) then
+			CombatUI.passTurn()
+			if CombatUI.canAct() then
+				mods.Net.fireServer("SubmitAction", { kind = mods.Enums.ActionKind.Pass, targetIds = {} })
+			end
+			setCombatStatus("PASSED · NO MATCH")
+		else
+			setCombatStatus("WAITING · NO MATCH")
+		end
+	end)
+	if CombatAuto.LastActionAt < os.clock() then
+		CombatAuto.LastActionAt = os.clock()
+	end
+	CombatAuto.Busy = false
+
+	if not ok then
+		setCombatStatus("ERR · " .. tostring(err))
+	end
+end
+
+-- Auto Trivia Solver, Live Combat State & Boss Discovery Hooks
+local triviaLookup = {}
+local function rebuildTriviaLookup(mods)
+	table.clear(triviaLookup)
+	for _, entry in ipairs(mods.Trivia or {}) do
+		if type(entry.q) == "string" and type(entry.a) == "string" then
+			triviaLookup[entry.q] = entry.a
+			triviaLookup[string.lower((string.gsub(entry.q, "%s+", " ")))] = entry.a
+		end
+	end
+end
+
+task.spawn(function()
+	local mods = getGameMods()
+	if not mods or not State.Alive then
+		return
+	end
+
+	rebuildTriviaLookup(mods)
+
+	trackConnection(mods.Net.onClientEvent("CombatStarted", function(data)
+		if not State.Alive or type(data) ~= "table" then
+			return
+		end
+		if type(data.state) == "table" then
+			LiveCombat.State = data.state
+			LiveCombat.MyId = findMyCombatantId(data.state)
+		end
+		if type(data.boss) == "table" and type(data.boss.id) == "string" then
+			LiveBossIds[data.boss.id] = true
+			if mods.BossEnemyIds then
+				mods.BossEnemyIds[data.boss.id] = true
+			end
+		end
+	end))
+
+	trackConnection(mods.Net.onClientEvent("CombatEvents", function(data)
+		if not State.Alive or type(data) ~= "table" then
+			return
+		end
+		if type(data.state) == "table" then
+			LiveCombat.State = data.state
+			LiveCombat.MyId = LiveCombat.MyId or findMyCombatantId(data.state)
+		end
+		if data.ended then
+			LiveCombat.State = nil
+			LiveCombat.TurnActorId = nil
+		end
+	end))
+
+	trackConnection(mods.Net.onClientEvent("HandDealt", function(data)
+		if not State.Alive or type(data) ~= "table" or not LiveCombat.State then
+			return
+		end
+		local myId = LiveCombat.MyId or findMyCombatantId(LiveCombat.State)
+		if myId and LiveCombat.State.combatants and LiveCombat.State.combatants[myId] and type(data.hand) == "table" then
+			LiveCombat.State.combatants[myId].hand = table.clone(data.hand)
+		end
+	end))
+
+	trackConnection(mods.Net.onClientEvent("TurnChanged", function(data)
+		if not State.Alive or type(data) ~= "table" then
+			return
+		end
+		LiveCombat.TurnActorId = data.secondsRemaining and data.actorId or nil
+	end))
+
+	local function clearLiveCombat()
+		LiveCombat.State = nil
+		LiveCombat.MyId = nil
+		LiveCombat.TurnActorId = nil
+	end
+	trackConnection(mods.Net.onClientEvent("CombatEnded", clearLiveCombat))
+	trackConnection(mods.Net.onClientEvent("ArenaCleared", clearLiveCombat))
+	trackConnection(mods.Net.onClientEvent("ArenaExited", clearLiveCombat))
+
+	trackConnection(mods.Net.onClientEvent("TriviaAsk", function(payload)
+		if not State.Alive or not CombatAuto.AutoTrivia or type(payload) ~= "table" then
+			return
+		end
+		task.delay(0.35, function()
+			if not State.Alive or not CombatAuto.AutoTrivia then
+				return
+			end
+			if payload.choosing then
+				mods.Net.fireServer("TriviaVote", { choice = 1 })
+				setCombatStatus("TRIVIA · VOTED TOPIC")
+				return
+			end
+			local q = tostring(payload.question or "")
+			local answer = triviaLookup[q] or triviaLookup[string.lower((string.gsub(q, "%s+", " ")))]
+			if answer and type(payload.options) == "table" then
+				for idx, opt in ipairs(payload.options) do
+					if opt == answer or string.lower(tostring(opt)) == string.lower(answer) then
+						mods.Net.fireServer("TriviaVote", { choice = idx })
+						setCombatStatus("TRIVIA · " .. tostring(answer))
+						return
+					end
+				end
+			end
+		end)
+	end))
+end)
+
+trackThread(function()
+	while State.Alive do
+		task.wait(0.2)
+		if not State.Alive then
+			break
+		end
+		if State.StatusFlushers then
+			for _, flush in ipairs(State.StatusFlushers) do
+				flush()
+			end
+		end
+		if CombatAuto.Enabled then
+			runCombatStep()
+		end
+	end
+end)
+
+--// =========================================================================
+--// TAB 3: DUNGEON (Auto Encounter, Auto Ready, Auto Replay, Chests)
+--// =========================================================================
+local DungeonTab = Window:AddTab("Dungeon")
+
+local ENCOUNTER_PRIO_OPTIONS = {
+	"Heal (Always)",
+	"Heal (Below HP%)",
+	"Loot",
+	"Fight",
+	"Events",
+	"Shop",
+	"Continue",
+}
+
+local DungeonAuto = {
+	AutoReady = Config.Get("Dungeon_AutoReady", false),
+	AutoEncounter = Config.Get("Dungeon_AutoEncounter", false),
+	Priority1 = Config.Get("Dungeon_Prio1", "Heal (Always)"),
+	Priority2 = Config.Get("Dungeon_Prio2", "Loot"),
+	Priority3 = Config.Get("Dungeon_Prio3", "Fight"),
+	RestThreshold = (tonumber(string.match(tostring(Config.Get("Dungeon_RestBelow", "50%")), "%d+")) or 50) / 100,
+	AutoSkipMerchant = Config.Get("Dungeon_AutoSkipMerchant", false),
+	AutoReplay = Config.Get("Dungeon_AutoReplay", false),
+	AutoChests = Config.Get("Dungeon_AutoChests", false),
+	PendingOffers = nil,
+	RunState = nil,
+	CurrentHpRatio = 1,
+}
+
+DungeonTab:AddSection("Run Automation")
+
+local dungeonStatusCard
+local function setDungeonStatus(text)
+	if dungeonStatusCard then
+		dungeonStatusCard:Set(text)
+	end
+end
+
+DungeonTab:AddToggle({
+	Title = "Auto Ready",
+	Description = "Auto-readies in party & run loading screens",
+	Default = DungeonAuto.AutoReady,
+	Callback = function(enabled)
+		DungeonAuto.AutoReady = enabled
+		Config.Set("Dungeon_AutoReady", enabled)
+		if enabled then
+			local mods = getGameMods()
+			if mods then
+				pcall(function()
+					mods.Net.fireServer("SetReady", { ready = true })
+					mods.Net.fireServer("SetRunReady", { ready = true })
+				end)
+			end
+		end
+	end,
+})
+
+local function priorityOptionMatches(opt, kind, hpRatio)
+	if opt == "Heal (Always)" then
+		return kind == "ShortRest"
+	elseif opt == "Heal (Below HP%)" then
+		return kind == "ShortRest" and hpRatio <= DungeonAuto.RestThreshold
+	elseif opt == "Loot" then
+		return kind == "Scavenge"
+	elseif opt == "Fight" then
+		return kind == "Fight"
+	elseif opt == "Events" then
+		return kind == "Dialogue" or kind == "StatCheck" or kind == "Quest"
+	elseif opt == "Shop" then
+		return kind == "Shop" or kind == "Merchant"
+	elseif opt == "Continue" then
+		return kind == "Continue"
+	end
+	return false
+end
+
+local function scoreEncounterKind(kind, hpRatio)
+	local rankWeights = {
+		{ DungeonAuto.Priority1, 1000 },
+		{ DungeonAuto.Priority2, 700 },
+		{ DungeonAuto.Priority3, 450 },
+	}
+	for _, rw in ipairs(rankWeights) do
+		if priorityOptionMatches(rw[1], kind, hpRatio) then
+			return rw[2]
+		end
+	end
+	local fallback = { Scavenge = 300, Fight = 250, Continue = 200, Quest = 180, Dialogue = 150, StatCheck = 150, ShortRest = 90, Shop = 40, Merchant = 40 }
+	return fallback[kind] or 10
+end
+
+local function scoreOutcomeList(outcomes, hpRatio)
+	if type(outcomes) ~= "table" then
+		return 0
+	end
+	local s = 0
+	local needHeal = (hpRatio or 1) <= DungeonAuto.RestThreshold
+	for _, out in ipairs(outcomes) do
+		if type(out) == "table" then
+			local k = out.kind
+			if k == "Gems" then
+				s += 260 * (tonumber(out.amount) or 1)
+			elseif k == "Item" or k == "Scavenge" or k == "Card" then
+				s += 160 * (tonumber(out.count) or 1)
+			elseif k == "Heal" then
+				local frac = tonumber(out.fraction) or 0.2
+				s += (needHeal and 450 or 90) * frac
+			elseif k == "Gold" then
+				s += 4 * (tonumber(out.amount) or 10)
+			elseif k == "StartEnergy" then
+				s += 75 * (tonumber(out.amount) or 1)
+			elseif k == "Damage" then
+				local frac = tonumber(out.fraction) or 0.15
+				s -= (needHeal and 500 or 180) * frac
+			elseif k == "Fight" then
+				s -= 20
+			elseif k == "NextFight" then
+				s -= 15
+			end
+		end
+	end
+	return s
+end
+
+local function pickBestChoiceForOffer(offer, def, runState, hpRatio)
+	local choices = (type(offer) == "table" and type(offer.choices) == "table" and offer.choices)
+		or (type(def) == "table" and type(def.choices) == "table" and def.choices)
+	if not choices or #choices == 0 then
+		return 1
+	end
+
+	local bestStats = (type(runState) == "table" and type(runState.bestStats) == "table" and runState.bestStats) or {}
+	local bestChoiceIdx, bestChoiceScore = 1, -math.huge
+
+	for idx, ch in ipairs(choices) do
+		if type(ch) == "table" and not ch.locked and not ch.disabled then
+			local score = 10 - (idx * 0.1)
+			if ch.outcomes then
+				score += scoreOutcomeList(ch.outcomes, hpRatio)
+			end
+			if ch.success or ch.failure then
+				local p = tonumber(ch.chance) or 0.5
+				if type(ch.stat) == "string" and tonumber(bestStats[ch.stat]) then
+					p = math.clamp(p + tonumber(bestStats[ch.stat]) * 0.1, 0.1, 0.95)
+				end
+				score += p * scoreOutcomeList(ch.success, hpRatio) + (1 - p) * scoreOutcomeList(ch.failure, hpRatio)
+			end
+			if type(ch.cost) == "table" and tonumber(ch.cost.gold) then
+				score -= tonumber(ch.cost.gold) * 2
+			end
+			if score > bestChoiceScore then
+				bestChoiceScore = score
+				bestChoiceIdx = idx
+			end
+		end
+	end
+	return bestChoiceIdx
+end
+
+local function pickBestEncounterOffer(mods, offers, hpRatio)
+	if type(offers) ~= "table" or #offers == 0 then
+		return
+	end
+	local ratio = hpRatio or DungeonAuto.CurrentHpRatio or 1
+	local bestIdx, bestScore = 1, -math.huge
+	for idx, offer in ipairs(offers) do
+		if not offer.locked and not offer.disabled then
+			local def = mods.Encounters and mods.Encounters[offer.id]
+			local kind = offer.kind or (def and def.kind) or ""
+			local score = scoreEncounterKind(kind, ratio)
+			if score > bestScore then
+				bestScore = score
+				bestIdx = idx
+			end
+		end
+	end
+	local picked = offers[bestIdx]
+	if picked then
+		local def = mods.Encounters and mods.Encounters[picked.id]
+		local choiceIdx = pickBestChoiceForOffer(picked, def, DungeonAuto.RunState, ratio)
+		mods.Net.fireServer("PickEncounter", { offerIndex = bestIdx, choiceIndex = choiceIdx })
+		DungeonAuto.PendingOffers = nil
+		setDungeonStatus(string.format("PICKED · %s (c%d)", tostring(picked.id or bestIdx), choiceIdx))
+	end
+end
+
+DungeonTab:AddToggle({
+	Title = "Auto Pick Encounter",
+	Description = "Auto-picks offers & best StatCheck/event choice",
+	Default = DungeonAuto.AutoEncounter,
+	Callback = function(enabled)
+		DungeonAuto.AutoEncounter = enabled
+		Config.Set("Dungeon_AutoEncounter", enabled)
+		setDungeonStatus(enabled and "WAITING OFFERS" or "IDLE")
+		if enabled and DungeonAuto.PendingOffers then
+			local mods = getGameMods()
+			if mods then
+				task.spawn(pickBestEncounterOffer, mods, DungeonAuto.PendingOffers, DungeonAuto.CurrentHpRatio)
+			end
+		end
+	end,
+})
+
+DungeonTab:AddDropdown({
+	Title = "1st Priority",
+	Options = ENCOUNTER_PRIO_OPTIONS,
+	Default = DungeonAuto.Priority1,
+	Callback = function(choice)
+		DungeonAuto.Priority1 = choice
+		Config.Set("Dungeon_Prio1", choice)
+	end,
+})
+
+DungeonTab:AddDropdown({
+	Title = "2nd Priority",
+	Options = ENCOUNTER_PRIO_OPTIONS,
+	Default = DungeonAuto.Priority2,
+	Callback = function(choice)
+		DungeonAuto.Priority2 = choice
+		Config.Set("Dungeon_Prio2", choice)
+	end,
+})
+
+DungeonTab:AddDropdown({
+	Title = "3rd Priority",
+	Options = ENCOUNTER_PRIO_OPTIONS,
+	Default = DungeonAuto.Priority3,
+	Callback = function(choice)
+		DungeonAuto.Priority3 = choice
+		Config.Set("Dungeon_Prio3", choice)
+	end,
+})
+
+DungeonTab:AddSegmented({
+	Title = "Rest Below HP",
+	Options = { "35%", "50%", "65%" },
+	Default = Config.Get("Dungeon_RestBelow", "50%"),
+	Callback = function(pct)
+		Config.Set("Dungeon_RestBelow", pct)
+		DungeonAuto.RestThreshold = (tonumber(string.match(pct, "%d+")) or 50) / 100
+	end,
+})
+
+DungeonTab:AddToggle({
+	Title = "Auto Skip Merchant",
+	Description = "Automatically leaves Merchant stops during AFK runs",
+	Default = DungeonAuto.AutoSkipMerchant,
+	Callback = function(enabled)
+		DungeonAuto.AutoSkipMerchant = enabled
+		Config.Set("Dungeon_AutoSkipMerchant", enabled)
+	end,
+})
+
+DungeonTab:AddToggle({
+	Title = "Auto Replay Run",
+	Description = "Automatically votes Replay on Run Summary",
+	Default = DungeonAuto.AutoReplay,
+	Callback = function(enabled)
+		DungeonAuto.AutoReplay = enabled
+		Config.Set("Dungeon_AutoReplay", enabled)
+	end,
+})
+
+local function countChestsInInventory(mods, profile)
+	if type(profile) ~= "table" or type(profile.inventory) ~= "table" then
+		return 0
+	end
+	local total = 0
+	for _, item in ipairs(profile.inventory) do
+		local def = mods.Items[item.defId]
+		if def and (def.category == mods.Enums.ItemCategory.Chest or def.chest ~= nil) then
+			total += (item.count or 1)
+		end
+	end
+	return total
+end
+
+local function openAllChestsSafe(silentWhenEmpty)
+	local mods = getGameMods()
+	if not mods then
+		return
+	end
+	local ok, profile = pcall(mods.Net.getProfile)
+	if not ok or type(profile) ~= "table" then
+		return
+	end
+	local count = countChestsInInventory(mods, profile)
+	if count > 0 then
+		mods.Net.fireServer("OpenAllChests", {})
+		setDungeonStatus("OPENING · " .. tostring(count) .. " CHESTS")
+	elseif not silentWhenEmpty then
+		setDungeonStatus("NO CHESTS TO OPEN")
+	end
+end
+
+DungeonTab:AddToggle({
+	Title = "Auto Open All Chests",
+	Description = "Automatically opens all chests in inventory",
+	Default = DungeonAuto.AutoChests,
+	Callback = function(enabled)
+		DungeonAuto.AutoChests = enabled
+		Config.Set("Dungeon_AutoChests", enabled)
+		if enabled then
+			task.spawn(openAllChestsSafe, true)
+		end
+	end,
+})
+
+DungeonTab:AddButton({
+	Title = "Open All Chests Now",
+	Callback = function()
+		openAllChestsSafe(false)
+	end,
+})
+
+dungeonStatusCard = DungeonTab:AddStatusCard({
+	Title = "Dungeon Status",
+	Value = "IDLE",
+})
+
+-- Dungeon event listeners
+task.spawn(function()
+	local mods = getGameMods()
+	if not mods or not State.Alive then
+		return
+	end
+
+	trackConnection(mods.Net.onClientEvent("RunStateChanged", function(runState)
+		if not State.Alive or type(runState) ~= "table" then
+			return
+		end
+		DungeonAuto.RunState = runState
+		if type(runState.members) == "table" then
+			for _, m in ipairs(runState.members) do
+				if m.userId == LocalPlayer.UserId and m.maxHp and m.maxHp > 0 then
+					DungeonAuto.CurrentHpRatio = (m.hp or m.maxHp) / m.maxHp
+					break
+				end
+			end
+		end
+		local areaLabel = tostring(runState.areaId or "RUN")
+		local stepNum = runState.step or runState.room or runState.depth or runState.stage
+		local stepLabel = stepNum and (" #" .. tostring(stepNum)) or ""
+		setDungeonStatus(string.format("%s%s · HP %d%%", areaLabel, stepLabel, math.floor((DungeonAuto.CurrentHpRatio or 1) * 100 + 0.5)))
+		if DungeonAuto.AutoReady and LocalPlayer:GetAttribute("Opening") ~= nil then
+			pcall(function()
+				mods.Net.fireServer("SetRunReady", { ready = true })
+			end)
+		end
+	end))
+
+	trackConnection(mods.Net.onClientEvent("EncountersOffered", function(data)
+		if not State.Alive or type(data) ~= "table" or type(data.offers) ~= "table" then
+			return
+		end
+		DungeonAuto.PendingOffers = data.offers
+		if not DungeonAuto.AutoEncounter then
+			setDungeonStatus("OFFERS · " .. tostring(#data.offers))
+			return
+		end
+		task.delay(0.5, function()
+			if not State.Alive or not DungeonAuto.AutoEncounter or not DungeonAuto.PendingOffers then
+				return
+			end
+			pickBestEncounterOffer(mods, DungeonAuto.PendingOffers, DungeonAuto.CurrentHpRatio)
+		end)
+	end))
+
+	trackConnection(mods.Net.onClientEvent("MerchantOpened", function()
+		if not State.Alive then
+			return
+		end
+		if DungeonAuto.AutoSkipMerchant then
+			task.delay(0.4, function()
+				if State.Alive and DungeonAuto.AutoSkipMerchant then
+					mods.Net.fireServer("MerchantLeave", {})
+					setDungeonStatus("MERCHANT SKIPPED")
+				end
+			end)
+		else
+			setDungeonStatus("MERCHANT OPEN")
+		end
+	end))
+
+	local function clearOffers()
+		DungeonAuto.PendingOffers = nil
+	end
+	trackConnection(mods.Net.onClientEvent("EncounterResolved", clearOffers))
+	trackConnection(mods.Net.onClientEvent("ArenaExited", clearOffers))
+
+	trackConnection(mods.Net.onClientEvent("RunSummary", function(summary)
+		if not State.Alive or type(summary) ~= "table" then
+			return
+		end
+		if DungeonAuto.AutoReplay and summary.replay == true then
+			task.delay(0.8, function()
+				if State.Alive and DungeonAuto.AutoReplay then
+					mods.Net.fireServer("RequestReplay")
+					setDungeonStatus("REPLAY REQUESTED")
+				end
+			end)
+		else
+			setDungeonStatus("RUN ENDED")
+		end
+	end))
+end)
+
+trackThread(function()
+	while State.Alive do
+		task.wait(4)
+		if not State.Alive then
+			break
+		end
+		if DungeonAuto.AutoChests then
+			openAllChestsSafe(true)
+		end
+	end
+end)
+
+--// =========================================================================
+--// TAB 4: CARNIVAL & PETS (Minigame Auto-Farm, Pet Feeding, Skip Grow)
+--// =========================================================================
+local CarnivalTab = Window:AddTab("Carnival")
+
+local CarnivalAuto = {
+	Game = "PotionMatch",
+	Farming = false,
+	RunsCompleted = 0,
+}
+
+CarnivalTab:AddSection("Carnival Minigame Farm")
+
+local carnivalStatusCard
+local function setCarnivalStatus(text)
+	if carnivalStatusCard then
+		carnivalStatusCard:Set(text)
+	end
+end
+
+local function discoverCarnivalMinigames(mods)
+	local found = {}
+	local seen = {}
+	if mods then
+		for _, def in pairs(mods.Carnival or {}) do
+			if type(def) == "table" and type(def.game) == "string" and not seen[def.game] then
+				seen[def.game] = true
+				table.insert(found, def.game)
+			end
+		end
+		for name, _ in pairs((mods.NewLandsSpots and mods.NewLandsSpots.booths) or {}) do
+			if name ~= "SnackStall" and not seen[name] then
+				seen[name] = true
+				table.insert(found, name)
+			end
+		end
+	end
+	if #found == 0 then
+		return { "PotionMatch", "GhostMaze", "TowerTopple", "PetCannon", "PetDance", "SnackCatch" }
+	end
+	table.sort(found)
+	return found
+end
+
+local carnivalDropdown = CarnivalTab:AddDropdown({
+	Title = "Minigame",
+	Options = { "PotionMatch", "GhostMaze", "TowerTopple", "PetCannon", "PetDance", "SnackCatch" },
+	Default = "PotionMatch",
+	Callback = function(choice)
+		CarnivalAuto.Game = choice
+	end,
+})
+
+task.spawn(function()
+	local mods = getGameMods()
+	if mods and State.Alive then
+		local list = discoverCarnivalMinigames(mods)
+		carnivalDropdown:SetOptions(list, table.find(list, "PotionMatch") and "PotionMatch" or list[1])
+	end
+end)
+
+local function buildMinigameRun(mods, gameName)
+	local sys = mods.MinigamesSys
+	if gameName == "PotionMatch" then
+		return 4.2, { brewed = 120, moves = 8, best = 12 }
+	elseif gameName == "GhostMaze" then
+		return 6.2, { snacks = 12 }
+	elseif gameName == "TowerTopple" then
+		return 7.0, { shots = 3, down = sys.towerBlocks() }
+	elseif gameName == "PetCannon" then
+		return 9.2, { shots = 5, score = 15 }
+	elseif gameName == "PetDance" then
+		return 15.2, { played = 5, passed = 5 }
+	elseif gameName == "SnackCatch" then
+		return 20.0, { score = 72 }
+	elseif gameName == "BeatBubbles" then
+		local n = sys.beatNotes()
+		local song = sys.beatSong()
+		return song * 0.95, { great = n, good = 0, ok = 0, miss = 0 }
+	end
+	-- Fallback for newly added minigames using live spec table
+	local okSpec, spec = pcall(sys.spec, gameName)
+	if okSpec and type(spec) == "table" then
+		local waitTime = math.max(5, math.min(25, (spec.SECONDS or 15) * 0.45))
+		return waitTime, { score = (spec.PERFECT or 100), played = (spec.ROUNDS or 5), passed = (spec.ROUNDS or 5) }
+	end
+	return 8.0, {}
+end
+
+local function playCarnivalOnce(gameName)
+	local mods = getGameMods()
+	if not mods then
+		setCarnivalStatus("ERR · MODULES NOT READY")
+		return false
+	end
+
+	local spots = mods.NewLandsSpots
+	local booth = spots and spots.booths and spots.booths[gameName]
+	if booth and booth.stand and booth.stand.p then
+		teleportToPosition(booth.stand.p)
+		task.wait(0.25)
+	end
+
+	setCarnivalStatus("STARTING · " .. gameName)
+	local okStart, startRes = pcall(function()
+		return mods.Net.func("MinigameStart"):InvokeServer({ game = gameName, difficulty = "Normal" })
+	end)
+	if not okStart or type(startRes) ~= "table" or not startRes.ok then
+		local reason = type(startRes) == "table" and tostring(startRes.reason) or "Failed"
+		setCarnivalStatus("BLOCKED · " .. reason)
+		return false
+	end
+
+	local waitSec, resultPayload = buildMinigameRun(mods, gameName)
+	local startedAt = os.clock()
+	while State.Alive and (os.clock() - startedAt) < waitSec do
+		setCarnivalStatus(string.format("%s · %.1fs", gameName, waitSec - (os.clock() - startedAt)))
+		task.wait(0.25)
+		if not CarnivalAuto.Farming and not State.Alive then
+			return false
+		end
+	end
+
+	if not State.Alive then
+		return false
+	end
+
+	local okEnd, endRes = pcall(function()
+		return mods.Net.func("MinigameEnd"):InvokeServer({ game = gameName, result = resultPayload })
+	end)
+	if okEnd and type(endRes) == "table" and endRes.ok ~= false then
+		CarnivalAuto.RunsCompleted += 1
+		setCarnivalStatus("DONE (" .. tostring(CarnivalAuto.RunsCompleted) .. ") · " .. tostring(endRes.grade or "OK"))
+		return true
+	end
+	local reason = type(endRes) == "table" and tostring(endRes.reason) or "Rejected"
+	setCarnivalStatus("END ERR · " .. reason)
+	return false
+end
+
+CarnivalTab:AddToggle({
+	Title = "Auto Farm Minigame",
+	Description = "TPs to booth & submits plausible Perfect runs",
+	Default = false,
+	Callback = function(enabled)
+		CarnivalAuto.Farming = enabled
+		if not enabled then
+			setCarnivalStatus("IDLE · " .. tostring(CarnivalAuto.RunsCompleted) .. " runs")
+		end
+	end,
+})
+
+CarnivalTab:AddButton({
+	Title = "Run Selected Minigame Once",
+	Callback = function()
+		if not CarnivalAuto.Farming then
+			playCarnivalOnce(CarnivalAuto.Game)
+		end
+	end,
+})
+
+CarnivalTab:AddSection("Pet Helpers")
+
+CarnivalTab:AddButton({
+	Title = "Feed Equipped Pet (All Snacks)",
+	Callback = function()
+		local mods = getGameMods()
+		if not mods then
+			return
+		end
+		local ok, profile = pcall(mods.Net.getProfile)
+		if not ok or type(profile) ~= "table" then
+			setCarnivalStatus("ERR · NO PROFILE")
+			return
+		end
+		local petUid = profile.equipped and profile.equipped.Pet
+		if not petUid then
+			setCarnivalStatus("NO PET EQUIPPED")
+			return
+		end
+		local fed = 0
+		for _, item in ipairs(profile.inventory or {}) do
+			local def = mods.Items[item.defId]
+			if def and (def.snack ~= nil or def.shelf == "Snacks" or def.petFood or def.food) then
+				local cnt = item.count or 1
+				if cnt > 0 then
+					pcall(function()
+						mods.Net.func("FeedPet"):InvokeServer({ uid = petUid, snackId = item.defId, count = cnt })
+					end)
+					fed += cnt
+				end
+			end
+		end
+		setCarnivalStatus(fed > 0 and ("FED PET · " .. tostring(fed) .. " snacks") or "NO SNACKS IN BAG")
+	end,
+})
+
+CarnivalTab:AddButton({
+	Title = "Skip Equipped Pet Grow",
+	Callback = function()
+		local mods = getGameMods()
+		if not mods then
+			return
+		end
+		local ok, profile = pcall(mods.Net.getProfile)
+		local petUid = ok and profile and profile.equipped and profile.equipped.Pet
+		if petUid then
+			mods.Net.fireServer("WantPetSkip", { uid = petUid })
+			pcall(function()
+				mods.Net.func("SkipPetGrow"):InvokeServer({ uid = petUid })
+			end)
+			setCarnivalStatus("PET SKIP SENT")
+		else
+			setCarnivalStatus("NO PET EQUIPPED")
+		end
+	end,
+})
+
+carnivalStatusCard = CarnivalTab:AddStatusCard({
+	Title = "Carnival Status",
+	Value = "IDLE",
+})
+
+trackThread(function()
+	while State.Alive do
+		task.wait(0.4)
+		if not State.Alive then
+			break
+		end
+		if CarnivalAuto.Farming then
+			local ok = playCarnivalOnce(CarnivalAuto.Game)
+			task.wait(ok and 1.2 or 2.5)
+		end
+	end
+end)
+
+--// =========================================================================
+--// TAB 5: LOBBY & QOL (Teleports, AFK World, Daily/Gift, Quick-Sell, Codes)
+--// =========================================================================
+local LobbyTab = Window:AddTab("Lobby")
+
+LobbyTab:AddSection("Teleports")
+
+local lobbyPositions = {}
+local lobbyDropdown
+local selectedLocation = "AbyssGate"
+local lobbyStatusCard
+
+local function setLobbyStatus(text)
+	if lobbyStatusCard then
+		lobbyStatusCard:Set(text)
+	end
+end
+
+local function discoverLobbyTargets(mods)
+	table.clear(lobbyPositions)
+	local names = {}
+	local seen = {}
+
+	local function addSpot(label, pos)
+		if label and pos and not seen[label] then
+			seen[label] = true
+			lobbyPositions[label] = pos
+			table.insert(names, label)
+		end
+	end
+
+	-- Discover all Gates in Workspace (AbyssGate + any future update gates)
+	for _, child in ipairs(workspace:GetChildren()) do
+		if (child:IsA("Model") or child:IsA("BasePart")) and string.find(child.Name, "Gate") then
+			addSpot(child.Name, child:GetPivot().Position)
+		end
+	end
+
+	-- Carnival Plaza from live NewLandsSpots if available
+	if mods and mods.NewLandsSpots and mods.NewLandsSpots.carnivalSign and mods.NewLandsSpots.carnivalSign.p then
+		addSpot("Carnival Plaza", mods.NewLandsSpots.carnivalSign.p + Vector3.new(0, -8, 35))
+	else
+		addSpot("Carnival Plaza", Vector3.new(0, 4, 360))
+	end
+
+	-- Discover all Plots & Trainers in CampaignLobby dynamically
+	local lobby = workspace:FindFirstChild("CampaignLobby")
+	if lobby then
+		local plots = lobby:FindFirstChild("Plots")
+		if plots then
+			local plotList = {}
+			for _, m in ipairs(plots:GetChildren()) do
+				table.insert(plotList, m)
+			end
+			table.sort(plotList, function(a, b) return a.Name < b.Name end)
+			for _, m in ipairs(plotList) do
+				addSpot("Plot · " .. m.Name, m:GetPivot().Position)
+			end
+		end
+
+		local trainers = lobby:FindFirstChild("Trainers")
+		if trainers then
+			local trainerList = {}
+			for _, t in ipairs(trainers:GetChildren()) do
+				table.insert(trainerList, t)
+			end
+			table.sort(trainerList, function(a, b) return a.Name < b.Name end)
+			for _, t in ipairs(trainerList) do
+				addSpot("Trainer · " .. t.Name, t:GetPivot().Position)
+			end
+		end
+	end
+
+	if #names == 0 then
+		addSpot("Lobby Center", Vector3.new(0, 6, 450))
+	end
+	return names
+end
+
+local initialTargets = discoverLobbyTargets(nil)
+selectedLocation = initialTargets[1]
+
+lobbyDropdown = LobbyTab:AddDropdown({
+	Title = "Destination",
+	Options = initialTargets,
+	Default = selectedLocation,
+	Callback = function(choice)
+		selectedLocation = choice
+	end,
+})
+
+task.spawn(function()
+	local mods = getGameMods()
+	if mods and State.Alive then
+		local list = discoverLobbyTargets(mods)
+		lobbyDropdown:SetOptions(list, table.find(list, selectedLocation) and selectedLocation or list[1])
+		selectedLocation = lobbyDropdown:Get()
+	end
+end)
+
+LobbyTab:AddButton({
+	Title = "Teleport to Destination",
+	Callback = function()
+		local pos = lobbyPositions[selectedLocation]
+		if not pos then
+			local mods = getGameMods()
+			discoverLobbyTargets(mods)
+			pos = lobbyPositions[selectedLocation]
+		end
+		if pos and teleportToPosition(pos) then
+			setLobbyStatus("TP · " .. selectedLocation)
+		else
+			setLobbyStatus("NOT FOUND IN LOBBY")
+		end
+	end,
+})
+
+LobbyTab:AddButton({
+	Title = "Join AFK World",
+	Callback = function()
+		local mods = getGameMods()
+		if mods then
+			mods.Net.fireServer("AfkRejoin", {})
+			setLobbyStatus("JOINING AFK WORLD")
+		end
+	end,
+})
+
+LobbyTab:AddSection("Smart Auto Equip")
+
+local AutoEquip = {
+	Enabled = Config.Get("AutoEquip", false),
+	Element = Config.Get("AutoEquipElement", "Auto (My School)"),
+	Busy = false,
+	LastRunAt = 0,
+}
+
+local EQUIP_SLOTS_ORDER = { "Weapon", "Offhand", "Helmet", "Outfit", "Backpack", "Charm1", "Charm2", "Charm3" }
+local RARITY_WEIGHT = { Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5, Mythic = 6 }
+
+local function scoreGearForSchool(mods, profile, item, def, slot, targetSchool)
+	local Inventory = mods.Inventory
+	local schoolDef = targetSchool and mods.Schools.defs[targetSchool]
+
+	local fakeProfile = {
+		inventory = { item },
+		equipped = { [slot] = item.uid },
+		level = profile.level or 1,
+		primarySchool = targetSchool or profile.primarySchool,
+	}
+
+	local okStats, stats = pcall(Inventory.equippedStats, fakeProfile)
+	local okHp, bonusHp = pcall(Inventory.equippedMaxHp, fakeProfile)
+	if not okStats or type(stats) ~= "table" then
+		stats = def.stats or {}
+	end
+	if not okHp or type(bonusHp) ~= "number" then
+		bonusHp = 0
+	end
+
+	local sameElement = false
+	if targetSchool then
+		local okNamed, named = pcall(Inventory.namesSchool, item.defId, targetSchool)
+		if okNamed and named then
+			sameElement = true
+		elseif schoolDef and (
+			(stats[schoolDef.damageBonus] or 0) > 0
+			or (stats[schoolDef.pierce] or 0) > 0
+			or (stats[schoolDef.resistance] or 0) > 0
+		) then
+			sameElement = true
+		end
+	end
+
+	local score = 0
+	if schoolDef then
+		score += (stats[schoolDef.damageBonus] or 0) * 1200
+		score += (stats[schoolDef.pierce] or 0) * 700
+		score += (stats[schoolDef.resistance] or 0) * 260
+	end
+
+	score += ((stats.AllDamage or 0) + (stats.OwnDamage or 0)) * 1050
+	score += (stats.Pierce or 0) * 600
+	score += (stats.PowerPipChance or 0) * 550
+	score += (stats.CritChance or 0) * 480
+	score += (stats.Accuracy or 0) * 320
+	score += (stats.CritDamage or 0) * 260
+	score += (stats.AllResistance or 0) * 240
+	score += (stats.Haste or 0) * 200
+	score += (stats.BlockChance or 0) * 180
+	score += (stats.StatusResistance or 0) * 160
+	local healWeight = (targetSchool == "Light" or targetSchool == "Nature") and 450 or 180
+	score += (stats.HealingBonus or 0) * healWeight
+	score += ((stats.MaxHealth or 0) + bonusHp) * 1.4
+
+	-- Small fallback credit for off-element stats only when no same-element/universal stat exists
+	for statName, val in pairs(stats) do
+		if type(val) == "number" and val > 0 then
+			if string.find(statName, "Damage$") and statName ~= "AllDamage" and statName ~= "OwnDamage" and statName ~= "CritDamage" and (not schoolDef or statName ~= schoolDef.damageBonus) then
+				score += val * 30
+			elseif string.find(statName, "Pierce$") and statName ~= "Pierce" and (not schoolDef or statName ~= schoolDef.pierce) then
+				score += val * 20
+			elseif string.find(statName, "Resistance$") and statName ~= "AllResistance" and statName ~= "StatusResistance" and (not schoolDef or statName ~= schoolDef.resistance) then
+				score += val * 15
+			end
+		end
+	end
+
+	local rarityVal = RARITY_WEIGHT[def.rarity] or 1
+	score += (rarityVal * 0.25) + ((item.tier or 0) * 0.6)
+
+	return sameElement, score
+end
+
+local function runSmartAutoEquip(silentNoChange)
+	if AutoEquip.Busy then
+		return
+	end
+	local mods = getGameMods()
+	if not mods or not mods.Inventory or not mods.Schools then
+		return
+	end
+	if mods.Place and mods.Place.loadoutLocked() then
+		if not silentNoChange then
+			setLobbyStatus("EQUIP LOCKED IN RUN")
+		end
+		return
+	end
+
+	AutoEquip.Busy = true
+	local ok, resultText = pcall(function()
+		local okProf, profile = pcall(mods.Net.getProfile)
+		if not okProf or type(profile) ~= "table" then
+			return "ERR · NO PROFILE"
+		end
+
+		local mySchool = profile.primarySchool
+		local targetSchool = (AutoEquip.Element == "Auto (My School)" or AutoEquip.Element == "") and mySchool or AutoEquip.Element
+		local playerLevel = profile.level or 1
+		local equipped = profile.equipped or {}
+		local usedUids = {}
+		local changes = 0
+
+		for _, slot in ipairs(EQUIP_SLOTS_ORDER) do
+			local bestSame, bestSameScore = nil, -math.huge
+			local bestAny, bestAnyScore = nil, -math.huge
+
+			for _, item in ipairs(profile.inventory or {}) do
+				if not usedUids[item.uid] then
+					local def = mods.Items[item.defId]
+					if def
+						and mods.Inventory.fits(def, slot)
+						and mods.Inventory.schoolCanWear(mySchool, item.defId)
+						and not mods.Inventory.expired(item)
+						and (def.minLevel or 1) <= playerLevel
+					then
+						local isSame, score = scoreGearForSchool(mods, profile, item, def, slot, targetSchool)
+						local isCurrentlyEquipped = (equipped[slot] == item.uid) and 0.001 or 0
+						if isSame and (score + isCurrentlyEquipped) > bestSameScore then
+							bestSameScore = score + isCurrentlyEquipped
+							bestSame = item
+						end
+						if (score + isCurrentlyEquipped) > bestAnyScore then
+							bestAnyScore = score + isCurrentlyEquipped
+							bestAny = item
+						end
+					end
+				end
+			end
+
+			local chosen = bestSame or bestAny
+			if chosen then
+				usedUids[chosen.uid] = true
+				if equipped[slot] ~= chosen.uid then
+					mods.Net.fireServer("EquipItem", { uid = chosen.uid, slot = slot })
+					changes += 1
+					task.wait(0.06)
+				end
+			end
+		end
+
+		if changes > 0 then
+			return string.format("EQUIPPED · %d slots (%s)", changes, tostring(targetSchool or "Any"))
+		end
+		return nil
+	end)
+	AutoEquip.LastRunAt = os.clock()
+	AutoEquip.Busy = false
+
+	if ok then
+		if resultText then
+			setLobbyStatus(resultText)
+		elseif not silentNoChange then
+			setLobbyStatus("BEST GEAR EQUIPPED")
+		end
+	else
+		setLobbyStatus("EQUIP ERR")
+	end
+end
+
+LobbyTab:AddToggle({
+	Title = "Auto Equip Best Gear",
+	Description = "Matches element first, then next-best weapon & armor",
+	Default = AutoEquip.Enabled,
+	Callback = function(enabled)
+		AutoEquip.Enabled = enabled
+		Config.Set("AutoEquip", enabled)
+		if enabled then
+			task.spawn(runSmartAutoEquip, false)
+		end
+	end,
+})
+
+local elementDropdown = LobbyTab:AddDropdown({
+	Title = "Preferred Element",
+	Options = { "Auto (My School)", "Flame", "Frost", "Storm", "Wind", "Light", "Nature", "Shadow", "Steel" },
+	Default = AutoEquip.Element,
+	Callback = function(choice)
+		AutoEquip.Element = choice
+		Config.Set("AutoEquipElement", choice)
+		if AutoEquip.Enabled then
+			task.spawn(runSmartAutoEquip, false)
+		end
+	end,
+})
+
+task.spawn(function()
+	local mods = getGameMods()
+	if mods and State.Alive and mods.Schools and type(mods.Schools.order) == "table" then
+		local opts = { "Auto (My School)" }
+		for _, s in ipairs(mods.Schools.order) do
+			table.insert(opts, s)
+		end
+		elementDropdown:SetOptions(opts, elementDropdown:Get())
+	end
+
+	if mods and State.Alive then
+		local function onLootOrProfile()
+			if State.Alive and AutoEquip.Enabled and (os.clock() - AutoEquip.LastRunAt) >= 1.2 then
+				task.delay(0.35, function()
+					if State.Alive and AutoEquip.Enabled then
+						runSmartAutoEquip(true)
+					end
+				end)
+			end
+		end
+		trackConnection(mods.Net.onClientEvent("ProfileChanged", onLootOrProfile))
+		trackConnection(mods.Net.onClientEvent("ChestOpened", onLootOrProfile))
+	end
+end)
+
+LobbyTab:AddButton({
+	Title = "Smart Auto Equip Now",
+	Callback = function()
+		runSmartAutoEquip(false)
+	end,
+})
+
+LobbyTab:AddSection("Account & Inventory")
+
+LobbyTab:AddButton({
+	Title = "Claim Daily & Favorite Gift",
+	Callback = function()
+		local mods = getGameMods()
+		if mods then
+			mods.Net.fireServer("ClaimDaily", {})
+			mods.Net.fireServer("ClaimFavoriteGift", {})
+			setLobbyStatus("CLAIMED DAILY + GIFT")
+		end
+	end,
+})
+
+local sellRarityMode = "Common"
+LobbyTab:AddSegmented({
+	Title = "Quick-Sell Tier",
+	Options = { "Common", "Uncommon+" },
+	Default = "Common",
+	Callback = function(opt)
+		sellRarityMode = opt
+	end,
+})
+
+LobbyTab:AddButton({
+	Title = "Quick-Sell Unequipped Gear",
+	Callback = function()
+		local mods = getGameMods()
+		if not mods then
+			return
+		end
+		local ok, profile = pcall(mods.Net.getProfile)
+		if not ok or type(profile) ~= "table" then
+			setLobbyStatus("ERR · NO PROFILE")
+			return
+		end
+
+		local equippedUids = {}
+		for _, uid in pairs(profile.equipped or {}) do
+			equippedUids[uid] = true
+		end
+
+		local allowUncommon = (sellRarityMode == "Uncommon+")
+		local sold = 0
+		for _, item in ipairs(profile.inventory or {}) do
+			local def = mods.Items[item.defId]
+			if def
+				and not equippedUids[item.uid]
+				and (item.tier or 0) == 0
+				and def.slot
+				and def.slot ~= "Pet"
+				and def.slot ~= "Mount"
+				and (def.rarity == "Common" or (allowUncommon and def.rarity == "Uncommon"))
+			then
+				local okSell, res = pcall(function()
+					return mods.Net.func("QuickSell"):InvokeServer({ defId = item.defId, uid = item.uid })
+				end)
+				if okSell and res then
+					sold += 1
+				end
+				task.wait(0.08)
+			end
+		end
+		setLobbyStatus("SOLD · " .. tostring(sold) .. " items")
+	end,
+})
+
+LobbyTab:AddInput({
+	Title = "Code",
+	Placeholder = "Enter redeem code...",
+	ButtonText = "Redeem",
+	Callback = function(codeText, box)
+		local code = string.gsub(tostring(codeText or ""), "^%s*(.-)%s*$", "%1")
+		if code == "" then
+			setLobbyStatus("ENTER A CODE FIRST")
+			return
+		end
+		local mods = getGameMods()
+		if not mods then
+			return
+		end
+		local ok, res = pcall(function()
+			return mods.Net.func("RedeemCode"):InvokeServer(code)
+		end)
+		if ok and type(res) == "table" then
+			if res.ok then
+				box.Text = ""
+				setLobbyStatus("REDEEMED · " .. code)
+			else
+				setLobbyStatus("CODE · " .. tostring(res.reason or "Failed"))
+			end
+		else
+			setLobbyStatus("CODE REQUEST FAILED")
+		end
+	end,
+})
+
+lobbyStatusCard = LobbyTab:AddStatusCard({
+	Title = "Lobby Status",
+	Value = "READY",
+})
+
+--// =========================================================================
+--// TAB 6: SETTINGS
+--// =========================================================================
+local SettingsTab = Window:AddTab("Settings")
+SettingsTab:AddSection("Auto-Update Sync")
+
+local versionCard = SettingsTab:AddStatusCard({
+	Title = "Game Build",
+	Value = "v" .. tostring(game.PlaceVersion),
+})
+
+local syncedDataCard = SettingsTab:AddStatusCard({
+	Title = "Live Registry",
+	Value = "Loading...",
+})
+
+local function refreshAllGameData(force)
+	local mods = getGameMods(force)
+	if not mods then
+		syncedDataCard:Set("UNAVAILABLE")
+		return
+	end
+	rebuildTriviaLookup(mods)
+	local cList = discoverCarnivalMinigames(mods)
+	carnivalDropdown:SetOptions(cList, carnivalDropdown:Get())
+	local lList = discoverLobbyTargets(mods)
+	lobbyDropdown:SetOptions(lList, lobbyDropdown:Get())
+
+	versionCard:Set("v" .. tostring(game.PlaceVersion) .. " · " .. tostring(mods.VersionId))
+	local s = mods.Stats
+	syncedDataCard:Set(string.format("%d cards · %d bosses · %d trivia", s.Abilities, s.Bosses, s.Trivia))
+end
+
+task.spawn(function()
+	task.wait(0.2)
+	if State.Alive then
+		refreshAllGameData(false)
+	end
+end)
+
+SettingsTab:AddButton({
+	Title = "Refresh Game Data",
+	Callback = function()
+		refreshAllGameData(true)
+	end,
+})
+
+SettingsTab:AddSection("Auto-Execute & Persistence")
+
+local teleportStatusCard = SettingsTab:AddStatusCard({
+	Title = "Teleport Loader",
+	Value = getTeleportScriptPath() and ("READY · " .. getTeleportScriptPath()) or "SYNC NEEDED",
+})
+
+SettingsTab:AddToggle({
+	Title = "Auto-Execute on Teleport",
+	Description = "Reloads script & settings when joining a new server",
+	Default = Config.Get("AutoExecute", true),
+	Callback = function(enabled)
+		Config.Set("AutoExecute", enabled)
+		if enabled then
+			local ok = queueTeleportAutoExec()
+			local path = getTeleportScriptPath()
+			if ok and path then
+				teleportStatusCard:Set("READY · " .. path)
+			elseif not path then
+				teleportStatusCard:Set("MISSING WORKSPACE FILE")
+			else
+				teleportStatusCard:Set("QUEUE UNSUPPORTED")
+			end
+		else
+			teleportStatusCard:Set("DISABLED")
+		end
+	end,
+})
+
+SettingsTab:AddSection("Interface")
+
+SettingsTab:AddStatusCard({
+	Title = "Toggle Keybind",
+	Value = "RightShift",
+})
+
+SettingsTab:AddButton({
+	Title = "Unload Script",
+	Callback = cleanup,
+})
