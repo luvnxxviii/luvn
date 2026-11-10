@@ -1739,7 +1739,9 @@ end)
 GeneralTab:AddButton({
 	Title = "Rejoin Current Server",
 	Callback = function()
-		TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+		pcall(function()
+			TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+		end)
 	end,
 })
 
@@ -1750,21 +1752,23 @@ trackThread(function()
 		if not State.Alive then
 			break
 		end
-		if Movement.SpeedEnabled then
-			local char = LocalPlayer.Character
-			local hum = char and char:FindFirstChildOfClass("Humanoid")
-			if hum and hum.WalkSpeed ~= Movement.WalkSpeed then
-				hum.WalkSpeed = Movement.WalkSpeed
+		pcall(function()
+			if Movement.SpeedEnabled then
+				local char = LocalPlayer.Character
+				local hum = char and char:FindFirstChildOfClass("Humanoid")
+				if hum and hum.WalkSpeed ~= Movement.WalkSpeed then
+					hum.WalkSpeed = Movement.WalkSpeed
+				end
 			end
-		end
-		if AntiAFK.Enabled then
-			if AntiAFK.Mode == "Idled + Pulse" and (os.clock() - lastPulse) >= 90 then
-				lastPulse = os.clock()
-				sendVirtualNudge()
-				AntiAFK.BlockedCount += 1
+			if AntiAFK.Enabled then
+				if AntiAFK.Mode == "Idled + Pulse" and (os.clock() - lastPulse) >= 90 then
+					lastPulse = os.clock()
+					sendVirtualNudge()
+					AntiAFK.BlockedCount += 1
+				end
+				updateAntiAfkReadout()
 			end
-			updateAntiAfkReadout()
-		end
+		end)
 	end
 end)
 
@@ -1788,6 +1792,7 @@ local CombatAuto = {
 	Busy = false,
 	LastActionAt = 0,
 	LastDiscardTurnKey = nil,
+	AimingSince = nil,
 }
 
 CombatTab:AddSection("Combat Automation")
@@ -3047,6 +3052,30 @@ local function pickBestFreeShield(freeShields, aliveEnemies, me)
 	return bestEntry
 end
 
+local function getCasterRedirectInfo(Statuses, me)
+	local hasRedirect = false
+	local redirectName = nil
+	local isBlinded = false
+	for _, entry in ipairs(me and me.statuses or {}) do
+		local sid = (type(entry) == "table" and entry.id) or entry
+		local st = type(sid) == "string" and Statuses[sid]
+		if st then
+			if st.turnsNext == true then
+				hasRedirect = true
+				redirectName = st.name or sid
+			end
+			if st.missesNext == true then
+				isBlinded = true
+			end
+		end
+	end
+	return {
+		hasRedirect = hasRedirect,
+		redirectName = redirectName,
+		isBlinded = isBlinded,
+	}
+end
+
 local function pickAttackEntry(mods, state, me, usableEntries, deckRem)
 	local powerUps = {}
 	local freeShields = {}
@@ -3223,30 +3252,6 @@ local function pickAttackEntry(mods, state, me, usableEntries, deckRem)
 	end
 
 	return nil, nil
-end
-
-local function getCasterRedirectInfo(Statuses, me)
-	local hasRedirect = false
-	local redirectName = nil
-	local isBlinded = false
-	for _, entry in ipairs(me and me.statuses or {}) do
-		local sid = (type(entry) == "table" and entry.id) or entry
-		local st = type(sid) == "string" and Statuses[sid]
-		if st then
-			if st.turnsNext == true then
-				hasRedirect = true
-				redirectName = st.name or sid
-			end
-			if st.missesNext == true then
-				isBlinded = true
-			end
-		end
-	end
-	return {
-		hasRedirect = hasRedirect,
-		redirectName = redirectName,
-		isBlinded = isBlinded,
-	}
 end
 
 local function getCombatantDebuffCount(Statuses, c, filterIds)
@@ -3949,6 +3954,18 @@ local function runCombatStep()
 
 	local state, myId, snapStatus = getCombatSnapshot(mods)
 	if not state or not myId then
+		if snapStatus == "AIMING" then
+			CombatAuto.AimingSince = CombatAuto.AimingSince or os.clock()
+			if (os.clock() - CombatAuto.AimingSince) >= 1.2 and mods.CombatUI and type(mods.CombatUI.stopAiming) == "function" then
+				pcall(mods.CombatUI.stopAiming)
+				CombatAuto.AimingSince = nil
+				setCombatStatus("RECOVERED · AIM")
+			else
+				setCombatStatus("WAIT · AIMING")
+			end
+			return
+		end
+		CombatAuto.AimingSince = nil
 		if snapStatus == "ENEMY TURN" then
 			setCombatStatus("WAIT · ENEMY TURN")
 		elseif snapStatus == "BUSY / ANIM" then
@@ -3958,6 +3975,7 @@ local function runCombatStep()
 		end
 		return
 	end
+	CombatAuto.AimingSince = nil
 
 	local me = state.combatants[myId]
 	local entries = collectEntries(mods, state, me, false)
@@ -4046,17 +4064,20 @@ local function runCombatStep()
 			local used = CombatUI.use(chosen.id, chosen.slot)
 			if used and CombatUI.isAiming() then
 				if targetId then
-					CombatUI.aimAt(targetId)
+					pcall(CombatUI.aimAt, targetId)
 				end
 				if CombatUI.isAiming() then
 					local aimable = CombatUI.aimableNow()
 					if aimable and aimable[1] then
-						CombatUI.aimAt(aimable[1])
-					else
-						CombatUI.stopAiming()
+						pcall(CombatUI.aimAt, aimable[1])
 					end
 				end
-			elseif not used then
+				if CombatUI.isAiming() then
+					pcall(CombatUI.stopAiming)
+					used = false
+				end
+			end
+			if not used then
 				-- Direct SubmitAction fallback if CombatUI.use refused due to UI/split-VM state
 				local tk = chosen.ability.targetKind
 				local needsTarget = (tk == "SingleEnemy" or tk == "SingleAlly" or tk == "SingleAny" or (tk == "SelfOnly" and chosen.ability.ally == true))
@@ -4255,7 +4276,9 @@ task.spawn(function()
 				return
 			end
 			if payload.choosing then
-				mods.Net.fireServer("TriviaVote", { choice = 1 })
+				pcall(function()
+					mods.Net.fireServer("TriviaVote", { choice = 1 })
+				end)
 				setCombatStatus("TRIVIA · VOTED TOPIC")
 				return
 			end
@@ -4264,7 +4287,9 @@ task.spawn(function()
 			if answer and type(payload.options) == "table" then
 				for idx, opt in ipairs(payload.options) do
 					if opt == answer or string.lower(tostring(opt)) == string.lower(answer) then
-						mods.Net.fireServer("TriviaVote", { choice = idx })
+						pcall(function()
+							mods.Net.fireServer("TriviaVote", { choice = idx })
+						end)
 						setCombatStatus("TRIVIA · " .. tostring(answer))
 						return
 					end
@@ -4286,7 +4311,11 @@ trackThread(function()
 			end
 		end
 		if CombatAuto.Enabled then
-			runCombatStep()
+			local okStep, stepErr = pcall(runCombatStep)
+			if not okStep then
+				CombatAuto.Busy = false
+				setCombatStatus("ERR · " .. tostring(stepErr))
+			end
 		end
 	end
 end)
@@ -4525,7 +4554,9 @@ local function pickBestEncounterOffer(mods, offers, hpRatio)
 		local btn = findRunUiChoiceButton(bestIdx, choiceIdx)
 		local firedUi = btn and btn:GetAttribute("Locked") ~= true and fireGuiButton(btn)
 		if not firedUi then
-			mods.Net.fireServer("PickEncounter", { offerIndex = bestIdx, choiceIndex = choiceIdx })
+			pcall(function()
+				mods.Net.fireServer("PickEncounter", { offerIndex = bestIdx, choiceIndex = choiceIdx })
+			end)
 		end
 		DungeonAuto.PendingOffers = nil
 		setDungeonStatus(string.format("PICKED · %s (c%d)", tostring(picked.id or bestIdx), choiceIdx))
@@ -4646,7 +4677,9 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 			DungeonAuto.VotedCurrentSummary = true
 			DungeonAuto.LastReplayAttemptAt = os.clock()
 			DungeonAuto.ReplayAttempts = (DungeonAuto.ReplayAttempts or 0) + 1
-			mods.Net.fireServer("RequestReplay")
+			pcall(function()
+				mods.Net.fireServer("RequestReplay")
+			end)
 			setDungeonStatus("REPLAY REQUESTED")
 		end
 		return
@@ -4682,7 +4715,9 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 			fireGuiButton(replayBtn)
 		end
 		if replayBtn.Text ~= "Replaying" and not DungeonAuto.VotedCurrentSummary then
-			mods.Net.fireServer("RequestReplay")
+			pcall(function()
+				mods.Net.fireServer("RequestReplay")
+			end)
 		end
 		DungeonAuto.VotedCurrentSummary = true
 		setDungeonStatus("REPLAY VOTED")
@@ -4696,7 +4731,9 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 	then
 		DungeonAuto.LastReplayAttemptAt = os.clock()
 		DungeonAuto.ReplayAttempts = (DungeonAuto.ReplayAttempts or 0) + 1
-		mods.Net.fireServer("RequestReplay")
+		pcall(function()
+			mods.Net.fireServer("RequestReplay")
+		end)
 		setDungeonStatus(string.format("REPLAY RETRY (%d/3)", DungeonAuto.ReplayAttempts))
 	end
 end
@@ -4801,7 +4838,9 @@ local function openAllChestsSafe(silentWhenEmpty)
 	end
 	local count = countChestsInInventory(mods, profile)
 	if count > 0 then
-		mods.Net.fireServer("OpenAllChests", {})
+		pcall(function()
+			mods.Net.fireServer("OpenAllChests", {})
+		end)
 		setDungeonStatus("OPENING · " .. tostring(count) .. " CHESTS")
 	elseif not silentWhenEmpty then
 		setDungeonStatus("NO CHESTS TO OPEN")
@@ -4889,7 +4928,9 @@ task.spawn(function()
 		if DungeonAuto.AutoSkipMerchant then
 			task.delay(0.8, function()
 				if State.Alive and DungeonAuto.AutoSkipMerchant then
-					mods.Net.fireServer("MerchantLeave", {})
+					pcall(function()
+						mods.Net.fireServer("MerchantLeave", {})
+					end)
 					setDungeonStatus("MERCHANT SKIPPED")
 				end
 			end)
@@ -5000,16 +5041,18 @@ trackThread(function()
 		if not State.Alive then
 			break
 		end
-		if DungeonAuto.AutoReplay or CombatAuto.Enabled then
-			tryContinueAfterDeath(false)
-		end
-		if DungeonAuto.AutoReplay then
-			tryVoteReplay(false, false)
-		end
-		chestTick += 1
-		if DungeonAuto.AutoChests and (chestTick % 5 == 0) then
-			openAllChestsSafe(true)
-		end
+		pcall(function()
+			if DungeonAuto.AutoReplay or CombatAuto.Enabled then
+				tryContinueAfterDeath(false)
+			end
+			if DungeonAuto.AutoReplay then
+				tryVoteReplay(false, false)
+			end
+			chestTick += 1
+			if DungeonAuto.AutoChests and (chestTick % 5 == 0) then
+				openAllChestsSafe(true)
+			end
+		end)
 	end
 end)
 
@@ -5075,13 +5118,14 @@ task.spawn(function()
 end)
 
 local function buildMinigameRun(mods, gameName)
-	local sys = mods.MinigamesSys
+	local sys = type(mods.MinigamesSys) == "table" and mods.MinigamesSys or nil
 	if gameName == "PotionMatch" then
 		return 4.2, { brewed = 120, moves = 8, best = 12 }
 	elseif gameName == "GhostMaze" then
 		return 6.2, { snacks = 12 }
 	elseif gameName == "TowerTopple" then
-		return 7.0, { shots = 3, down = sys.towerBlocks() }
+		local blocks = (sys and type(sys.towerBlocks) == "function" and sys.towerBlocks()) or 10
+		return 7.0, { shots = 3, down = blocks }
 	elseif gameName == "PetCannon" then
 		return 9.2, { shots = 5, score = 15 }
 	elseif gameName == "PetDance" then
@@ -5089,12 +5133,15 @@ local function buildMinigameRun(mods, gameName)
 	elseif gameName == "SnackCatch" then
 		return 20.0, { score = 72 }
 	elseif gameName == "BeatBubbles" then
-		local n = sys.beatNotes()
-		local song = sys.beatSong()
+		local n = (sys and type(sys.beatNotes) == "function" and sys.beatNotes()) or 40
+		local song = (sys and type(sys.beatSong) == "function" and sys.beatSong()) or 18
 		return song * 0.95, { great = n, good = 0, ok = 0, miss = 0 }
 	end
 	-- Fallback for newly added minigames using live spec table
-	local okSpec, spec = pcall(sys.spec, gameName)
+	local okSpec, spec = false, nil
+	if sys and type(sys.spec) == "function" then
+		okSpec, spec = pcall(sys.spec, gameName)
+	end
 	if okSpec and type(spec) == "table" then
 		local waitTime = math.max(5, math.min(25, (spec.SECONDS or 15) * 0.45))
 		return waitTime, { score = (spec.PERFECT or 100), played = (spec.ROUNDS or 5), passed = (spec.ROUNDS or 5) }
@@ -5103,54 +5150,66 @@ local function buildMinigameRun(mods, gameName)
 end
 
 local function playCarnivalOnce(gameName)
-	local mods = getGameMods()
-	if not mods then
-		setCarnivalStatus("ERR · MODULES NOT READY")
+	if CarnivalAuto.Busy then
 		return false
 	end
-
-	local spots = mods.NewLandsSpots
-	local booth = spots and spots.booths and spots.booths[gameName]
-	if booth and booth.stand and booth.stand.p then
-		teleportToPosition(booth.stand.p)
-		task.wait(0.25)
-	end
-
-	setCarnivalStatus("STARTING · " .. gameName)
-	local okStart, startRes = pcall(function()
-		return mods.Net.func("MinigameStart"):InvokeServer({ game = gameName, difficulty = "Normal" })
-	end)
-	if not okStart or type(startRes) ~= "table" or not startRes.ok then
-		local reason = type(startRes) == "table" and tostring(startRes.reason) or "Failed"
-		setCarnivalStatus("BLOCKED · " .. reason)
-		return false
-	end
-
-	local waitSec, resultPayload = buildMinigameRun(mods, gameName)
-	local startedAt = os.clock()
-	while State.Alive and (os.clock() - startedAt) < waitSec do
-		setCarnivalStatus(string.format("%s · %.1fs", gameName, waitSec - (os.clock() - startedAt)))
-		task.wait(0.25)
-		if not CarnivalAuto.Farming and not State.Alive then
+	CarnivalAuto.Busy = true
+	local okRun, res = pcall(function()
+		local mods = getGameMods()
+		if not mods then
+			setCarnivalStatus("ERR · MODULES NOT READY")
 			return false
 		end
-	end
 
-	if not State.Alive then
+		local spots = mods.NewLandsSpots
+		local booth = spots and spots.booths and spots.booths[gameName]
+		if booth and booth.stand and booth.stand.p then
+			teleportToPosition(booth.stand.p)
+			task.wait(0.25)
+		end
+
+		setCarnivalStatus("STARTING · " .. gameName)
+		local okStart, startRes = pcall(function()
+			return mods.Net.func("MinigameStart"):InvokeServer({ game = gameName, difficulty = "Normal" })
+		end)
+		if not okStart or type(startRes) ~= "table" or not startRes.ok then
+			local reason = type(startRes) == "table" and tostring(startRes.reason) or "Failed"
+			setCarnivalStatus("BLOCKED · " .. reason)
+			return false
+		end
+
+		local waitSec, resultPayload = buildMinigameRun(mods, gameName)
+		local startedAt = os.clock()
+		while State.Alive and (os.clock() - startedAt) < waitSec do
+			setCarnivalStatus(string.format("%s · %.1fs", gameName, waitSec - (os.clock() - startedAt)))
+			task.wait(0.25)
+			if not CarnivalAuto.Farming and not State.Alive then
+				return false
+			end
+		end
+
+		if not State.Alive then
+			return false
+		end
+
+		local okEnd, endRes = pcall(function()
+			return mods.Net.func("MinigameEnd"):InvokeServer({ game = gameName, result = resultPayload })
+		end)
+		if okEnd and type(endRes) == "table" and endRes.ok ~= false then
+			CarnivalAuto.RunsCompleted += 1
+			setCarnivalStatus("DONE (" .. tostring(CarnivalAuto.RunsCompleted) .. ") · " .. tostring(endRes.grade or "OK"))
+			return true
+		end
+		local reason = type(endRes) == "table" and tostring(endRes.reason) or "Rejected"
+		setCarnivalStatus("END ERR · " .. reason)
+		return false
+	end)
+	CarnivalAuto.Busy = false
+	if not okRun then
+		setCarnivalStatus("CARNIVAL ERR")
 		return false
 	end
-
-	local okEnd, endRes = pcall(function()
-		return mods.Net.func("MinigameEnd"):InvokeServer({ game = gameName, result = resultPayload })
-	end)
-	if okEnd and type(endRes) == "table" and endRes.ok ~= false then
-		CarnivalAuto.RunsCompleted += 1
-		setCarnivalStatus("DONE (" .. tostring(CarnivalAuto.RunsCompleted) .. ") · " .. tostring(endRes.grade or "OK"))
-		return true
-	end
-	local reason = type(endRes) == "table" and tostring(endRes.reason) or "Rejected"
-	setCarnivalStatus("END ERR · " .. reason)
-	return false
+	return res == true
 end
 
 CarnivalTab:AddToggle({
@@ -5220,7 +5279,9 @@ CarnivalTab:AddButton({
 		local ok, profile = pcall(mods.Net.getProfile)
 		local petUid = ok and profile and profile.equipped and profile.equipped.Pet
 		if petUid then
-			mods.Net.fireServer("WantPetSkip", { uid = petUid })
+			pcall(function()
+				mods.Net.fireServer("WantPetSkip", { uid = petUid })
+			end)
 			pcall(function()
 				mods.Net.func("SkipPetGrow"):InvokeServer({ uid = petUid })
 			end)
@@ -5243,8 +5304,8 @@ trackThread(function()
 			break
 		end
 		if CarnivalAuto.Farming then
-			local ok = playCarnivalOnce(CarnivalAuto.Game)
-			task.wait(ok and 1.2 or 2.5)
+			local okCall, okRun = pcall(playCarnivalOnce, CarnivalAuto.Game)
+			task.wait((okCall and okRun) and 1.2 or 2.5)
 		end
 	end
 end)
@@ -5371,7 +5432,9 @@ LobbyTab:AddButton({
 	Callback = function()
 		local mods = getGameMods()
 		if mods then
-			mods.Net.fireServer("AfkRejoin", {})
+			pcall(function()
+				mods.Net.fireServer("AfkRejoin", {})
+			end)
 			setLobbyStatus("JOINING AFK WORLD")
 		end
 	end,
@@ -5629,14 +5692,17 @@ LobbyTab:AddButton({
 	Callback = function()
 		local mods = getGameMods()
 		if mods then
-			mods.Net.fireServer("ClaimDaily", {})
-			mods.Net.fireServer("ClaimFavoriteGift", {})
+			pcall(function()
+				mods.Net.fireServer("ClaimDaily", {})
+				mods.Net.fireServer("ClaimFavoriteGift", {})
+			end)
 			setLobbyStatus("CLAIMED DAILY + GIFT")
 		end
 	end,
 })
 
 local sellRarityMode = "Common"
+local quickSellBusy = false
 LobbyTab:AddSegmented({
 	Title = "Quick-Sell Tier",
 	Options = { "Common", "Uncommon+" },
@@ -5649,43 +5715,53 @@ LobbyTab:AddSegmented({
 LobbyTab:AddButton({
 	Title = "Quick-Sell Unequipped Gear",
 	Callback = function()
+		if quickSellBusy then
+			return
+		end
 		local mods = getGameMods()
 		if not mods then
 			return
 		end
-		local ok, profile = pcall(mods.Net.getProfile)
-		if not ok or type(profile) ~= "table" then
-			setLobbyStatus("ERR · NO PROFILE")
-			return
-		end
-
-		local equippedUids = {}
-		for _, uid in pairs(profile.equipped or {}) do
-			equippedUids[uid] = true
-		end
-
-		local allowUncommon = (sellRarityMode == "Uncommon+")
-		local sold = 0
-		for _, item in ipairs(profile.inventory or {}) do
-			local def = mods.Items[item.defId]
-			if def
-				and not equippedUids[item.uid]
-				and (item.tier or 0) == 0
-				and def.slot
-				and def.slot ~= "Pet"
-				and def.slot ~= "Mount"
-				and (def.rarity == "Common" or (allowUncommon and def.rarity == "Uncommon"))
-			then
-				local okSell, res = pcall(function()
-					return mods.Net.func("QuickSell"):InvokeServer({ defId = item.defId, uid = item.uid })
-				end)
-				if okSell and res then
-					sold += 1
-				end
-				task.wait(0.08)
+		quickSellBusy = true
+		local okRun = pcall(function()
+			local ok, profile = pcall(mods.Net.getProfile)
+			if not ok or type(profile) ~= "table" then
+				setLobbyStatus("ERR · NO PROFILE")
+				return
 			end
+
+			local equippedUids = {}
+			for _, uid in pairs(profile.equipped or {}) do
+				equippedUids[uid] = true
+			end
+
+			local allowUncommon = (sellRarityMode == "Uncommon+")
+			local sold = 0
+			for _, item in ipairs(profile.inventory or {}) do
+				local def = mods.Items[item.defId]
+				if def
+					and not equippedUids[item.uid]
+					and (item.tier or 0) == 0
+					and def.slot
+					and def.slot ~= "Pet"
+					and def.slot ~= "Mount"
+					and (def.rarity == "Common" or (allowUncommon and def.rarity == "Uncommon"))
+				then
+					local okSell, res = pcall(function()
+						return mods.Net.func("QuickSell"):InvokeServer({ defId = item.defId, uid = item.uid })
+					end)
+					if okSell and res then
+						sold += 1
+					end
+					task.wait(0.08)
+				end
+			end
+			setLobbyStatus("SOLD · " .. tostring(sold) .. " items")
+		end)
+		quickSellBusy = false
+		if not okRun then
+			setLobbyStatus("QUICK-SELL ERR")
 		end
-		setLobbyStatus("SOLD · " .. tostring(sold) .. " items")
 	end,
 })
 
