@@ -2464,8 +2464,79 @@ local function isUsefulPowerUp(pu, handDamageSchools, targetSchool)
 	return handDamageSchools[s] == true
 end
 
+local function isZeroCostDefense(ability, info)
+	if not ability or not info then
+		return false
+	end
+	local cost = ability.energyCost or 0
+	return cost <= 0 and not info.preventsAction and (info.directDamage or 0) == 0 and (info.shieldScore > 0 or info.hasDefenseBuff)
+end
+
+local function combatantHasStatus(c, statusId)
+	if not c or not statusId then
+		return false
+	end
+	for _, stEntry in ipairs(c.statuses or {}) do
+		local sid = (type(stEntry) == "table" and stEntry.id) or stEntry
+		if sid == statusId then
+			return true
+		end
+	end
+	return false
+end
+
+local function pickBestFreeShield(freeShields, aliveEnemies, me)
+	if #freeShields == 0 then
+		return nil
+	end
+	local enemySchools = {}
+	for _, e in ipairs(aliveEnemies) do
+		local sc = e.combatant and e.combatant.school
+		if sc then
+			enemySchools[sc] = true
+		end
+	end
+
+	local bestEntry, bestScore = nil, -math.huge
+	for _, entry in ipairs(freeShields) do
+		local ab = entry.ability
+		local info = entry.info
+		local s = (info.shieldScore or 0)
+		local wardSchool = nil
+		local dupStatus = false
+		for _, ef in ipairs(ab.effects or {}) do
+			if ef.kind == "ApplyStatus" and ef.statusId then
+				if combatantHasStatus(me, ef.statusId) then
+					dupStatus = true
+				end
+				wardSchool = ab.school
+			end
+		end
+
+		if info.shieldScore > 0 then
+			s += 1000
+		elseif wardSchool and enemySchools[wardSchool] then
+			s += 700
+		else
+			s += 300
+		end
+		if ab.targetKind == "AllAllies" then
+			s += 80
+		end
+		if dupStatus and info.shieldScore == 0 then
+			s -= 500
+		end
+		if s > bestScore then
+			bestScore = s
+			bestEntry = entry
+		end
+	end
+	return bestEntry
+end
+
 local function pickAttackEntry(mods, state, me, usableEntries)
 	local powerUps = {}
+	local freeShields = {}
 	local damagers = {}
 	local handDamageSchools = {}
 	local aliveEnemies = getAliveEnemies(mods, state, me)
@@ -2480,6 +2551,9 @@ local function pickAttackEntry(mods, state, me, usableEntries)
 		end
 		if entry.info.isAttackPowerUp then
 			table.insert(powerUps, entry)
+		end
+		if isZeroCostDefense(entry.ability, entry.info) then
+			table.insert(freeShields, entry)
 		end
 	end
 
@@ -2557,16 +2631,27 @@ local function pickAttackEntry(mods, state, me, usableEntries)
 				return safePowerUps[1], nil
 			end
 
+			local bestShield = pickBestFreeShield(freeShields, aliveEnemies, me)
+			if bestShield then
+				return bestShield, nil
+			end
+
 			if bossFinisher.payable then
 				return bossFinisher, nil
 			end
 
-			-- Cannot afford the 4+ pip card yet and no safe power-ups to play -> save (pass turn)
+			-- Cannot afford the 4+ pip card yet and no safe power-ups or 0-pip shields -> save (pass turn)
 			return nil, bossFinisher
 		end
 	end
 
-	-- 3. Stack useful buffs (0-cost / matching school in hand) when no instant kill is available
+	-- 3. Use 0-pip shields/wards when available before or between attacks
+	local bestFreeShield = pickBestFreeShield(freeShields, aliveEnemies, me)
+	if bestFreeShield then
+		return bestFreeShield, nil
+	end
+
+	-- 4. Stack useful buffs (0-cost / matching school in hand) when no instant kill is available
 	local usefulPowerUps = {}
 	for _, pu in ipairs(powerUps) do
 		if isUsefulPowerUp(pu, handDamageSchools, nil) and ((pu.ability.energyCost or 0) <= 1 or #damagers == 0) then
@@ -2777,12 +2862,15 @@ local function pickSupportEntry(mods, state, me, entries)
 				end
 			end
 
-			-- 4. Always use shields & defensive buffs (especially when no player needs healing)
+			-- 4. Always use shields & defensive buffs (prioritize 0-pip shields when available)
 			if info.shieldScore > 0 then
 				score += 2500 + info.shieldScore
 			end
 			if info.hasDefenseBuff then
 				score += 2000
+			end
+			if isZeroCostDefense(ab, info) then
+				score += 450
 			end
 
 			-- 5. Energy & offensive buffs
@@ -2905,7 +2993,7 @@ local function tryAutoDiscard(mods, state, me)
 			local info = analyzeAbility(mods, ab, me.energy or 0)
 			local isBrick = false
 			if CombatAuto.Style == "Attack" then
-				isBrick = (info.directDamage == 0 and not info.isAttackPowerUp)
+				isBrick = (info.directDamage == 0 and not info.isAttackPowerUp and not isZeroCostDefense(ab, info))
 			else
 				isBrick = (not info.isSupport)
 			end
@@ -3439,13 +3527,75 @@ DungeonTab:AddToggle({
 	end,
 })
 
+local function findSummaryButton(summaryGui, btnName)
+	if not summaryGui then
+		return nil
+	end
+	for _, d in ipairs(summaryGui:GetDescendants()) do
+		if d:IsA("TextButton") and d.Name == btnName then
+			return d
+		end
+	end
+	return nil
+end
+
+local function tryVoteReplay(forceFire)
+	if not State.Alive or not DungeonAuto.AutoReplay then
+		return
+	end
+	local mods = getGameMods()
+	if not mods then
+		return
+	end
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	local summaryGui = pg and pg:FindFirstChild("RunSummary")
+	if not summaryGui then
+		if forceFire then
+			mods.Net.fireServer("RequestReplay")
+			setDungeonStatus("REPLAY REQUESTED")
+		end
+		return
+	end
+
+	local replayBtn = findSummaryButton(summaryGui, "Replay")
+	if not replayBtn then
+		if findSummaryButton(summaryGui, "Continue") then
+			setDungeonStatus("RUN ENDED (NO REPLAY)")
+		end
+		return
+	end
+
+	if replayBtn.Text == "Replaying" then
+		return
+	end
+	if (os.clock() - (DungeonAuto.LastReplayVoteAt or 0)) < 1.2 then
+		return
+	end
+	DungeonAuto.LastReplayVoteAt = os.clock()
+
+	if typeof(firesignal) == "function" then
+		pcall(firesignal, replayBtn.Activated)
+		if replayBtn.Text ~= "Replaying" then
+			pcall(firesignal, replayBtn.MouseButton1Click)
+		end
+	end
+	if replayBtn.Text ~= "Replaying" then
+		mods.Net.fireServer("RequestReplay")
+	end
+	setDungeonStatus("REPLAY VOTED")
+end
+
 DungeonTab:AddToggle({
 	Title = "Auto Replay Run",
-	Description = "Automatically votes Replay on Run Summary",
+	Description = "Auto-votes Replay & tracks party replay votes",
 	Default = DungeonAuto.AutoReplay,
 	Callback = function(enabled)
 		DungeonAuto.AutoReplay = enabled
 		Config.Set("Dungeon_AutoReplay", enabled)
+		if enabled then
+			DungeonAuto.LastReplayVoteAt = 0
+			task.spawn(tryVoteReplay, false)
+		end
 	end,
 })
 
@@ -3580,26 +3730,44 @@ task.spawn(function()
 		if not State.Alive or type(summary) ~= "table" then
 			return
 		end
+		DungeonAuto.LastReplayVoteAt = 0
 		if DungeonAuto.AutoReplay and summary.replay == true then
-			task.delay(0.8, function()
+			task.delay(0.6, function()
 				if State.Alive and DungeonAuto.AutoReplay then
-					mods.Net.fireServer("RequestReplay")
-					setDungeonStatus("REPLAY REQUESTED")
+					tryVoteReplay(true)
 				end
 			end)
+		elseif summary.replay ~= true then
+			setDungeonStatus("RUN ENDED (NO REPLAY)")
 		else
 			setDungeonStatus("RUN ENDED")
+		end
+	end))
+
+	trackConnection(mods.Net.onClientEvent("RunReplayVotes", function(votes)
+		if not State.Alive or type(votes) ~= "table" then
+			return
+		end
+		if votes.starting then
+			setDungeonStatus("REPLAY STARTING")
+		elseif type(votes.count) == "number" and type(votes.of) == "number" and votes.count > 0 then
+			setDungeonStatus(string.format("REPLAY VOTES · %d/%d", votes.count, votes.of))
 		end
 	end))
 end)
 
 trackThread(function()
+	local chestTick = 0
 	while State.Alive do
-		task.wait(4)
+		task.wait(0.8)
 		if not State.Alive then
 			break
 		end
-		if DungeonAuto.AutoChests then
+		if DungeonAuto.AutoReplay then
+			tryVoteReplay(false)
+		end
+		chestTick += 1
+		if DungeonAuto.AutoChests and (chestTick % 5 == 0) then
 			openAllChestsSafe(true)
 		end
 	end
