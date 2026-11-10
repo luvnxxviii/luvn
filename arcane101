@@ -1,6 +1,6 @@
 -- Arcane 101 · Monochrome Minimalist Hub
 -- Modular Luau Script | Theme: Monochrome Minimalist Sleek
-local SCRIPT_VERSION = "V1"
+local SCRIPT_VERSION = "V1.1"
 
 local env = (typeof(getgenv) == "function" and getgenv()) or _G
 if type(env.__MonochromeCleanup) == "function" then
@@ -93,9 +93,12 @@ end
 
 env.__MonochromeCleanup = cleanup
 
---// Persistent Config & Auto-Execute on Server Join
+--// Persistent Config & Auto-Execute on Server Join (Per-Account Isolated)
 local CONFIG_DIR = "MonochromeHub"
-local CONFIG_PATH = CONFIG_DIR .. "/arcane101_config.json"
+local LEGACY_CONFIG_PATH = CONFIG_DIR .. "/arcane101_config.json"
+local accountKey = (LocalPlayer and LocalPlayer.UserId and LocalPlayer.UserId > 0) and tostring(LocalPlayer.UserId) or (LocalPlayer and LocalPlayer.Name or "default")
+accountKey = string.gsub(accountKey, "[^%w_%-]", "_")
+local CONFIG_PATH = CONFIG_DIR .. "/arcane101_config_" .. accountKey .. ".json"
 
 local Config = {
 	Data = {},
@@ -111,9 +114,12 @@ function Config.Load()
 		Config.Loading = false
 		return
 	end
+	local loadedFromAccountFile = false
 	pcall(function()
-		if isfile(CONFIG_PATH) then
-			local raw = readfile(CONFIG_PATH)
+		local loadPath = isfile(CONFIG_PATH) and CONFIG_PATH or (isfile(LEGACY_CONFIG_PATH) and LEGACY_CONFIG_PATH or nil)
+		if loadPath then
+			loadedFromAccountFile = (loadPath == CONFIG_PATH)
+			local raw = readfile(loadPath)
 			local decoded = HttpService:JSONDecode(raw)
 			if type(decoded) == "table" then
 				Config.Data = decoded
@@ -121,6 +127,10 @@ function Config.Load()
 		end
 	end)
 	Config.Loading = false
+	-- Migrate legacy shared config into this account's own file once so accounts diverge cleanly
+	if not loadedFromAccountFile and next(Config.Data) ~= nil then
+		Config.Save()
+	end
 end
 
 function Config.Save()
@@ -182,9 +192,19 @@ env.__MonochromeBooted = true
 local isFn = typeof(isfile) == "function" and isfile
 local readFn = typeof(readfile) == "function" and readfile
 if not isFn or not readFn then return end
-if isFn("MonochromeHub/arcane101_config.json") then
+local Players = game:GetService("Players")
+local lp = Players.LocalPlayer
+while not lp do
+	Players.PlayerAdded:Wait()
+	lp = Players.LocalPlayer
+end
+local acct = (lp.UserId and lp.UserId > 0) and tostring(lp.UserId) or (lp.Name or "default")
+acct = string.gsub(acct, "[^%w_%-]", "_")
+local cfgPath = "MonochromeHub/arcane101_config_" .. acct .. ".json"
+local checkPath = isFn(cfgPath) and cfgPath or (isFn("MonochromeHub/arcane101_config.json") and "MonochromeHub/arcane101_config.json" or nil)
+if checkPath then
 	local ok, cfg = pcall(function()
-		return game:GetService("HttpService"):JSONDecode(readfile("MonochromeHub/arcane101_config.json"))
+		return game:GetService("HttpService"):JSONDecode(readFn(checkPath))
 	end)
 	if ok and type(cfg) == "table" and cfg.AutoExecute == false then
 		return
@@ -1789,6 +1809,7 @@ local CombatAuto = {
 	AutoTrivia = Config.Get("AutoTrivia", true),
 	FastPlayback = Config.Get("FastPlayback", false),
 	AutoPass = Config.Get("AutoPass", true),
+	SupportAttackWhenHealthy = Config.Get("SupportAttackWhenHealthy", true),
 	Busy = false,
 	LastActionAt = 0,
 	LastDiscardTurnKey = nil,
@@ -1845,6 +1866,16 @@ CombatTab:AddToggle({
 	Callback = function(enabled)
 		CombatAuto.AutoHeal = enabled
 		Config.Set("AutoHeal", enabled)
+	end,
+})
+
+CombatTab:AddToggle({
+	Title = "Support: Attack When Healthy",
+	Description = "Supports cast spare debuffs/attacks when team is >=80% HP & keeping heal pips",
+	Default = CombatAuto.SupportAttackWhenHealthy,
+	Callback = function(enabled)
+		CombatAuto.SupportAttackWhenHealthy = enabled
+		Config.Set("SupportAttackWhenHealthy", enabled)
 	end,
 })
 
@@ -1998,6 +2029,7 @@ local LiveCombat = {
 	TurnActorId = nil,
 	BossCombatantId = nil,
 	LastGcScan = 0,
+	BusySince = nil,
 	ConsumedCounts = {},
 }
 
@@ -2208,9 +2240,17 @@ local function analyzeAbility(mods, ability, energy, me, cardTiersFallback)
 	local hasDefenseBuff = false
 	local hasEnergyGain = false
 	local gainEnergyAmount = 0
+	local hasSummon = false
+	local appliesEnemyDebuff = false
+	local buffStatusIds = {}
+	local enemyStatusIds = {}
+	local wardSchool = nil
 	local revivesAlly = false
 	local preventsAction = false
 	local appliesControl = false
+	local appliesVulnerable = false
+	local appliesBlind = false
+	local appliesWeaken = false
 	local abId = ability.id or ""
 	local tiers = cardTiersFallback or DeckStrategy.CardTiers
 
@@ -2248,15 +2288,36 @@ local function analyzeAbility(mods, ability, energy, me, cardTiersFallback)
 		elseif kind == "GainEnergy" then
 			hasEnergyGain = true
 			gainEnergyAmount += (ef.amount or 1)
+		elseif kind == "Summon" then
+			hasSummon = true
 		elseif kind == "ApplyStatus" and ef.statusId then
 			local st = Statuses[ef.statusId]
 			if st then
 				local appliesToSelf = (ef.target == "Self") or (ability.targetKind == "SelfOnly" and ef.target ~= "Enemies")
+				local targetsEnemies = (not appliesToSelf) and (
+					ef.target == "Enemies"
+					or ef.target == "Enemy"
+					or ability.targetKind == "SingleEnemy"
+					or ability.targetKind == "AllEnemies"
+				)
 				if st.preventsAction then
 					if appliesToSelf then
 						preventsAction = true
 					else
 						appliesControl = true
+					end
+				end
+				if targetsEnemies then
+					appliesEnemyDebuff = true
+					table.insert(enemyStatusIds, { id = ef.statusId, st = st })
+					if (type(st.damageTakenMultiplier) == "number" and st.damageTakenMultiplier > 1) or ef.statusId == "Vulnerable" then
+						appliesVulnerable = true
+					end
+					if st.missesNext == true then
+						appliesBlind = true
+					end
+					if type(st.damageDealtMultiplier) == "number" and st.damageDealtMultiplier < 1 then
+						appliesWeaken = true
 					end
 				end
 				if st.schoolDealt ~= nil or (st.damageDealtMultiplier and st.damageDealtMultiplier > 1) or (st.damageDealtPerStack and st.damageDealtPerStack > 0) then
@@ -2266,9 +2327,13 @@ local function analyzeAbility(mods, ability, energy, me, cardTiersFallback)
 						powerUpStatusId = ef.statusId
 					end
 				end
-				if hasStatusTag(st, "Buff") and not st.preventsAction then
+				if hasStatusTag(st, "Buff") and not st.preventsAction and not targetsEnemies then
+					if st.schoolTaken ~= nil and st.school then
+						wardSchool = st.school
+					end
 					if st.damageTakenMultiplier or st.schoolTaken or st.evadesNext or st.reprisal or ef.statusId == "Regrowth" then
 						hasDefenseBuff = true
+						table.insert(buffStatusIds, { id = ef.statusId, st = st, target = ef.target })
 					end
 					if ef.statusId == "Regrowth" then
 						healScore += 24
@@ -2292,13 +2357,21 @@ local function analyzeAbility(mods, ability, energy, me, cardTiersFallback)
 		or (ability.targetKind == "SingleAny" and directDamage == 0)
 	)
 
-	local isSupport = targetsAllyOrSelf and directDamage == 0 and not preventsAction and (
-		healScore > 0
-		or shieldScore > 0
-		or hasCleanse
-		or hasDefenseBuff
-		or hasEnergyGain
-		or isAttackPowerUp
+	local isSupport = directDamage == 0 and not preventsAction and (
+		(targetsAllyOrSelf and (
+			healScore > 0
+			or shieldScore > 0
+			or hasCleanse
+			or hasDefenseBuff
+			or hasEnergyGain
+			or isAttackPowerUp
+			or hasSummon
+		))
+		or appliesVulnerable
+		or appliesBlind
+		or appliesWeaken
+		or appliesControl
+		or appliesEnemyDebuff
 	)
 
 	return {
@@ -2315,11 +2388,19 @@ local function analyzeAbility(mods, ability, energy, me, cardTiersFallback)
 		hasCleanse = hasCleanse,
 		cleanseStatuses = cleanseStatuses,
 		hasDefenseBuff = hasDefenseBuff,
+		hasSummon = hasSummon,
+		buffStatusIds = buffStatusIds,
+		enemyStatusIds = enemyStatusIds,
+		wardSchool = wardSchool,
 		hasEnergyGain = hasEnergyGain,
 		gainEnergyAmount = gainEnergyAmount,
 		revivesAlly = revivesAlly,
 		preventsAction = preventsAction,
 		appliesControl = appliesControl,
+		appliesVulnerable = appliesVulnerable,
+		appliesBlind = appliesBlind,
+		appliesWeaken = appliesWeaken,
+		appliesEnemyDebuff = appliesEnemyDebuff,
 	}
 end
 
@@ -2731,6 +2812,8 @@ local function getAliveEnemies(mods, state, me)
 			local ehp = math.max(1, hp + shield)
 			local isBoss = isBossCombatant(mods, c, id)
 			local evades = false
+			local isVulnerable = false
+			local isBlinded = false
 			local reprisal = 0
 			for _, stEntry in ipairs(c.statuses or {}) do
 				local sid = (type(stEntry) == "table" and stEntry.id) or stEntry
@@ -2738,6 +2821,12 @@ local function getAliveEnemies(mods, state, me)
 				if stDef then
 					if stDef.evadesNext then
 						evades = true
+					end
+					if (type(stDef.damageTakenMultiplier) == "number" and stDef.damageTakenMultiplier > 1) or sid == "Vulnerable" then
+						isVulnerable = true
+					end
+					if stDef.missesNext == true then
+						isBlinded = true
 					end
 					if type(stDef.reprisal) == "number" then
 						reprisal += stDef.reprisal * ((type(stEntry) == "table" and tonumber(stEntry.power)) or 1)
@@ -2754,6 +2843,8 @@ local function getAliveEnemies(mods, state, me)
 				effectiveHp = ehp,
 				isBoss = isBoss,
 				evades = evades,
+				isVulnerable = isVulnerable,
+				isBlinded = isBlinded,
 				reprisal = math.min(reprisal, repCap),
 			})
 		end
@@ -2808,8 +2899,20 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 				if e.isBoss then
 					killsBoss = true
 				end
-			elseif entry.info.appliesControl and not e.evades then
-				tactical += 90
+			else
+				if entry.info.appliesControl and not e.evades then
+					tactical += 90
+				end
+				if not e.evades then
+					if entry.info.appliesVulnerable and not e.isVulnerable and dmg < e.effectiveHp then
+						tactical += (e.isBoss and 220 or 85)
+					end
+					if entry.info.appliesBlind and not e.isBlinded then
+						tactical += (e.isBoss and 140 or 65)
+					elseif entry.info.appliesWeaken then
+						tactical += (e.isBoss and 90 or 35)
+					end
+				end
 			end
 		end
 		tactical -= (overkill * 0.3)
@@ -2854,8 +2957,20 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 		local s = (eff * (e.isBoss and bossFocusMult or 1)) - (overkill * 0.65) - (eff * (e.reprisal or 0) * 0.85)
 		if canKill then
 			s += (e.isBoss and 500 or 140)
-		elseif entry.info.appliesControl and not e.evades then
-			s += 90
+		else
+			if entry.info.appliesControl and not e.evades then
+				s += 90
+			end
+			if not e.evades then
+				if entry.info.appliesVulnerable and not e.isVulnerable and dmg < e.effectiveHp then
+					s += (e.isBoss and 240 or 90)
+				end
+				if entry.info.appliesBlind and not e.isBlinded then
+					s += (e.isBoss and 140 or 65)
+				elseif entry.info.appliesWeaken then
+					s += (e.isBoss and 90 or 35)
+				end
+			end
 		end
 		if (e.evades or (e.reprisal or 0) > 0) and (entry.ability.energyCost or 0) <= 1 and not canKill then
 			s += e.evades and 30 or -15
@@ -3238,10 +3353,21 @@ local function pickAttackEntry(mods, state, me, usableEntries, deckRem)
 		return usefulPowerUps[1], nil
 	end
 
-	-- 4. Cast the best damage-dealing card currently payable! (If Blinded with no Cleanse, spend a 0-1 pip poke first instead of burning a 3+ pip finisher)
+	-- 4. Cast the best damage-dealing card currently payable! (If Blinded or top target has Mirage evade, spend a 0-1 pip poke first before burning a 2+ pip finisher)
 	if #damagers > 0 then
 		local rInfo = getCasterRedirectInfo(mods.Statuses, me)
-		if rInfo.isBlinded and #damagers >= 2 then
+		local topAtk = damagers[1]
+		local topEval = topAtk._eval
+		local topEvades = topEval and topEval.bestEnemy and topEval.bestEnemy.evades
+		local allEvade = (#aliveEnemies > 0)
+		for _, e in ipairs(aliveEnemies) do
+			if not e.evades then
+				allEvade = false
+				break
+			end
+		end
+		local shouldPokeFirst = rInfo.isBlinded or allEvade or (topAtk.ability.targetKind ~= "AllEnemies" and topEvades)
+		if shouldPokeFirst and #damagers >= 2 and (topAtk.ability.energyCost or 0) >= 2 then
 			for _, d in ipairs(damagers) do
 				if (d.ability.energyCost or 0) <= 1 then
 					return d, nil
@@ -3336,7 +3462,11 @@ local function getTeamHealthInfo(mods, state, me, lowThreshold)
 				end
 
 				local shieldVal = tonumber(c.shield) or 0
-				local shieldRank = shieldVal * 1000 + ratio
+				local allySchool = getCombatantSchool(mods, c)
+				local sDef = allySchool and mods.Schools and mods.Schools.defs and mods.Schools.defs[allySchool]
+				local schoolDefense = (sDef and tonumber(sDef.defense)) or 3
+				-- Prioritize unshielded squishy carries (low school defense / lower HP) before tanks
+				local shieldRank = shieldVal * 1000 + ratio * 100 + schoolDefense * 5 + (maxHp / 5000)
 				if shieldRank < bestShieldScore then
 					bestShieldScore = shieldRank
 					unshieldedId = id
@@ -3550,12 +3680,102 @@ local function pickEmergencyHealEntry(mods, state, me, entries, threshold, deckR
 	return bestHeal, nil
 end
 
+local function getStatusStackCount(c, statusId)
+	if not c or not statusId then
+		return 0
+	end
+	local count = 0
+	for _, stEntry in ipairs(c.statuses or {}) do
+		local sid = (type(stEntry) == "table" and stEntry.id) or stEntry
+		if sid == statusId then
+			count += (type(stEntry) == "table" and tonumber(stEntry.stacks)) or 1
+		end
+	end
+	return count
+end
+
 local function pickSupportEntry(mods, state, me, entries, deckRem)
-	local healthInfo = getTeamHealthInfo(mods, state, me)
+	local healthInfo = getTeamHealthInfo(mods, state, me, CombatAuto.HealThreshold)
 	local needsHeal = (healthInfo.lowestRatio < 0.99)
-	local strongHeal = findStrongHealToSave(mods, state, me, entries, healthInfo, nil, deckRem)
+	local urgentHeal = (healthInfo.revivableCount > 0) or (healthInfo.lowestRatio <= math.max(0.70, CombatAuto.HealThreshold))
+	local strongHeal = urgentHeal and findStrongHealToSave(mods, state, me, entries, healthInfo, nil, deckRem) or nil
 	local strongHealCost = strongHeal and (strongHeal.ability.energyCost or 2) or 0
 	local myEnergy = me.energy or 0
+
+	local aliveEnemies = getAliveEnemies(mods, state, me)
+	local enemySchools = {}
+	local bossAlive = false
+	local totalEnemyHp = 0
+	for _, e in ipairs(aliveEnemies) do
+		totalEnemyHp += e.effectiveHp
+		if e.isBoss then
+			bossAlive = true
+		end
+		local sc = e.combatant and e.combatant.school
+		if sc then
+			enemySchools[sc] = true
+		end
+	end
+
+	local aliveAllies = {}
+	local teamMaxHpSum = 0
+	local unshieldedCarryExists = false
+	for _, c in pairs(state.combatants) do
+		if c.team == me.team and not c.isPet and mods.CombatSim.isAlive(c) then
+			table.insert(aliveAllies, c)
+			local maxHp = (c.derived and c.derived.maxHp) or c.maxHp or 100
+			teamMaxHpSum += maxHp
+			if (tonumber(c.shield) or 0) <= 0 and ((c.hp or maxHp) / math.max(1, maxHp)) < 0.92 then
+				unshieldedCarryExists = true
+			end
+		end
+	end
+	local teamAvgMaxHp = math.max(100, teamMaxHpSum / math.max(1, #aliveAllies))
+	-- Only hold back costly defensive walls/debuffs if the fight is almost over (1 weak non-boss mob about to drop)
+	local fightDangerous = bossAlive or (#aliveEnemies >= 2) or (totalEnemyHp >= teamAvgMaxHp * 0.45)
+
+	local function buffBenefitCount(ab, buffList)
+		local benefited = 0
+		local pool = (ab.targetKind == "SelfOnly" and not ab.ally) and { me } or aliveAllies
+		for _, b in ipairs(buffList) do
+			local maxSt = (b.st and tonumber(b.st.maxStacks)) or 1
+			local targetPool = (b.target == "Self") and { me } or pool
+			local missingOnPool = 0
+			for _, ally in ipairs(targetPool) do
+				if getStatusStackCount(ally, b.id) < maxSt then
+					missingOnPool += 1
+				end
+			end
+			benefited = math.max(benefited, missingOnPool)
+		end
+		return benefited
+	end
+
+	local function enemyDebuffTargetsMissing(ab, enemyStList)
+		if #enemyStList == 0 then
+			return 0, false
+		end
+		local missingTotal = 0
+		local missingOnBoss = false
+		for _, e in ipairs(aliveEnemies) do
+			local anyMissing = false
+			for _, ds in ipairs(enemyStList) do
+				local maxSt = (ds.st and tonumber(ds.st.maxStacks)) or 1
+				if getStatusStackCount(e.combatant, ds.id) < maxSt then
+					anyMissing = true
+					break
+				end
+			end
+			if anyMissing then
+				missingTotal += 1
+				if e.isBoss then
+					missingOnBoss = true
+				end
+			end
+		end
+		return missingTotal, missingOnBoss
+	end
+
 	local candidates = {}
 
 	for _, entry in ipairs(entries) do
@@ -3563,7 +3783,13 @@ local function pickSupportEntry(mods, state, me, entries, deckRem)
 			local info = entry.info
 			local ab = entry.ability
 			local netCost = (ab.energyCost or 0) - (info.gainEnergyAmount or 0)
-			local safeForHealSave = (not strongHeal) or (netCost <= 0) or ((myEnergy - netCost) >= strongHealCost)
+			local isTeamWallOrCleanse = (info.hasCleanse and healthInfo.hasDebuff)
+				or (info.hasDefenseBuff and healthInfo.lowestRatio > 0.55)
+				or info.hasSummon
+			local safeForHealSave = (not strongHeal)
+				or (netCost <= 0)
+				or ((myEnergy - netCost) >= strongHealCost)
+				or (isTeamWallOrCleanse and healthInfo.lowestRatio > 0.60)
 
 			if safeForHealSave then
 				local score = 0
@@ -3581,28 +3807,73 @@ local function pickSupportEntry(mods, state, me, entries, deckRem)
 					end
 				end
 
-				-- 3. Heal the lowest-HP player when anyone needs healing
+				-- 3. Heal when allies need healing (scaled higher when urgent)
 				if info.healScore > 0 and needsHeal then
-					score += 4000 + info.healScore
+					local urgencyBonus = (healthInfo.lowestRatio <= CombatAuto.HealThreshold) and 2200 or 0
+					score += 4000 + urgencyBonus + info.healScore
 					if ab.targetKind == "AllAllies" and (healthInfo.multiHurtCount >= 2 or healthInfo.hurtCount >= 2) then
 						score += 500
 					end
 				end
 
-				-- 4. Always use shields & defensive buffs (prioritize 0-pip shields when available)
-				if info.shieldScore > 0 then
-					score += 2500 + info.shieldScore
-				end
+				-- 4. Team-advantage defensive buffs (Earthen Wall, Rootbound Grove, Frost Aegis, Gale Barrier, Wards) — ONLY when not already active & worth using!
 				if info.hasDefenseBuff then
-					score += 2000
+					if info.wardSchool and not enemySchools[info.wardSchool] then
+						score += 0
+					else
+						local benefited = buffBenefitCount(ab, info.buffStatusIds or {})
+						if benefited > 0 and (fightDangerous or (ab.energyCost or 0) <= 0 or unshieldedCarryExists) then
+							local strongMitigation = false
+							for _, b in ipairs(info.buffStatusIds or {}) do
+								local mult = b.st and b.st.damageTakenMultiplier
+								if (type(mult) == "number" and mult <= 0.80) or (b.st and b.st.evadesNext) then
+									strongMitigation = true
+									break
+								end
+							end
+							local baseBuffVal = strongMitigation and 2800 or 1900
+							local multiScale = (ab.targetKind == "AllAllies") and (benefited * 260) or 150
+							score += baseBuffVal + multiScale
+						end
+					end
 				end
-				if isZeroCostDefense(ab, info) then
+
+				-- 5. Shields (worth casting if fight is dangerous, 0-pip, or an ally is injured/unshielded)
+				if info.shieldScore > 0 then
+					local hasDefenseUpgrade = (score > 0 and info.hasDefenseBuff)
+					if fightDangerous or (ab.energyCost or 0) <= 0 or unshieldedCarryExists or healthInfo.lowestRatio < 0.85 or hasDefenseUpgrade then
+						score += (fightDangerous and 2300 or 900) + info.shieldScore
+					end
+				end
+
+				-- 6. Beneficial Summons (e.g. Nature's Call of the Grove Unicorn)
+				if info.hasSummon and fightDangerous then
+					score += 2700
+				end
+
+				-- 7. Team-Advantage Enemy Debuffs (Vulnerable: Hex / Gorgon Hiss; Beguiled; Blinded; Chilled)
+				if info.appliesEnemyDebuff and #aliveEnemies > 0 then
+					local missCnt, missBoss = enemyDebuffTargetsMissing(ab, info.enemyStatusIds or {})
+					if missCnt > 0 and (fightDangerous or (ab.energyCost or 0) <= 0) then
+						if info.appliesVulnerable then
+							score += (missBoss and 3100 or 2200) + (missCnt * 180)
+						elseif info.appliesControl then
+							score += (#aliveEnemies >= 2 and 2600 or 1000) + (missBoss and 300 or 0)
+						elseif info.appliesBlind or info.appliesWeaken then
+							score += (missBoss and 2200 or 1700) + (missCnt * 140)
+						else
+							score += 1100 + (missCnt * 100)
+						end
+					end
+				end
+
+				if isZeroCostDefense(ab, info) and score > 0 then
 					score += 450
 				end
 
-				-- 5. Energy & elemental power-up buffs (matched to self or teammates who use that element)
+				-- 8. Energy & elemental power-up buffs (matched to self or teammates who use that element)
 				if info.hasEnergyGain then
-					score += 1000
+					score += 1200 + ((ab.targetKind == "AllAllies") and (#aliveAllies * 200) or 0)
 				end
 				if info.isAttackPowerUp then
 					if ab.targetKind == "SelfOnly" and not ab.ally then
@@ -3613,7 +3884,7 @@ local function pickSupportEntry(mods, state, me, entries, deckRem)
 					else
 						local buffTargetId, matchScore = pickBuffAllyTarget(mods, state, me, info.powerUpSchool, info.powerUpStatusId)
 						if buffTargetId and (not info.powerUpSchool or (matchScore and matchScore >= 4000)) then
-							score += 1400 + (((ab.energyCost or 0) <= 0) and 250 or 0)
+							score += 1500 + (((ab.energyCost or 0) <= 0) and 250 or 0)
 						end
 					end
 				end
@@ -3622,7 +3893,7 @@ local function pickSupportEntry(mods, state, me, entries, deckRem)
 					score += 40
 				end
 
-				-- Do not waste pure heals if everyone is full HP and no debuff needs cleansing
+				-- Do not waste cards that provide zero benefit right now
 				if score > 0 then
 					table.insert(candidates, { entry = entry, score = score })
 				end
@@ -3634,7 +3905,10 @@ local function pickSupportEntry(mods, state, me, entries, deckRem)
 		return nil, strongHeal
 	end
 	table.sort(candidates, function(a, b)
-		return a.score > b.score
+		if math.abs(a.score - b.score) > 1 then
+			return a.score > b.score
+		end
+		return (a.entry.ability.energyCost or 0) < (b.entry.ability.energyCost or 0)
 	end)
 	return candidates[1].entry, nil
 end
@@ -3674,7 +3948,21 @@ local function pickTargetId(mods, state, me, ability, info, preferMode, evalResu
 				local projDmg = directDmg * mult
 				local canKill = (directDmg > 0) and (projDmg >= ehp * 0.99)
 				local score
-				if CombatAuto.TargetPriority == "Highest HP" then
+				if directDmg <= 0 then
+					-- Non-damage support debuff (Hex, Beguile, Lantern Flash, etc.): pick un-debuffed Boss / highest-threat enemy
+					local alreadyDebuffed = true
+					if info and info.enemyStatusIds and #info.enemyStatusIds > 0 then
+						for _, ds in ipairs(info.enemyStatusIds) do
+							if getStatusStackCount(c, ds.id) < ((ds.st and tonumber(ds.st.maxStacks)) or 1) then
+								alreadyDebuffed = false
+								break
+							end
+						end
+					else
+						alreadyDebuffed = false
+					end
+					score = (alreadyDebuffed and 1000000 or 0) - (isBoss and 500000 or 0) - ehp
+				elseif CombatAuto.TargetPriority == "Highest HP" then
 					score = -ehp / math.max(0.05, mult)
 				elseif CombatAuto.TargetPriority == "Boss First" then
 					score = (isBoss and -10000000 or 0) - (canKill and 500000 or 0) - maxHp + (ehp / math.max(0.05, mult) * 0.01)
@@ -3712,10 +4000,37 @@ local function pickTargetId(mods, state, me, ability, info, preferMode, evalResu
 			end
 		elseif info.hasCleanse and healthInfo.debuffedId and (info.healScore == 0 or healthInfo.lowestRatio >= 0.99) then
 			pickedId = healthInfo.debuffedId
-		elseif info.healScore > 0 and healthInfo.lowestId then
+		elseif info.healScore > 0 and healthInfo.lowestRatio < 0.99 and healthInfo.lowestId then
 			pickedId = healthInfo.lowestId
 		elseif info.isAttackPowerUp then
 			pickedId = pickBuffAllyTarget(mods, state, me, info.powerUpSchool, info.powerUpStatusId) or me.id
+		elseif info.hasDefenseBuff and info.buffStatusIds and #info.buffStatusIds > 0 then
+			local bestAlly, bestRank = nil, math.huge
+			for id, c in pairs(state.combatants) do
+				if c.team == me.team and not c.isPet and CombatSim.isAlive(c) then
+					local hasAll = true
+					for _, b in ipairs(info.buffStatusIds) do
+						local maxSt = (b.st and tonumber(b.st.maxStacks)) or 1
+						if getStatusStackCount(c, b.id) < maxSt then
+							hasAll = false
+							break
+						end
+					end
+					if not hasAll then
+						local maxHp = (c.derived and c.derived.maxHp) or c.maxHp or 100
+						local ratio = (c.hp or maxHp) / math.max(1, maxHp)
+						local allySc = getCombatantSchool(mods, c)
+						local sDef = allySc and mods.Schools and mods.Schools.defs and mods.Schools.defs[allySc]
+						local scDef = (sDef and tonumber(sDef.defense)) or 3
+						local rank = (tonumber(c.shield) or 0) * 100 + ratio * 50 + scDef * 5 + (maxHp / 5000)
+						if rank < bestRank then
+							bestRank = rank
+							bestAlly = id
+						end
+					end
+				end
+			end
+			pickedId = bestAlly or healthInfo.unshieldedId or healthInfo.lowestId or me.id
 		elseif info.shieldScore > 0 and (healthInfo.unshieldedId or healthInfo.lowestId) then
 			pickedId = healthInfo.unshieldedId or healthInfo.lowestId
 		else
@@ -3767,14 +4082,22 @@ local function scoreDiscardBrick(mods, state, me, ab, info, enemySchools, deckRe
 		return 750
 	end
 
-	if info.hasCleanse and getCombatantDebuffCount(mods.Statuses, me, info.cleanseStatuses) > 0 then
-		return -600
+	if info.hasCleanse then
+		if getCombatantDebuffCount(mods.Statuses, me, info.cleanseStatuses) > 0 then
+			return -600
+		end
+		if CombatAuto.Style == "Support" or ab.targetKind == "AllAllies" then
+			local hInfo = getTeamHealthInfo(mods, state, me)
+			if hInfo.hasDebuff then
+				return -600
+			end
+		end
 	end
 
 	if info.healScore > 0 then
 		local meMaxHp = (me.derived and me.derived.maxHp) or me.maxHp or 100
 		local meRatio = (me.hp or meMaxHp) / math.max(1, meMaxHp)
-		if meRatio <= 0.65 or info.revivesAlly then
+		if meRatio <= 0.65 or info.revivesAlly or (CombatAuto.Style == "Support" and ab.targetKind == "AllAllies") then
 			return -500
 		end
 		return (CombatAuto.Style == "Attack" and cost <= 1 and info.healScore < (meMaxHp * 0.18)) and 520 or 100
@@ -3967,15 +4290,31 @@ local function runCombatStep()
 		end
 		CombatAuto.AimingSince = nil
 		if snapStatus == "ENEMY TURN" then
+			LiveCombat.BusySince = nil
 			setCombatStatus("WAIT · ENEMY TURN")
 		elseif snapStatus == "BUSY / ANIM" then
-			setCombatStatus("WAIT · ANIMATING")
+			LiveCombat.BusySince = LiveCombat.BusySince or os.clock()
+			local liveMyId = LiveCombat.MyId or (LiveCombat.State and findMyCombatantId(LiveCombat.State))
+			if liveMyId and LiveCombat.TurnActorId == liveMyId
+				and (os.clock() - LiveCombat.BusySince) >= 6.0
+				and mods.CombatUI and type(mods.CombatUI.setBusy) == "function"
+			then
+				pcall(mods.CombatUI.setBusy, false)
+				LiveCombat.BusySince = nil
+				setCombatStatus("RECOVERED · BUSY")
+			else
+				setCombatStatus("WAIT · ANIMATING")
+			end
 		elseif snapStatus == "SYNCING" then
+			LiveCombat.BusySince = nil
 			setCombatStatus("WAIT · SYNCING STATE")
+		else
+			LiveCombat.BusySince = nil
 		end
 		return
 	end
 	CombatAuto.AimingSince = nil
+	LiveCombat.BusySince = nil
 
 	local me = state.combatants[myId]
 	local entries = collectEntries(mods, state, me, false)
@@ -4038,6 +4377,26 @@ local function runCombatStep()
 				chosen, savingForCard = pickAttackEntry(mods, state, me, entries, deckRem)
 			else
 				chosen, savingForCard = pickSupportEntry(mods, state, me, entries, deckRem)
+				if not chosen and not savingForCard and CombatAuto.SupportAttackWhenHealthy then
+					local supportHealth = getTeamHealthInfo(mods, state, me, CombatAuto.HealThreshold)
+					if not supportHealth.hasDebuff and supportHealth.revivableCount == 0 and supportHealth.lowestRatio >= math.max(0.80, CombatAuto.HealThreshold) then
+						local atkCandidate, atkSave = pickAttackEntry(mods, state, me, entries, deckRem)
+						if atkCandidate and not atkSave then
+							local strongHeal = findStrongHealToSave(mods, state, me, entries, supportHealth, nil, deckRem)
+							local reservePips = strongHeal and math.min(2, strongHeal.ability.energyCost or 2) or ((supportHealth.lowestRatio < 0.95) and 2 or 0)
+							local netCost = math.max(0, (atkCandidate.ability.energyCost or 0) - (atkCandidate.info.gainEnergyAmount or 0))
+							local atkEval = atkCandidate._eval
+							local keepsReserve = ((me.energy or 0) - netCost) >= reservePips
+							local highTeamValue = (atkEval and (atkEval.wipesAll or atkEval.killsBoss or atkEval.killCount > 0))
+								or (atkCandidate.info.healScore or 0) > 0
+								or atkCandidate.info.appliesVulnerable
+								or atkCandidate.info.appliesBlind
+							if keepsReserve or highTeamValue then
+								chosen = atkCandidate
+							end
+						end
+					end
+				end
 			end
 		end
 
@@ -4253,6 +4612,7 @@ task.spawn(function()
 			return
 		end
 		LiveCombat.TurnActorId = data.secondsRemaining and data.actorId or nil
+		LiveCombat.BusySince = nil
 	end))
 
 	local function clearLiveCombat()
@@ -4260,6 +4620,7 @@ task.spawn(function()
 		LiveCombat.MyId = nil
 		LiveCombat.TurnActorId = nil
 		LiveCombat.BossCombatantId = nil
+		LiveCombat.BusySince = nil
 		table.clear(LiveCombat.ConsumedCounts)
 		setDeckStrategyStatus(DeckStrategy.SummaryText)
 	end
@@ -4335,6 +4696,45 @@ local ENCOUNTER_PRIO_OPTIONS = {
 	"Continue",
 }
 
+local QUICKSELL_TIER_OPTIONS = { "Common", "Up to Uncommon", "Up to Rare", "Up to Epic", "Up to Legendary", "Up to Mythic" }
+local QUICKSELL_TIER_MAX_RANK = {
+	["Common"] = 1,
+	["Up to Uncommon"] = 2,
+	["Uncommon+"] = 2,
+	["Up to Rare"] = 3,
+	["Up to Epic"] = 4,
+	["Up to Legendary"] = 5,
+	["Up to Mythic"] = 6,
+}
+local RARITY_ORDER_FALLBACK = {
+	Common = 1,
+	Uncommon = 2,
+	Rare = 3,
+	Epic = 4,
+	Legendary = 5,
+	Mythic = 6,
+	Divine = 7,
+	Exotic = 8,
+}
+local sellRarityMode = Config.Get("QuickSellTier", "Common")
+if sellRarityMode == "Uncommon+" then
+	sellRarityMode = "Up to Uncommon"
+elseif not QUICKSELL_TIER_MAX_RANK[sellRarityMode] then
+	sellRarityMode = "Common"
+end
+local quickSellTierDropdowns = {}
+local quickSellBusy = false
+
+local function setQuickSellTier(choice)
+	sellRarityMode = choice
+	Config.Set("QuickSellTier", choice)
+	for _, dd in ipairs(quickSellTierDropdowns) do
+		if dd:Get() ~= choice then
+			dd:Set(choice, true)
+		end
+	end
+end
+
 local DungeonAuto = {
 	AutoReady = Config.Get("Dungeon_AutoReady", false),
 	AutoEncounter = Config.Get("Dungeon_AutoEncounter", false),
@@ -4345,12 +4745,22 @@ local DungeonAuto = {
 	AutoSkipMerchant = Config.Get("Dungeon_AutoSkipMerchant", false),
 	AutoReplay = Config.Get("Dungeon_AutoReplay", false),
 	AutoChests = Config.Get("Dungeon_AutoChests", false),
+	AutoQuickSell = Config.Get("Dungeon_AutoQuickSell", false),
+	AutoRequeue = Config.Get("Dungeon_AutoRequeue", false),
+	RequeueMode = Config.Get("Dungeon_RequeueMode", "Auto (Last Party)"),
+	LastAreaId = Config.Get("Dungeon_LastArea", ""),
+	LastDifficulty = Config.Get("Dungeon_LastDifficulty", "Medium"),
+	LastPartyLeaderId = Config.Get("Dungeon_LastLeaderId", 0),
+	LastPartyLeaderName = Config.Get("Dungeon_LastLeaderName", ""),
+	LastPartySize = Config.Get("Dungeon_LastPartySize", 1),
 	PendingOffers = nil,
 	RunState = nil,
 	CurrentHpRatio = 1,
+	RequeueBusy = false,
+	LastRequeueAt = 0,
+	LastQuickSellAt = 0,
+	BootedAt = os.clock(),
 }
-
-DungeonTab:AddSection("Run Automation")
 
 local dungeonStatusCard
 local function setDungeonStatus(text)
@@ -4358,6 +4768,75 @@ local function setDungeonStatus(text)
 		dungeonStatusCard:Set(text)
 	end
 end
+
+local function runQuickSellTrash(silent, statusFn)
+	if quickSellBusy or not State.Alive then
+		return 0
+	end
+	if LocalPlayer:GetAttribute("InCombat") == true then
+		return 0
+	end
+	local mods = getGameMods()
+	if not mods then
+		return 0
+	end
+	quickSellBusy = true
+	local sold = 0
+	local okRun, errMsg = pcall(function()
+		local ok, profile = pcall(mods.Net.getProfile)
+		if not ok or type(profile) ~= "table" then
+			if not silent and statusFn then
+				statusFn("ERR · NO PROFILE")
+			end
+			return
+		end
+
+		local equippedUids = {}
+		for _, uid in pairs(profile.equipped or {}) do
+			equippedUids[uid] = true
+		end
+
+		local maxRank = QUICKSELL_TIER_MAX_RANK[sellRarityMode] or 1
+		local rarityTable = mods.Constants and mods.Constants.RARITY
+		for _, item in ipairs(profile.inventory or {}) do
+			if not State.Alive or LocalPlayer:GetAttribute("InCombat") == true then
+				break
+			end
+			local def = mods.Items[item.defId]
+			local rName = def and (def.rarity or "Common")
+			local rInfo = rarityTable and rarityTable[rName]
+			local rank = (type(rInfo) == "table" and tonumber(rInfo.order)) or RARITY_ORDER_FALLBACK[rName] or 99
+			if def
+				and not equippedUids[item.uid]
+				and item.locked ~= true
+				and (item.tier or 0) == 0
+				and def.slot
+				and def.slot ~= "Pet"
+				and def.slot ~= "Mount"
+				and rank <= maxRank
+			then
+				local okSell, res = pcall(function()
+					return mods.Net.func("QuickSell"):InvokeServer({ defId = item.defId, uid = item.uid })
+				end)
+				if okSell and (res == true or (type(res) == "table" and res.ok ~= false)) then
+					sold += 1
+				end
+				task.wait(0.06)
+			end
+		end
+		if statusFn and (sold > 0 or not silent) then
+			statusFn("SOLD · " .. tostring(sold) .. " items")
+		end
+	end)
+	DungeonAuto.LastQuickSellAt = os.clock()
+	quickSellBusy = false
+	if not okRun and not silent and statusFn then
+		statusFn("QUICK-SELL ERR")
+	end
+	return sold
+end
+
+DungeonTab:AddSection("Run Automation")
 
 DungeonTab:AddToggle({
 	Title = "Auto Ready",
@@ -4842,6 +5321,13 @@ local function openAllChestsSafe(silentWhenEmpty)
 			mods.Net.fireServer("OpenAllChests", {})
 		end)
 		setDungeonStatus("OPENING · " .. tostring(count) .. " CHESTS")
+		if DungeonAuto.AutoQuickSell then
+			task.delay(0.75, function()
+				if State.Alive and DungeonAuto.AutoQuickSell then
+					runQuickSellTrash(true, setDungeonStatus)
+				end
+			end)
+		end
 	elseif not silentWhenEmpty then
 		setDungeonStatus("NO CHESTS TO OPEN")
 	end
@@ -4867,10 +5353,246 @@ DungeonTab:AddButton({
 	end,
 })
 
+DungeonTab:AddToggle({
+	Title = "Auto Quick-Sell Trash",
+	Description = "Sells unlocked gear up to your chosen tier after chests, runs & merchant",
+	Default = DungeonAuto.AutoQuickSell,
+	Callback = function(enabled)
+		DungeonAuto.AutoQuickSell = enabled
+		Config.Set("Dungeon_AutoQuickSell", enabled)
+		if enabled and LocalPlayer:GetAttribute("InCombat") ~= true then
+			task.spawn(runQuickSellTrash, true, setDungeonStatus)
+		end
+	end,
+})
+
+table.insert(quickSellTierDropdowns, DungeonTab:AddDropdown({
+	Title = "Quick-Sell Tier",
+	Options = QUICKSELL_TIER_OPTIONS,
+	Default = sellRarityMode,
+	Callback = setQuickSellTier,
+}))
+
+DungeonTab:AddToggle({
+	Title = "Auto Re-Queue (Lobby)",
+	Description = "Auto-rejoins party & re-launches last dungeon when back in Lobby",
+	Default = DungeonAuto.AutoRequeue,
+	Callback = function(enabled)
+		DungeonAuto.AutoRequeue = enabled
+		Config.Set("Dungeon_AutoRequeue", enabled)
+		if not enabled then
+			setDungeonStatus("RE-QUEUE OFF")
+		elseif DungeonAuto.LastAreaId ~= "" then
+			setDungeonStatus("RE-QUEUE · " .. tostring(DungeonAuto.LastAreaId) .. " (" .. tostring(DungeonAuto.LastDifficulty) .. ")")
+		end
+	end,
+})
+
+DungeonTab:AddDropdown({
+	Title = "Re-Queue Party",
+	Options = { "Auto (Last Party)", "Solo / Instant", "Wait 2 Players", "Wait 3 Players", "Wait 4 Players" },
+	Default = DungeonAuto.RequeueMode,
+	Callback = function(choice)
+		DungeonAuto.RequeueMode = choice
+		Config.Set("Dungeon_RequeueMode", choice)
+	end,
+})
+
 dungeonStatusCard = DungeonTab:AddStatusCard({
 	Title = "Dungeon Status",
 	Value = "IDLE",
 })
+
+local function rememberLastDungeon(areaId, difficulty, leaderId, leaderName, memberCount, updatePartySize)
+	if type(areaId) == "string" and areaId ~= "" and DungeonAuto.LastAreaId ~= areaId then
+		DungeonAuto.LastAreaId = areaId
+		Config.Set("Dungeon_LastArea", areaId)
+	end
+	if type(difficulty) == "string" and difficulty ~= "" and DungeonAuto.LastDifficulty ~= difficulty then
+		DungeonAuto.LastDifficulty = difficulty
+		Config.Set("Dungeon_LastDifficulty", difficulty)
+	end
+	if type(leaderId) == "number" and leaderId > 0 and DungeonAuto.LastPartyLeaderId ~= leaderId then
+		DungeonAuto.LastPartyLeaderId = leaderId
+		Config.Set("Dungeon_LastLeaderId", leaderId)
+	end
+	if type(leaderName) == "string" and leaderName ~= "" and DungeonAuto.LastPartyLeaderName ~= leaderName then
+		DungeonAuto.LastPartyLeaderName = leaderName
+		Config.Set("Dungeon_LastLeaderName", leaderName)
+	end
+	if updatePartySize and type(memberCount) == "number" and memberCount >= 1 and DungeonAuto.LastPartySize ~= memberCount then
+		DungeonAuto.LastPartySize = memberCount
+		Config.Set("Dungeon_LastPartySize", memberCount)
+	end
+end
+
+local function recordPartySnapshot(party)
+	if type(party) ~= "table" then
+		return
+	end
+	local mCount = type(party.members) == "table" and #party.members or nil
+	rememberLastDungeon(
+		party.areaId,
+		party.difficulty,
+		party.leaderUserId,
+		party.leaderName,
+		mCount,
+		party.launching == true
+	)
+end
+
+local function tryLobbyRequeue()
+	if not DungeonAuto.AutoRequeue or DungeonAuto.RequeueBusy or not State.Alive then
+		return
+	end
+	local mods = getGameMods()
+	if not mods or not mods.Place or not mods.Place.isLobby() then
+		return
+	end
+	if LocalPlayer:GetAttribute("InRun") == true or LocalPlayer:GetAttribute("InCombat") == true then
+		return
+	end
+	local now = os.clock()
+	if (now - DungeonAuto.BootedAt) < 3.0 or (now - DungeonAuto.LastRequeueAt) < 3.0 then
+		return
+	end
+	if DungeonAuto.LastAreaId == "" then
+		setDungeonStatus("RE-QUEUE · PLAY A DUNGEON ONCE")
+		return
+	end
+
+	DungeonAuto.RequeueBusy = true
+	pcall(function()
+		if DungeonAuto.AutoQuickSell and (os.clock() - DungeonAuto.LastQuickSellAt) >= 8.0 then
+			runQuickSellTrash(true, setDungeonStatus)
+		end
+
+		local okList, lpRes = pcall(function()
+			return mods.Net.func("ListParties"):InvokeServer()
+		end)
+		if not okList or type(lpRes) ~= "table" then
+			return
+		end
+
+		local reqSize = 1
+		if DungeonAuto.RequeueMode == "Solo / Instant" then
+			reqSize = 1
+		elseif DungeonAuto.RequeueMode == "Wait 2 Players" then
+			reqSize = 2
+		elseif DungeonAuto.RequeueMode == "Wait 3 Players" then
+			reqSize = 3
+		elseif DungeonAuto.RequeueMode == "Wait 4 Players" then
+			reqSize = 4
+		else
+			reqSize = math.max(1, DungeonAuto.LastPartySize or 1)
+		end
+
+		local targetArea = DungeonAuto.LastAreaId
+		local targetDiff = (DungeonAuto.LastDifficulty ~= "" and DungeonAuto.LastDifficulty) or "Medium"
+		local myParty = lpRes.party
+
+		if type(myParty) == "table" then
+			recordPartySnapshot(myParty)
+			if myParty.launching then
+				setDungeonStatus("LAUNCHING · " .. tostring(myParty.areaId or targetArea))
+				return
+			end
+
+			local members = myParty.members or {}
+			if myParty.leaderUserId == LocalPlayer.UserId then
+				if targetArea ~= "" and myParty.areaId ~= targetArea then
+					pcall(mods.Net.fireServer, "SetPartyOptions", { areaId = targetArea })
+					task.wait(0.25)
+				end
+				if targetDiff ~= "" and myParty.difficulty ~= targetDiff then
+					pcall(mods.Net.fireServer, "SetPartyOptions", { difficulty = targetDiff })
+					task.wait(0.25)
+				end
+				if reqSize > 1 and not myParty.public then
+					pcall(mods.Net.fireServer, "SetPartyPublic", { public = true })
+				end
+
+				local allReady = true
+				for _, m in ipairs(members) do
+					if m.userId ~= LocalPlayer.UserId and m.ready ~= true then
+						allReady = false
+						break
+					end
+				end
+
+				if #members >= reqSize and allReady then
+					setDungeonStatus(string.format("RE-QUEUE START · %s (%s)", targetArea, targetDiff))
+					pcall(function()
+						return mods.Net.func("StartRun"):InvokeServer()
+					end)
+				else
+					setDungeonStatus(string.format("PARTY %d/%d · %s", #members, reqSize, targetArea))
+				end
+			else
+				local iAmReady = false
+				for _, m in ipairs(members) do
+					if m.userId == LocalPlayer.UserId then
+						iAmReady = (m.ready == true)
+						break
+					end
+				end
+				if not iAmReady then
+					pcall(mods.Net.fireServer, "SetReady", { ready = true })
+				end
+				setDungeonStatus("PARTY READY · WAIT LEADER")
+			end
+			return
+		end
+
+		-- Not currently in a party in Lobby
+		if reqSize <= 1 then
+			local okCreate, created = pcall(function()
+				return mods.Net.func("CreateParty"):InvokeServer()
+			end)
+			if okCreate and type(created) == "table" then
+				pcall(mods.Net.fireServer, "SetPartyOptions", { areaId = targetArea })
+				task.wait(0.2)
+				pcall(mods.Net.fireServer, "SetPartyOptions", { difficulty = targetDiff })
+				setDungeonStatus("CREATED SOLO · STARTING")
+			end
+			return
+		end
+
+		local isFormerMember = (DungeonAuto.LastPartyLeaderId ~= 0 and DungeonAuto.LastPartyLeaderId ~= LocalPlayer.UserId)
+		if isFormerMember then
+			for _, p in ipairs(lpRes.parties or {}) do
+				if not p.locked and (p.memberCount or 1) < (p.maxSize or 5) then
+					local leaderMatch = (DungeonAuto.LastPartyLeaderName ~= "" and p.leaderName == DungeonAuto.LastPartyLeaderName)
+					local dungeonMatch = (DungeonAuto.LastPartyLeaderName == "" and p.areaId == targetArea and p.difficulty == targetDiff)
+					if leaderMatch or dungeonMatch then
+						local okJoin, joinRes = pcall(function()
+							return mods.Net.func("JoinPartyById"):InvokeServer({ partyId = p.partyId })
+						end)
+						if okJoin and type(joinRes) == "table" and joinRes.ok then
+							pcall(mods.Net.fireServer, "SetReady", { ready = true })
+							setDungeonStatus("JOINED · " .. tostring(p.leaderName or targetArea))
+							return
+						end
+					end
+				end
+			end
+			setDungeonStatus("WAIT LEADER · " .. tostring(DungeonAuto.LastPartyLeaderName ~= "" and DungeonAuto.LastPartyLeaderName or targetArea))
+		else
+			local okCreate, created = pcall(function()
+				return mods.Net.func("CreateParty"):InvokeServer()
+			end)
+			if okCreate and type(created) == "table" then
+				pcall(mods.Net.fireServer, "SetPartyPublic", { public = true })
+				pcall(mods.Net.fireServer, "SetPartyOptions", { areaId = targetArea })
+				task.wait(0.2)
+				pcall(mods.Net.fireServer, "SetPartyOptions", { difficulty = targetDiff })
+				setDungeonStatus(string.format("PARTY OPEN (1/%d) · %s", reqSize, targetArea))
+			end
+		end
+	end)
+	DungeonAuto.LastRequeueAt = os.clock()
+	DungeonAuto.RequeueBusy = false
+end
 
 -- Dungeon event listeners
 task.spawn(function()
@@ -4879,11 +5601,40 @@ task.spawn(function()
 		return
 	end
 
+	if mods.Place and mods.Place.isLobby() then
+		local okL, lpRes = pcall(function()
+			return mods.Net.func("ListParties"):InvokeServer()
+		end)
+		if okL and type(lpRes) == "table" and type(lpRes.party) == "table" then
+			recordPartySnapshot(lpRes.party)
+		end
+	end
+
+	trackConnection(mods.Net.onClientEvent("PartyChanged", function(party)
+		if not State.Alive then
+			return
+		end
+		recordPartySnapshot(party)
+	end))
+
+	trackConnection(mods.Net.onClientEvent("PartyInvited", function(inv)
+		if not State.Alive or not DungeonAuto.AutoRequeue or type(inv) ~= "table" then
+			return
+		end
+		if mods.Place and mods.Place.isLobby() then
+			if DungeonAuto.LastPartyLeaderId == 0 or inv.fromUserId == DungeonAuto.LastPartyLeaderId or DungeonAuto.RequeueMode ~= "Solo / Instant" then
+				pcall(mods.Net.fireServer, "PartyInviteAnswer", { accept = true })
+			end
+		end
+	end))
+
 	trackConnection(mods.Net.onClientEvent("RunStateChanged", function(runState)
 		if not State.Alive or type(runState) ~= "table" then
 			return
 		end
 		DungeonAuto.RunState = runState
+		local mCount = type(runState.members) == "table" and #runState.members or nil
+		rememberLastDungeon(runState.areaId, runState.difficulty, nil, nil, mCount, true)
 		if type(runState.members) == "table" then
 			for _, m in ipairs(runState.members) do
 				if m.userId == LocalPlayer.UserId and m.maxHp and m.maxHp > 0 then
@@ -4925,18 +5676,23 @@ task.spawn(function()
 		if not State.Alive then
 			return
 		end
-		if DungeonAuto.AutoSkipMerchant then
-			task.delay(0.8, function()
+		task.spawn(function()
+			if DungeonAuto.AutoQuickSell then
+				setDungeonStatus("MERCHANT · QUICK-SELLING")
+				runQuickSellTrash(true, setDungeonStatus)
+			end
+			if DungeonAuto.AutoSkipMerchant then
+				task.wait(0.8)
 				if State.Alive and DungeonAuto.AutoSkipMerchant then
 					pcall(function()
 						mods.Net.fireServer("MerchantLeave", {})
 					end)
 					setDungeonStatus("MERCHANT SKIPPED")
 				end
-			end)
-		else
-			setDungeonStatus("MERCHANT OPEN")
-		end
+			elseif not DungeonAuto.AutoQuickSell then
+				setDungeonStatus("MERCHANT OPEN")
+			end
+		end)
 	end))
 
 	local function clearOffers()
@@ -4997,12 +5753,26 @@ task.spawn(function()
 		if not State.Alive or type(summary) ~= "table" then
 			return
 		end
+		rememberLastDungeon(summary.areaId, summary.difficulty, nil, nil, nil, false)
 		DungeonAuto.VotedSummaryGui = nil
 		DungeonAuto.VotedCurrentSummary = false
 		DungeonAuto.ServerConfirmedReplayVote = false
 		DungeonAuto.ReplayAttempts = 0
 		DungeonAuto.SeenFallenAt = nil
 		DungeonAuto.DeclineAttempts = 0
+		if DungeonAuto.AutoChests then
+			task.delay(0.4, function()
+				if State.Alive and DungeonAuto.AutoChests then
+					openAllChestsSafe(true)
+				end
+			end)
+		elseif DungeonAuto.AutoQuickSell then
+			task.delay(0.6, function()
+				if State.Alive and DungeonAuto.AutoQuickSell then
+					runQuickSellTrash(true, setDungeonStatus)
+				end
+			end)
+		end
 		if DungeonAuto.AutoReplay and summary.replay == true then
 			setDungeonStatus(string.format("REPLAY IN %.1fs", REPLAY_DELAY_SECONDS))
 			task.delay(REPLAY_DELAY_SECONDS, function()
@@ -5049,8 +5819,15 @@ trackThread(function()
 				tryVoteReplay(false, false)
 			end
 			chestTick += 1
-			if DungeonAuto.AutoChests and (chestTick % 5 == 0) then
-				openAllChestsSafe(true)
+			if chestTick % 5 == 0 then
+				if DungeonAuto.AutoChests then
+					openAllChestsSafe(true)
+				elseif DungeonAuto.AutoQuickSell and LocalPlayer:GetAttribute("InCombat") ~= true then
+					runQuickSellTrash(true, setDungeonStatus)
+				end
+			end
+			if DungeonAuto.AutoRequeue then
+				tryLobbyRequeue()
 			end
 		end)
 	end
@@ -5701,67 +6478,17 @@ LobbyTab:AddButton({
 	end,
 })
 
-local sellRarityMode = "Common"
-local quickSellBusy = false
-LobbyTab:AddSegmented({
+table.insert(quickSellTierDropdowns, LobbyTab:AddDropdown({
 	Title = "Quick-Sell Tier",
-	Options = { "Common", "Uncommon+" },
-	Default = "Common",
-	Callback = function(opt)
-		sellRarityMode = opt
-	end,
-})
+	Options = QUICKSELL_TIER_OPTIONS,
+	Default = sellRarityMode,
+	Callback = setQuickSellTier,
+}))
 
 LobbyTab:AddButton({
 	Title = "Quick-Sell Unequipped Gear",
 	Callback = function()
-		if quickSellBusy then
-			return
-		end
-		local mods = getGameMods()
-		if not mods then
-			return
-		end
-		quickSellBusy = true
-		local okRun = pcall(function()
-			local ok, profile = pcall(mods.Net.getProfile)
-			if not ok or type(profile) ~= "table" then
-				setLobbyStatus("ERR · NO PROFILE")
-				return
-			end
-
-			local equippedUids = {}
-			for _, uid in pairs(profile.equipped or {}) do
-				equippedUids[uid] = true
-			end
-
-			local allowUncommon = (sellRarityMode == "Uncommon+")
-			local sold = 0
-			for _, item in ipairs(profile.inventory or {}) do
-				local def = mods.Items[item.defId]
-				if def
-					and not equippedUids[item.uid]
-					and (item.tier or 0) == 0
-					and def.slot
-					and def.slot ~= "Pet"
-					and def.slot ~= "Mount"
-					and (def.rarity == "Common" or (allowUncommon and def.rarity == "Uncommon"))
-				then
-					local okSell, res = pcall(function()
-						return mods.Net.func("QuickSell"):InvokeServer({ defId = item.defId, uid = item.uid })
-					end)
-					if okSell and res then
-						sold += 1
-					end
-					task.wait(0.08)
-				end
-			end
-			setLobbyStatus("SOLD · " .. tostring(sold) .. " items")
-		end)
-		quickSellBusy = false
-		if not okRun then
-			setLobbyStatus("QUICK-SELL ERR")
-		end
+		runQuickSellTrash(false, setLobbyStatus)
 	end,
 })
 
