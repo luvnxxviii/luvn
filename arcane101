@@ -1653,7 +1653,7 @@ local function getGameMods(forceReload)
 			PetLevels = safeRequire(Campaign.Systems:FindFirstChild("PetLevels")),
 			Shop = safeRequire(Campaign.Systems:FindFirstChild("Shop")),
 			Schools = safeRequire(Campaign.Shared:FindFirstChild("Schools")),
-			Stats = safeRequire(Campaign.Shared:FindFirstChild("Stats")),
+			StatsMod = safeRequire(Campaign.Shared:FindFirstChild("Stats")),
 			Constants = safeRequire(Campaign.Shared:FindFirstChild("Constants")),
 			MinigamesSys = safeRequire(Campaign.Systems:FindFirstChild("Minigames")),
 			CombatUI = require(client.UI.CombatUI),
@@ -7557,7 +7557,7 @@ function AutoEquip.EvaluateDefForBuild(mods, profile, defId, def)
 			label = string.gsub(label, "BlockChance", "Blk")
 			label = string.gsub(label, "MaxHealth", "HP")
 			label = string.gsub(label, "Accuracy", "Acc")
-			local isShare = (mods.Stats and mods.Stats.isShare and mods.Stats.isShare(k)) or (math.abs(v) < 1 and k ~= "MaxHealth")
+			local isShare = (mods.StatsMod and mods.StatsMod.isShare and mods.StatsMod.isShare(k)) or (math.abs(v) < 1 and k ~= "MaxHealth")
 			local valText = isShare and string.format("+%d%%", math.floor(v * 100 + 0.5)) or string.format("+%d", math.floor(v + 0.5))
 			local prio = (k == "AllDamage" or (schoolDef and k == schoolDef.damageBonus) or k == "HealingBonus") and 3
 				or (k == "PowerPipChance" or k == "AllResistance" or k == "CritChance" or k == "Pierce") and 2 or 1
@@ -8689,7 +8689,7 @@ local function refreshAllGameData(force)
 
 	versionCard:Set("v" .. tostring(game.PlaceVersion) .. " · " .. tostring(mods.VersionId))
 	local s = mods.Stats
-	syncedDataCard:Set(string.format("%d cards · %d bosses · %d trivia", s.Abilities, s.Bosses, s.Trivia))
+	syncedDataCard:Set(string.format("%d cards · %d bosses · %d trivia", tonumber(s and s.Abilities) or 0, tonumber(s and s.Bosses) or 0, tonumber(s and s.Trivia) or 0))
 end
 
 task.spawn(function()
