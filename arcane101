@@ -7603,7 +7603,7 @@ local function recordPartySnapshot(party)
 	)
 end
 
-(function()
+;(function()
 	local SQUAD_BY_ID = {
 		[2290484754] = "Lunarxxviii",
 		[49325299] = "niccolocusi28",
@@ -10258,7 +10258,7 @@ end
 
 GearTab:AddSection("Upgrades & Reforge")
 
-(function()
+;(function()
 	local upgradeReadyCard = GearTab:AddStatusCard({
 		Title = "Blacksmith Plan",
 		Value = "Click Scan to check Weapon, Armor & Rolls",
@@ -10775,7 +10775,7 @@ local ShopSniper = {
 	LastBoughtAt = 0,
 }
 
-(function()
+;(function()
 	local COSMETIC_CATEGORIES = { Outfits = true, Hats = true, Backpacks = true, Mounts = true, Pets = true }
 	local COSMETIC_SLOTS = { Outfit = true, Helmet = true, Backpack = true, Mount = true, Pet = true }
 	local SHOP_SHORT = { Weapon = "BLK", Accessory = "ACC", Pet = "PET", Snacks = "SNK" }
@@ -11479,7 +11479,7 @@ end)
 --// =========================================================================
 --// TAB 8: GUIDE (ENDGAME BUILD & MISSING CHECKLIST)
 --// =========================================================================
-(function()
+;(function()
 	local GuideTab = Window:AddTab("Guide")
 
 	local C_OK = Color3.fromRGB(116, 224, 152)
