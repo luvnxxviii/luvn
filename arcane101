@@ -7603,7 +7603,7 @@ local function recordPartySnapshot(party)
 	)
 end
 
-do
+(function()
 	local SQUAD_BY_ID = {
 		[2290484754] = "Lunarxxviii",
 		[49325299] = "niccolocusi28",
@@ -7896,7 +7896,7 @@ do
 		DungeonAuto.LastRePartyAt = os.clock()
 		DungeonAuto.RePartyBusy = false
 	end
-end
+end)()
 
 local function tryLobbyRequeue()
 	if not DungeonAuto.AutoRequeue or DungeonAuto.RequeueBusy or not State.Alive then
@@ -10258,7 +10258,7 @@ end
 
 GearTab:AddSection("Upgrades & Reforge")
 
-do
+(function()
 	local upgradeReadyCard = GearTab:AddStatusCard({
 		Title = "Blacksmith Plan",
 		Value = "Click Scan to check Weapon, Armor & Rolls",
@@ -10617,7 +10617,7 @@ do
 			refBestWeak(false)
 		end,
 	})
-end
+end)()
 
 GearTab:AddSection("Auto Lock")
 
@@ -10775,7 +10775,7 @@ local ShopSniper = {
 	LastBoughtAt = 0,
 }
 
-do
+(function()
 	local COSMETIC_CATEGORIES = { Outfits = true, Hats = true, Backpacks = true, Mounts = true, Pets = true }
 	local COSMETIC_SLOTS = { Outfit = true, Helmet = true, Backpack = true, Mount = true, Pet = true }
 	local SHOP_SHORT = { Weapon = "BLK", Accessory = "ACC", Pet = "PET", Snacks = "SNK" }
@@ -11440,7 +11440,7 @@ do
 			end
 		end
 	end)
-end
+end)()
 
 trackRestore(function()
 	AntiAFK.Enabled = false
@@ -11479,7 +11479,7 @@ end)
 --// =========================================================================
 --// TAB 8: GUIDE (ENDGAME BUILD & MISSING CHECKLIST)
 --// =========================================================================
-do
+(function()
 	local GuideTab = Window:AddTab("Guide")
 
 	local C_OK = Color3.fromRGB(116, 224, 152)
@@ -12509,7 +12509,7 @@ do
 			end))
 		end
 	end)
-end
+end)()
 
 --// =========================================================================
 --// TAB 9: SETTINGS
