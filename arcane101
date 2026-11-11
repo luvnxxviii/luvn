@@ -1665,6 +1665,14 @@ local function getGameMods(forceReload)
 			Schools = safeRequire(Campaign.Shared:FindFirstChild("Schools")),
 			StatsMod = safeRequire(Campaign.Shared:FindFirstChild("Stats")),
 			Constants = safeRequire(Campaign.Shared:FindFirstChild("Constants")),
+			Areas = Areas,
+			BossChests = safeRequire(Campaign.Data:FindFirstChild("BossChests")) or {},
+			Recipes = safeRequire(Campaign.Data:FindFirstChild("Recipes")) or {},
+			MountDrops = safeRequire(Campaign.Data:FindFirstChild("MountDrops")) or {},
+			Seraph = safeRequire(Campaign.Data:FindFirstChild("Seraph")) or {},
+			RetiredItems = safeRequire(Campaign.Data:FindFirstChild("RetiredItems")) or {},
+			Quests = safeRequire(Campaign.Data:FindFirstChild("Quests")) or {},
+			Races = safeRequire(Campaign.Data:FindFirstChild("Races")) or {},
 			MinigamesSys = safeRequire(Campaign.Systems:FindFirstChild("Minigames")),
 			CombatUI = require(client.UI.CombatUI),
 			Place = safeRequire(client:FindFirstChild("Place")),
@@ -2027,6 +2035,7 @@ function CombatAuto.AnnotateEnemyThreats(mods, state, me, enemies)
 	local killableCount = 0
 	local nonBossHpSum, nonBossCount = 0, 0
 	local allHpSum = 0
+	local hasActiveBinder = false
 
 	local function statusHasTag(st, tag)
 		if not st or type(st.tags) ~= "table" then
@@ -2040,9 +2049,38 @@ function CombatAuto.AnnotateEnemyThreats(mods, state, me, enemies)
 		return false
 	end
 
+	local function isBinderCombatant(c)
+		return type(c) == "table" and (c.binds == true or c.enemyId == "WardenLeftHand" or c.enemyId == "WardenRightHand")
+	end
+
+	local function hasBoundImmunityStatus(c)
+		if type(c) ~= "table" then
+			return false
+		end
+		for _, stEntry in ipairs(c.statuses or {}) do
+			local sid = (type(stEntry) == "table" and stEntry.id) or stEntry
+			local st = type(sid) == "string" and Statuses[sid]
+			if sid == "Bound" or (st and st.uncapped == true and st.cleanseProof == true and type(st.damageTakenMultiplier) == "number" and st.damageTakenMultiplier <= 0.1) then
+				return true
+			end
+		end
+		return false
+	end
+
+	for _, e in ipairs(enemies) do
+		if isBinderCombatant(e.combatant) then
+			hasActiveBinder = true
+			break
+		end
+	end
+
 	for _, e in ipairs(enemies) do
 		local c = e.combatant or {}
 		local mHp = math.max(1, e.maxHp or (c.derived and c.derived.maxHp) or c.maxHp or e.hp or 100)
+		local isBinder = isBinderCombatant(c)
+		local isBound = hasBoundImmunityStatus(c) or (hasActiveBinder and type(c.bound) == "table")
+		e.isAbyssFist = isBinder
+		e._hasBoundStatus = isBound
 		allHpSum += mHp
 		if not e.isBoss then
 			nonBossHpSum += mHp
@@ -2051,7 +2089,7 @@ function CombatAuto.AnnotateEnemyThreats(mods, state, me, enemies)
 		if (e.hp or mHp) < mHp * 0.92 then
 			damagedEnemyCount += 1
 		end
-		if not (c.immortal == true or c.unkillable == true) then
+		if not (c.immortal == true or c.unkillable == true or isBound) then
 			killableCount += 1
 		end
 		for _, stEntry in ipairs(c.statuses or {}) do
@@ -2364,13 +2402,21 @@ function CombatAuto.AnnotateEnemyThreats(mods, state, me, enemies)
 			hasMajorHealer = true
 		end
 		local c = e.combatant or {}
-		local isImmortal = (c.immortal == true or c.unkillable == true) and killableCount > 0
+		local isBoundProtected = (e._hasBoundStatus == true) and killableCount > 0
+		local isImmortal = (c.immortal == true or c.unkillable == true or isBoundProtected) and killableCount > 0
 		if isImmortal then
-			effectiveThreat *= 0.15
+			effectiveThreat *= (isBoundProtected and 0.02 or 0.15)
+		elseif hasActiveBinder and e.isAbyssFist then
+			local hpRatio = math.clamp((e.hp or 1) / math.max(1, e.maxHp or 1), 0, 1)
+			effectiveThreat = math.max(effectiveThreat, maxRawBase * 1.45) + (1 - hpRatio) * 180
 		end
 
 		local role
-		if isMajorHealer then
+		if isImmortal and isBoundProtected then
+			role = "Bound"
+		elseif hasActiveBinder and e.isAbyssFist then
+			role = "Fist (Priority)"
+		elseif isMajorHealer then
 			role = "Healer"
 		elseif m.ctrlScore >= m.dpsScore * 0.90 and m.ctrlScore >= 38 then
 			role = "Debuffer"
@@ -2381,7 +2427,9 @@ function CombatAuto.AnnotateEnemyThreats(mods, state, me, enemies)
 		end
 
 		e.isMajorHealer = isMajorHealer
+		e.isBoundProtected = isBoundProtected
 		e.isImmortal = isImmortal
+		e._hasBoundStatus = nil
 		e.threatRole = role
 		e.allyHealScore = m.allyHealScore
 		e.dpsScore = m.dpsScore
@@ -2396,18 +2444,20 @@ function CombatAuto.AnnotateEnemyThreats(mods, state, me, enemies)
 	for _, e in ipairs(enemies) do
 		local ratio = (maxEffectiveThreat > 0) and (e.threatScore / maxEffectiveThreat) or 1
 		e.threatRatio = ratio
-		e.isTopThreat = (ratio >= 0.98)
+		e.isTopThreat = (not e.isImmortal) and ((ratio >= 0.98) or (hasActiveBinder and e.isAbyssFist == true))
 		local mult = 0.90 + ratio * 0.65
-		if e.isTopThreat then
+		if e.isImmortal then
+			mult = e.isBoundProtected and 0.02 or 0.25
+		elseif hasActiveBinder and e.isAbyssFist then
+			local hpRatio = math.clamp((e.hp or 1) / math.max(1, e.maxHp or 1), 0, 1)
+			mult = 2.60 + (1 - hpRatio) * 0.40
+		elseif e.isTopThreat then
 			mult = e.isMajorHealer and 1.95 or 1.75
 		elseif e.isMajorHealer then
 			mult = 1.80
 		end
-		if e.isBoss and not hasMajorHealer and not e.isImmortal then
+		if e.isBoss and not hasMajorHealer and not e.isImmortal and not hasActiveBinder then
 			mult += 0.15
-		end
-		if e.isImmortal then
-			mult = 0.25
 		end
 		e.threatFocusMult = mult
 	end
@@ -4293,6 +4343,7 @@ local function getElementMultiplier(mods, attackSchool, defender, me, directAlre
 	end
 
 	local evades = false
+	local hasUncappedMod = false
 	for _, entry in ipairs(defender.statuses or {}) do
 		local sid = (type(entry) == "table" and entry.id) or entry
 		local st = type(sid) == "string" and mods.Statuses[sid]
@@ -4302,6 +4353,9 @@ local function getElementMultiplier(mods, attackSchool, defender, me, directAlre
 			elseif type(st.damageTakenMultiplier) == "number" then
 				if not (ignoreShatterBuffs and st.damageTakenMultiplier < 1 and not st.cleanseProof) then
 					defWardFactor *= st.damageTakenMultiplier
+					if st.uncapped == true and st.damageTakenMultiplier < 1 then
+						hasUncappedMod = true
+					end
 				end
 			elseif atkSchool and st.school == atkSchool and type(st.schoolTaken) == "number" then
 				defWardFactor *= math.max(0.1, 1 - st.schoolTaken)
@@ -4311,7 +4365,7 @@ local function getElementMultiplier(mods, attackSchool, defender, me, directAlre
 		end
 	end
 
-	local minIncoming = (mods.Constants and mods.Constants.MAX_DAMAGE_REDUCTION) and (1 - mods.Constants.MAX_DAMAGE_REDUCTION) or 0.1
+	local minIncoming = hasUncappedMod and 0.01 or ((mods.Constants and mods.Constants.MAX_DAMAGE_REDUCTION) and (1 - mods.Constants.MAX_DAMAGE_REDUCTION) or 0.1)
 	mult *= evades and 0.05 or math.max(minIncoming, defWardFactor)
 
 	return math.clamp(mult, 0.01, 15.0)
@@ -4459,21 +4513,23 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 					killsTopThreat = true
 				end
 			else
-				local highThreat = e.isBoss or e.isMajorHealer or e.isTopThreat
-				if entry.info.hasShatter and e.hasDefenseMitigation then
-					tactical += (highThreat and 240 or 140)
-				end
-				if entry.info.appliesControl and not e.evades and not e.isControlLocked then
-					tactical += highThreat and 130 or 85
-				end
-				if not e.evades then
-					if entry.info.appliesVulnerable and not e.isVulnerable and dmg < e.effectiveHp then
-						tactical += (highThreat and 220 or 85)
+				local highThreat = (e.isBoss or e.isMajorHealer or e.isTopThreat) and not e.isBoundProtected
+				if not e.isBoundProtected then
+					if entry.info.hasShatter and e.hasDefenseMitigation then
+						tactical += (highThreat and 240 or 140)
 					end
-					if entry.info.appliesBlind and not e.isBlinded and not e.isControlLocked then
-						tactical += (highThreat and 140 or 65)
-					elseif entry.info.appliesWeaken then
-						tactical += (highThreat and 90 or 35)
+					if entry.info.appliesControl and not e.evades and not e.isControlLocked then
+						tactical += highThreat and 130 or 85
+					end
+					if not e.evades then
+						if entry.info.appliesVulnerable and not e.isVulnerable and dmg < e.effectiveHp then
+							tactical += (highThreat and 220 or 85)
+						end
+						if entry.info.appliesBlind and not e.isBlinded and not e.isControlLocked then
+							tactical += (highThreat and 140 or 65)
+						elseif entry.info.appliesWeaken then
+							tactical += (highThreat and 90 or 35)
+						end
 					end
 				end
 			end
@@ -4533,11 +4589,17 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 
 		local overkill = math.max(0, dmg - e.effectiveHp)
 		local s = (eff * focusMult) - (overkill * 0.65) - (eff * (e.reprisal or 0) * 0.85)
-		local highThreat = e.isBoss or e.isMajorHealer or e.isTopThreat
+		local highThreat = (e.isBoss or e.isMajorHealer or e.isTopThreat) and not e.isBoundProtected
+		if e.isBoundProtected then
+			s *= 0.02
+		elseif e.isAbyssFist then
+			local hpFrac = math.clamp((e.hp or 1) / math.max(1, e.maxHp or 1), 0, 1)
+			s += 320 + math.floor((1 - hpFrac) * 180)
+		end
 		if canKill then
 			local killThreatBonus = isSmart and (e.isMajorHealer and 360 or math.floor((e.threatRatio or 0) * 180)) or 0
 			s += (e.isBoss and 420 or 120) + killThreatBonus + (killPips * 55)
-		else
+		elseif not e.isBoundProtected then
 			if entry.info.hasShatter and e.hasDefenseMitigation then
 				s += (highThreat and 260 or 150)
 			end
@@ -5573,6 +5635,8 @@ local function pickTargetId(mods, state, me, ability, info, preferMode, evalResu
 				local projDmg = directDmg * mult
 				local autoExec = (not isBoss) and tExecThresh > 0 and ((hp - math.max(0, projDmg - shield)) <= maxHp * tExecThresh)
 				local canKill = (directDmg > 0) and ((projDmg >= ehp * 0.99) or autoExec)
+				local isBoundProtected = (eInfo and eInfo.isBoundProtected == true) or false
+				local isAbyssFist = (eInfo and eInfo.isAbyssFist == true) or (c.binds == true) or (c.enemyId == "WardenLeftHand" or c.enemyId == "WardenRightHand")
 				local score
 				if directDmg <= 0 then
 					-- Non-damage support debuff (Hex, Beguile, Blind, Stun, MortalWound): prioritize top-threat enemy missing it & not StunImmune/CC-locked
@@ -5596,20 +5660,20 @@ local function pickTargetId(mods, state, me, ability, info, preferMode, evalResu
 					end
 					local threatWeight = ((eInfo and eInfo.threatScore) or 0) * 1500
 						+ ((appliesMortalWound and eInfo and eInfo.isMajorHealer) and 400000 or 0)
-					score = (alreadyDebuffed and 10000000 or 0) - threatWeight - (isBoss and 150000 or 0) - ehp
+					score = (alreadyDebuffed and 10000000 or 0) + (isBoundProtected and 50000000 or 0) - (isAbyssFist and 2000000 or 0) - threatWeight - ((isBoss and not isBoundProtected) and 150000 or 0) - ehp
 				elseif CombatAuto.TargetPriority == "Highest HP" then
-					score = -ehp / math.max(0.05, mult)
+					score = (isBoundProtected and 50000000 or 0) - (isAbyssFist and 2000000 or 0) - (ehp / math.max(0.05, mult))
 				elseif CombatAuto.TargetPriority == "Boss First" then
-					score = (isBoss and -10000000 or 0) - (canKill and 500000 or 0) - maxHp + (ehp / math.max(0.05, mult) * 0.01)
+					score = (isBoundProtected and 50000000 or 0) - (isAbyssFist and 2000000 or 0) + ((isBoss and not isBoundProtected) and -10000000 or 0) - (canKill and 500000 or 0) - maxHp + (ehp / math.max(0.05, mult) * 0.01)
 				elseif CombatAuto.TargetPriority == "Lowest HP" then
-					score = ehp
+					score = (isBoundProtected and 50000000 or 0) - (isAbyssFist and 2000000 or 0) + ehp
 				else
-					-- Smart Effective: threat-weighted damage & lethal kills (Major Healer > Top DPS/Debuffer > Tank/Weak)
+					-- Smart Effective: Abyss Fists / Major Healer / Top DPS > Tank / Bound Head
 					local eff = math.min(projDmg, ehp)
 					local okAmt = math.max(0, projDmg - ehp)
 					local fMult = (eInfo and eInfo.threatFocusMult) or (isBoss and 1.25 or 1.0)
 					local killThreatBonus = (eInfo and eInfo.isMajorHealer and 350000) or ((eInfo and eInfo.isTopThreat) and 220000) or 0
-					score = -(eff * fMult) + (okAmt * 0.65) - (canKill and ((isBoss and 500000 or 100000) + killThreatBonus) or 0)
+					score = (isBoundProtected and 50000000 or 0) - (isAbyssFist and (2000000 - ehp * 0.5) or 0) - (eff * fMult) + (okAmt * 0.65) - (canKill and ((isBoss and 500000 or 100000) + killThreatBonus) or 0)
 				end
 				if not bestScore or score < bestScore then
 					bestScore = score
@@ -6390,6 +6454,9 @@ local DungeonAuto = {
 	ReserveUpgradeFuel = Config.Get("Dungeon_ReserveFuel", true),
 	AutoRequeue = Config.Get("Dungeon_AutoRequeue", false),
 	RequeueMode = Config.Get("Dungeon_RequeueMode", "Auto (Last Party)"),
+	ReParty = Config.Get("Dungeon_ReParty", false),
+	RePartyGroup = Config.Get("Dungeon_RePartyGroup", "Full Squad (4 Accs)"),
+	RePartyFollowServer = Config.Get("Dungeon_RePartyFollowServer", true),
 	LastAreaId = Config.Get("Dungeon_LastArea", ""),
 	LastDifficulty = Config.Get("Dungeon_LastDifficulty", "Medium"),
 	LastPartyLeaderId = Config.Get("Dungeon_LastLeaderId", 0),
@@ -6399,7 +6466,11 @@ local DungeonAuto = {
 	RunState = nil,
 	CurrentHpRatio = 1,
 	RequeueBusy = false,
+	RePartyBusy = false,
 	LastRequeueAt = 0,
+	LastRePartyAt = 0,
+	LastFollowTpAt = 0,
+	LastInviteSentAt = {},
 	LastQuickSellAt = 0,
 	BootedAt = os.clock(),
 	QuickSellToggles = {},
@@ -7447,6 +7518,45 @@ DungeonTab:AddDropdown({
 	end,
 })
 
+DungeonTab:AddToggle({
+	Title = "Auto Re-Party (My 4 Accs)",
+	Description = "Forms & stays in private party in Lobby or after reconnect (ONLY your 4 accounts)",
+	Default = DungeonAuto.ReParty,
+	Callback = function(enabled)
+		DungeonAuto.ReParty = enabled
+		Config.Set("Dungeon_ReParty", enabled)
+		if not enabled then
+			setDungeonStatus("RE-PARTY OFF")
+		else
+			setDungeonStatus("RE-PARTY ON · " .. tostring(DungeonAuto.RePartyGroup))
+		end
+	end,
+})
+
+DungeonTab:AddDropdown({
+	Title = "Re-Party Setup",
+	Options = {
+		"Full Squad (4 Accs)",
+		"2 Duos (Storm+Light / Shadow+Nature)",
+		"Follow Last Squad Leader",
+	},
+	Default = DungeonAuto.RePartyGroup,
+	Callback = function(choice)
+		DungeonAuto.RePartyGroup = choice
+		Config.Set("Dungeon_RePartyGroup", choice)
+	end,
+})
+
+DungeonTab:AddToggle({
+	Title = "Follow Squad Server",
+	Description = "Follows Leader's Lobby server if an account reconnects elsewhere",
+	Default = DungeonAuto.RePartyFollowServer,
+	Callback = function(enabled)
+		DungeonAuto.RePartyFollowServer = enabled
+		Config.Set("Dungeon_RePartyFollowServer", enabled)
+	end,
+})
+
 dungeonStatusCard = DungeonTab:AddStatusCard({
 	Title = "Dungeon Status",
 	Value = "IDLE",
@@ -7488,6 +7598,301 @@ local function recordPartySnapshot(party)
 		mCount,
 		party.launching == true
 	)
+end
+
+do
+	local SQUAD_BY_ID = {
+		[2290484754] = "Lunarxxviii",
+		[49325299] = "niccolocusi28",
+		[129143175] = "flamingcookie28",
+		[50373786] = "stillcrown28",
+	}
+	local SQUAD_BY_NAME = {}
+	for uid, nm in pairs(SQUAD_BY_ID) do
+		SQUAD_BY_NAME[string.lower(nm)] = uid
+	end
+
+	local function resolveUserId(uid, name)
+		local n = tonumber(uid)
+		if n and SQUAD_BY_ID[n] then
+			return n
+		end
+		if type(name) == "string" and name ~= "" then
+			local matched = SQUAD_BY_NAME[string.lower(name)]
+			if matched then
+				return matched
+			end
+		end
+		return nil
+	end
+
+	function DungeonAuto.IsMySquadAccount(uid, name)
+		return resolveUserId(uid, name) ~= nil
+	end
+
+	local function resolveSquadRole()
+		local myUid = resolveUserId(LocalPlayer.UserId, LocalPlayer.Name)
+		if not myUid then
+			return nil
+		end
+		if DungeonAuto.RePartyGroup == "2 Duos (Storm+Light / Shadow+Nature)" then
+			if myUid == 2290484754 or myUid == 49325299 then
+				return {
+					groupKey = "duo_a",
+					leaderId = 2290484754,
+					members = { [2290484754] = true, [49325299] = true },
+					targetSize = 2,
+				}
+			end
+			return {
+				groupKey = "duo_b",
+				leaderId = 129143175,
+				members = { [129143175] = true, [50373786] = true },
+				targetSize = 2,
+			}
+		elseif DungeonAuto.RePartyGroup == "Follow Last Squad Leader" then
+			local lastUid = resolveUserId(DungeonAuto.LastPartyLeaderId, DungeonAuto.LastPartyLeaderName)
+			return {
+				groupKey = "last",
+				leaderId = lastUid or 2290484754,
+				members = { [2290484754] = true, [49325299] = true, [129143175] = true, [50373786] = true },
+				targetSize = 4,
+			}
+		end
+		return {
+			groupKey = "full4",
+			leaderId = 2290484754,
+			members = { [2290484754] = true, [49325299] = true, [129143175] = true, [50373786] = true },
+			targetSize = 4,
+		}
+	end
+
+	function DungeonAuto.AcceptsInviteFrom(uid, name)
+		local inviterId = resolveUserId(uid, name)
+		if not inviterId then
+			return false
+		end
+		local role = resolveSquadRole()
+		if not role then
+			return false
+		end
+		if DungeonAuto.RePartyGroup == "2 Duos (Storm+Light / Shadow+Nature)" then
+			return role.members[inviterId] == true and inviterId == role.leaderId
+		end
+		return true
+	end
+
+	local function bridgePath(groupKey)
+		return "MonochromeHub/reparty_bridge_" .. tostring(groupKey) .. ".json"
+	end
+
+	local function writeBridge(groupKey, payload)
+		if typeof(writefile) ~= "function" then
+			return
+		end
+		if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder("MonochromeHub") then
+			pcall(makefolder, "MonochromeHub")
+		end
+		local okE, encoded = pcall(function()
+			return HttpService:JSONEncode(payload)
+		end)
+		if okE and type(encoded) == "string" then
+			pcall(writefile, bridgePath(groupKey), encoded)
+		end
+	end
+
+	local function readBridge(groupKey)
+		if typeof(readfile) ~= "function" or typeof(isfile) ~= "function" then
+			return nil
+		end
+		local p = bridgePath(groupKey)
+		if not isfile(p) then
+			return nil
+		end
+		local okR, raw = pcall(readfile, p)
+		if not okR or type(raw) ~= "string" or #raw == 0 then
+			return nil
+		end
+		local okD, dec = pcall(function()
+			return HttpService:JSONDecode(raw)
+		end)
+		return (okD and type(dec) == "table") and dec or nil
+	end
+
+	function DungeonAuto.TryLobbyReParty(mods)
+		if not DungeonAuto.ReParty or DungeonAuto.RePartyBusy or not State.Alive then
+			return
+		end
+		if not mods or not mods.Place or not mods.Place.isLobby() then
+			return
+		end
+		if LocalPlayer:GetAttribute("InRun") == true or LocalPlayer:GetAttribute("InCombat") == true then
+			return
+		end
+		local now = os.clock()
+		if (now - DungeonAuto.BootedAt) < 2.2 or (now - DungeonAuto.LastRePartyAt) < 2.5 then
+			return
+		end
+		local role = resolveSquadRole()
+		if not role then
+			return
+		end
+
+		DungeonAuto.RePartyBusy = true
+		pcall(function()
+			local myUid = resolveUserId(LocalPlayer.UserId, LocalPlayer.Name)
+			local iAmLeader = (myUid == role.leaderId)
+
+			local okList, lpRes = pcall(function()
+				return mods.Net.func("ListParties"):InvokeServer()
+			end)
+			if not okList or type(lpRes) ~= "table" then
+				return
+			end
+
+			local myParty = lpRes.party
+			if type(myParty) == "table" then
+				recordPartySnapshot(myParty)
+				if myParty.launching then
+					return
+				end
+			end
+
+			if iAmLeader then
+				if type(myParty) ~= "table" then
+					local okC, created = pcall(function()
+						return mods.Net.func("CreateParty"):InvokeServer()
+					end)
+					if okC and type(created) == "table" then
+						myParty = created
+					end
+				end
+				if type(myParty) ~= "table" then
+					return
+				end
+
+				-- Keep party strictly private so outsiders never join
+				if myParty.public == true then
+					pcall(mods.Net.fireServer, "SetPartyPublic", { public = false })
+				end
+
+				writeBridge(role.groupKey, {
+					leaderUserId = LocalPlayer.UserId,
+					leaderName = LocalPlayer.Name,
+					partyId = myParty.partyId,
+					code = myParty.code,
+					jobId = game.JobId,
+					placeId = game.PlaceId,
+					updatedAt = os.time(),
+				})
+
+				local inParty = {}
+				local squadCount = 0
+				for _, m in ipairs(myParty.members or {}) do
+					local mUid = resolveUserId(m.userId, m.name)
+					if mUid then
+						inParty[mUid] = true
+						if role.members[mUid] then
+							squadCount += 1
+						end
+					elseif m.userId and not SQUAD_BY_ID[m.userId] then
+						-- Kick strangers if somehow present while Re-Party is enforcing 4-acc exclusivity
+						pcall(mods.Net.fireServer, "KickPartyMember", { userId = m.userId })
+					end
+				end
+
+				for _, plr in ipairs(Players:GetPlayers()) do
+					local pUid = resolveUserId(plr.UserId, plr.Name)
+					if pUid and pUid ~= myUid and role.members[pUid] and not inParty[plr.UserId] and not inParty[pUid] then
+						local lastInv = DungeonAuto.LastInviteSentAt[plr.UserId] or 0
+						if (os.clock() - lastInv) >= 6.0 then
+							DungeonAuto.LastInviteSentAt[plr.UserId] = os.clock()
+							pcall(mods.Net.fireServer, "InviteToParty", { userId = plr.UserId })
+						end
+					end
+				end
+
+				if not DungeonAuto.AutoRequeue then
+					setDungeonStatus(string.format("RE-PARTY %d/%d · LOBBY (%s)", squadCount, role.targetSize, tostring(myParty.code or "PRIVATE")))
+				end
+			else
+				-- Member logic: stay in designated squad leader's party; leave outsider parties; join via bridge code or follow server
+				if type(myParty) == "table" then
+					local leaderUid = resolveUserId(myParty.leaderUserId, myParty.leaderName)
+					local rightLeader = (leaderUid == role.leaderId)
+						or (DungeonAuto.RePartyGroup == "Follow Last Squad Leader" and leaderUid ~= nil)
+					if rightLeader then
+						local iAmReady = false
+						for _, m in ipairs(myParty.members or {}) do
+							if m.userId == LocalPlayer.UserId then
+								iAmReady = (m.ready == true)
+								break
+							end
+						end
+						if not iAmReady then
+							pcall(mods.Net.fireServer, "SetReady", { ready = true })
+						end
+						if not DungeonAuto.AutoRequeue then
+							setDungeonStatus("RE-PARTY · WITH " .. tostring(myParty.leaderName or SQUAD_BY_ID[leaderUid]))
+						end
+						return
+					else
+						pcall(function()
+							return mods.Net.func("LeaveParty"):InvokeServer()
+						end)
+						task.wait(0.25)
+					end
+				end
+
+				-- Not in squad party yet: check bridge first
+				local br = readBridge(role.groupKey)
+				local freshBridge = br and (os.time() - (tonumber(br.updatedAt) or 0)) <= 60
+				if freshBridge then
+					if br.jobId and br.jobId ~= "" and br.jobId ~= game.JobId and DungeonAuto.RePartyFollowServer then
+						if (os.clock() - DungeonAuto.LastFollowTpAt) >= 12.0 then
+							DungeonAuto.LastFollowTpAt = os.clock()
+							setDungeonStatus("FOLLOWING LEADER SERVER...")
+							pcall(function()
+								TeleportService:TeleportToPlaceInstance(tonumber(br.placeId) or game.PlaceId, br.jobId, LocalPlayer)
+							end)
+						end
+						return
+					end
+					if type(br.code) == "string" and br.code ~= "" then
+						local okJ, jRes = pcall(function()
+							return mods.Net.func("JoinParty"):InvokeServer({ code = br.code })
+						end)
+						if okJ and type(jRes) == "table" and jRes.ok then
+							pcall(mods.Net.fireServer, "SetReady", { ready = true })
+							setDungeonStatus("RE-PARTIED · " .. tostring(br.leaderName or SQUAD_BY_ID[role.leaderId]))
+							return
+						end
+					end
+				end
+
+				-- Fallback: scan ListParties strictly matching our designated Squad Leader
+				for _, p in ipairs(lpRes.parties or {}) do
+					local pLeaderUid = resolveUserId(p.leaderUserId, p.leaderName)
+					if pLeaderUid == role.leaderId and not p.locked and (p.memberCount or 1) < (p.maxSize or 5) then
+						local okJoin, joinRes = pcall(function()
+							return mods.Net.func("JoinPartyById"):InvokeServer({ partyId = p.partyId })
+						end)
+						if okJoin and type(joinRes) == "table" and joinRes.ok then
+							pcall(mods.Net.fireServer, "SetReady", { ready = true })
+							setDungeonStatus("RE-PARTIED · " .. tostring(p.leaderName))
+							return
+						end
+					end
+				end
+
+				if not DungeonAuto.AutoRequeue then
+					setDungeonStatus("RE-PARTY · WAIT " .. tostring(SQUAD_BY_ID[role.leaderId] or "LEADER"))
+				end
+			end
+		end)
+		DungeonAuto.LastRePartyAt = os.clock()
+		DungeonAuto.RePartyBusy = false
+	end
 end
 
 local function tryLobbyRequeue()
@@ -7557,7 +7962,7 @@ local function tryLobbyRequeue()
 					pcall(mods.Net.fireServer, "SetPartyOptions", { difficulty = targetDiff })
 					task.wait(0.25)
 				end
-				if reqSize > 1 and not myParty.public then
+				if reqSize > 1 and not myParty.public and not DungeonAuto.ReParty then
 					pcall(mods.Net.fireServer, "SetPartyPublic", { public = true })
 				end
 
@@ -7594,6 +7999,9 @@ local function tryLobbyRequeue()
 		end
 
 		-- Not currently in a party in Lobby
+		if DungeonAuto.ReParty then
+			return
+		end
 		if reqSize <= 1 then
 			local okCreate, created = pcall(function()
 				return mods.Net.func("CreateParty"):InvokeServer()
@@ -7667,10 +8075,19 @@ task.spawn(function()
 	end))
 
 	trackConnection(mods.Net.onClientEvent("PartyInvited", function(inv)
-		if not State.Alive or not DungeonAuto.AutoRequeue or type(inv) ~= "table" then
+		if not State.Alive or type(inv) ~= "table" then
 			return
 		end
-		if mods.Place and mods.Place.isLobby() then
+		if not (mods.Place and mods.Place.isLobby()) then
+			return
+		end
+		if DungeonAuto.ReParty then
+			if DungeonAuto.AcceptsInviteFrom and DungeonAuto.AcceptsInviteFrom(inv.fromUserId, inv.fromName) then
+				pcall(mods.Net.fireServer, "PartyInviteAnswer", { accept = true })
+			end
+			return
+		end
+		if DungeonAuto.AutoRequeue then
 			if DungeonAuto.LastPartyLeaderId == 0 or inv.fromUserId == DungeonAuto.LastPartyLeaderId or DungeonAuto.RequeueMode ~= "Solo / Instant" then
 				pcall(mods.Net.fireServer, "PartyInviteAnswer", { accept = true })
 			end
@@ -7875,6 +8292,9 @@ trackThread(function()
 				if DungeonAuto.AutoQuickSell and LocalPlayer:GetAttribute("InCombat") ~= true and (os.clock() - DungeonAuto.LastQuickSellAt) >= 8.0 then
 					runQuickSellTrash(true, setDungeonStatus)
 				end
+			end
+			if DungeonAuto.ReParty and DungeonAuto.TryLobbyReParty then
+				DungeonAuto.TryLobbyReParty(getGameMods())
 			end
 			if DungeonAuto.AutoRequeue then
 				tryLobbyRequeue()
@@ -8651,7 +9071,7 @@ local function detectProfilePathId(mods, profile)
 	return nil
 end
 
-local function resolveAutoBuildProfile(mods, profile, schoolOverride)
+local function resolveAutoBuildProfile(mods, profile, schoolOverride, roleOverride)
 	local mySchool = profile and profile.primarySchool
 	local targetSchool = schoolOverride
 	if not targetSchool or targetSchool == "" then
@@ -8667,20 +9087,23 @@ local function resolveAutoBuildProfile(mods, profile, schoolOverride)
 		end
 	end
 
-	local modeChoice = AutoEquip.BuildMode
+	local modeChoice = (roleOverride and roleOverride ~= "Auto") and roleOverride or ((not roleOverride) and AutoEquip.BuildMode or "Auto")
 	local resolvedMode
 	if modeChoice == "Support" or modeChoice == "Damage" then
 		resolvedMode = modeChoice
+	elseif roleOverride == "Auto" and targetSchool ~= mySchool then
+		resolvedMode = (targetSchool == "Light" or targetSchool == "Nature" or targetSchool == "Frost") and "Support" or "Damage"
 	else
 		resolvedMode = (pathInfo and pathInfo.mode) or "Damage"
 	end
 
+	local effPathInfo = (not schoolOverride or schoolOverride == "" or schoolOverride == mySchool) and pathInfo or nil
 	local archetype
 	local label
 	if resolvedMode == "Support" then
-		if pathInfo and pathInfo.mode == "Support" then
-			archetype = pathInfo.archetype
-			label = pathInfo.label
+		if effPathInfo and effPathInfo.mode == "Support" then
+			archetype = effPathInfo.archetype
+			label = effPathInfo.label
 		elseif targetSchool == "Frost" then
 			archetype = "ShieldTank"
 			label = "Tank/Shield"
@@ -8695,9 +9118,9 @@ local function resolveAutoBuildProfile(mods, profile, schoolOverride)
 			label = "Support"
 		end
 	else
-		if pathInfo and pathInfo.mode == "Damage" then
-			archetype = pathInfo.archetype
-			label = pathInfo.label
+		if effPathInfo and effPathInfo.mode == "Damage" then
+			archetype = effPathInfo.archetype
+			label = effPathInfo.label
 		else
 			archetype = (targetSchool == "Storm" and "StormCrit")
 				or (targetSchool == "Wind" and "HasteTempo")
@@ -8705,7 +9128,7 @@ local function resolveAutoBuildProfile(mods, profile, schoolOverride)
 				or (targetSchool == "Steel" and "TankBruiser")
 				or (targetSchool == "Light" and "LightCritHeal")
 				or "RawDamage"
-			label = pathInfo and (pathInfo.label .. " (DMG)") or ((targetSchool or "Auto") .. " DPS")
+			label = effPathInfo and (effPathInfo.label .. " (DMG)") or ((targetSchool or "Auto") .. " DPS")
 		end
 	end
 
@@ -11051,7 +11474,1042 @@ trackRestore(function()
 end)
 
 --// =========================================================================
---// TAB 8: SETTINGS
+--// TAB 8: GUIDE (ENDGAME BUILD & MISSING CHECKLIST)
+--// =========================================================================
+do
+	local GuideTab = Window:AddTab("Guide")
+
+	local C_OK = Color3.fromRGB(116, 224, 152)
+	local C_BAG = Color3.fromRGB(116, 204, 244)
+	local C_WARN = Color3.fromRGB(246, 200, 108)
+	local C_MISS = Color3.fromRGB(244, 128, 128)
+	local C_MYTH = Color3.fromRGB(198, 154, 255)
+	local C_SUB = Color3.fromRGB(170, 172, 184)
+
+	local GuideCfg = {
+		ViewMode = Config.Get("Guide_ViewMode", "All Slots (Full BiS)"),
+		SchoolOverride = Config.Get("Guide_School", "Auto (My School)"),
+		RoleOverride = Config.Get("Guide_Role", "Auto"),
+		CompareTier = Config.Get("Guide_CompareTier", "Max BS (T5+Roll)"),
+		CapMode = Config.Get("Guide_CapMode", "Current Cap"),
+	}
+
+	GuideTab:AddSection("Endgame Build Advisor")
+
+	local guideBuildCard = GuideTab:AddStatusCard({
+		Title = "Target Build",
+		Value = "Loading...",
+	})
+
+	local guideGapCard = GuideTab:AddStatusCard({
+		Title = "Stats (Now -> BiS)",
+		Value = "Loading...",
+	})
+
+	local renderGuide
+
+	GuideTab:AddDropdown({
+		Title = "View Mode",
+		Options = {
+			"All Slots (Full BiS)",
+			"Missing Only",
+			"Farm Routes (Where to Get)",
+			"Endgame Cards & Tiers",
+		},
+		Default = GuideCfg.ViewMode,
+		Callback = function(choice)
+			GuideCfg.ViewMode = choice
+			Config.Set("Guide_ViewMode", choice)
+			if renderGuide then
+				task.spawn(renderGuide, false)
+			end
+		end,
+	})
+
+	GuideTab:AddDropdown({
+		Title = "Preview School",
+		Options = { "Auto (My School)", "Storm", "Shadow", "Light", "Nature", "Flame", "Frost", "Wind", "Steel" },
+		Default = GuideCfg.SchoolOverride,
+		Callback = function(choice)
+			GuideCfg.SchoolOverride = choice
+			Config.Set("Guide_School", choice)
+			if renderGuide then
+				task.spawn(renderGuide, false)
+			end
+		end,
+	})
+
+	GuideTab:AddSegmented({
+		Title = "Build Role",
+		Options = { "Auto", "Damage", "Support" },
+		Default = GuideCfg.RoleOverride,
+		Callback = function(choice)
+			GuideCfg.RoleOverride = choice
+			Config.Set("Guide_Role", choice)
+			if renderGuide then
+				task.spawn(renderGuide, false)
+			end
+		end,
+	})
+
+	GuideTab:AddSegmented({
+		Title = "Projection Mode",
+		Options = { "Max BS (T5+Roll)", "Base Drops" },
+		Default = GuideCfg.CompareTier,
+		Callback = function(choice)
+			GuideCfg.CompareTier = choice
+			Config.Set("Guide_CompareTier", choice)
+			if renderGuide then
+				task.spawn(renderGuide, false)
+			end
+		end,
+	})
+
+	GuideTab:AddSegmented({
+		Title = "Level Scope",
+		Options = { "Current Cap", "My Level", "Uncapped (All)" },
+		Default = GuideCfg.CapMode,
+		Callback = function(choice)
+			GuideCfg.CapMode = choice
+			Config.Set("Guide_CapMode", choice)
+			if renderGuide then
+				task.spawn(renderGuide, false)
+			end
+		end,
+	})
+
+	GuideTab:AddButton({
+		Title = "Refresh & Sync Game Update",
+		Callback = function()
+			if renderGuide then
+				task.spawn(renderGuide, true, true)
+			end
+		end,
+	})
+
+	GuideTab:AddSection("Gear, Gaps & Farm Locations")
+
+	local guideListFrame = create("ScrollingFrame", {
+		Size = UDim2.new(1, 0, 0, 275),
+		BackgroundColor3 = Theme.Surface,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 2,
+		ScrollBarImageColor3 = Theme.Border,
+		CanvasSize = UDim2.fromOffset(0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		Parent = GuideTab.Page,
+	}, {
+		create("UICorner", { CornerRadius = UDim.new(0, 9) }),
+		create("UIStroke", { Color = Theme.BorderSoft, Thickness = 1 }),
+		create("UIListLayout", {
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Padding = UDim.new(0, 6),
+		}),
+		create("UIPadding", {
+			PaddingLeft = UDim.new(0, 6),
+			PaddingRight = UDim.new(0, 6),
+			PaddingTop = UDim.new(0, 6),
+			PaddingBottom = UDim.new(0, 6),
+		}),
+	})
+
+	local cachedCatalogSig, cachedCatalog = nil, nil
+
+	local function fmtPct(v)
+		return string.format("%g%%", math.floor(v * 1000 + 0.5) / 10)
+	end
+
+	local function getRarityWeight(mods, rarity)
+		if mods and mods.Enums and type(mods.Enums.RarityOrder) == "table" then
+			local idx = table.find(mods.Enums.RarityOrder, rarity)
+			if idx then
+				return idx
+			end
+		end
+		return RARITY_WEIGHT[rarity] or 1
+	end
+
+	local function summarizeItemStats(def, evalItem, mods)
+		local parts = {}
+		local st = type(def.stats) == "table" and def.stats or {}
+		local mul = 1 + ((evalItem and evalItem.tier or 0) * ((mods.Constants and mods.Constants.UPGRADE and mods.Constants.UPGRADE.STAT_BONUS_PER_TIER) or 0.18))
+		local dmgKeys = {
+			AllDamage = "AllDmg", OwnDamage = "OwnDmg",
+			StormDamage = "StormDmg", ShadowDamage = "ShadowDmg", LightDamage = "LightDmg",
+			NatureDamage = "NatureDmg", FlameDamage = "FlameDmg", FrostDamage = "FrostDmg",
+			WindDamage = "WindDmg", SteelDamage = "SteelDmg",
+		}
+		for k, v in pairs(st) do
+			if type(v) == "number" and v ~= 0 then
+				local val = v
+				if def.slot == "Pet" then
+					if mods.Constants and mods.Constants.PET_STAT_BOOST then
+						val = v * (mods.Constants.PET_STAT_BOOST[def.rarity] or 1)
+					end
+				elseif def.slot ~= "Mount" then
+					local rolled = evalItem and type(evalItem.rolledStats) == "table" and tonumber(evalItem.rolledStats[k]) or 0
+					val = (v + rolled) * mul
+				end
+				if dmgKeys[k] then
+					table.insert(parts, "+" .. fmtPct(val) .. " " .. dmgKeys[k])
+				elseif k == "HealingBonus" then
+					table.insert(parts, "+" .. fmtPct(val) .. " Heal")
+				elseif k == "CritChance" then
+					table.insert(parts, "+" .. fmtPct(val) .. " Crit")
+				elseif k == "CritDamage" then
+					table.insert(parts, "+" .. fmtPct(val) .. " CritDmg")
+				elseif k == "PowerPipChance" then
+					table.insert(parts, "+" .. fmtPct(val) .. " Pip")
+				elseif k == "AllResistance" then
+					table.insert(parts, "+" .. fmtPct(val) .. " AllRes")
+				elseif k == "Pierce" or string.find(k, "Pierce$") then
+					table.insert(parts, "+" .. fmtPct(val) .. " " .. k)
+				elseif k == "StatusPower" then
+					table.insert(parts, "+" .. fmtPct(val) .. " DoT")
+				elseif k == "Haste" then
+					table.insert(parts, "+" .. fmtPct(val) .. " Haste")
+				elseif k == "BlockChance" then
+					table.insert(parts, "+" .. fmtPct(val) .. " Block")
+				elseif k == "StatusResistance" then
+					table.insert(parts, "+" .. fmtPct(val) .. " StRes")
+				elseif k == "MaxHealth" then
+					table.insert(parts, "+" .. tostring(math.floor(val + 0.5)) .. " HP")
+				end
+			end
+		end
+		if type(def.grants) == "table" then
+			for gk, gv in pairs(def.grants) do
+				if gv then
+					table.insert(parts, "Passive:" .. tostring(gk))
+				end
+			end
+		end
+		if def.slot == "Mount" and type(def.speedBonus or def.speed) == "number" then
+			table.insert(parts, "+" .. fmtPct(def.speedBonus or def.speed) .. " Speed")
+		end
+		table.sort(parts)
+		if #parts == 0 then
+			return def.rarity or "Base"
+		end
+		return table.concat(parts, " · ")
+	end
+
+	local function getModsSignature(mods)
+		local s = mods and mods.Stats
+		return string.format("%s|%s|%d|%d", tostring(game.PlaceVersion), tostring(mods and mods.VersionId), tonumber(s and s.Items) or 0, tonumber(s and s.Abilities) or 0)
+	end
+
+	local function buildGuideSourceCatalog(mods)
+		local sig = getModsSignature(mods)
+		if cachedCatalog and cachedCatalogSig == sig then
+			return cachedCatalog
+		end
+		local items = mods.Items or {}
+		local areas = mods.Areas or {}
+		local bossChests = mods.BossChests or {}
+		local recipes = mods.Recipes or {}
+		local mountDrops = mods.MountDrops or {}
+		local quests = mods.Quests or {}
+		local const = mods.Constants or {}
+
+		local matAreas = {}
+		local function addMatArea(matId, label)
+			if type(matId) ~= "string" then
+				return
+			end
+			matAreas[matId] = matAreas[matId] or {}
+			if not table.find(matAreas[matId], label) then
+				table.insert(matAreas[matId], label)
+			end
+		end
+
+		local srcByItem = {}
+		local function addSrc(itemId, entry)
+			if type(itemId) ~= "string" or not items[itemId] then
+				return
+			end
+			srcByItem[itemId] = srcByItem[itemId] or { labels = {}, zones = {}, isRareMythic = false }
+			local rec = srcByItem[itemId]
+			if entry.label and not table.find(rec.labels, entry.label) then
+				table.insert(rec.labels, entry.label)
+			end
+			if entry.zone and not table.find(rec.zones, entry.zone) then
+				table.insert(rec.zones, entry.zone)
+			end
+			if entry.isRareMythic then
+				rec.isRareMythic = true
+			end
+		end
+
+		local function areaLabel(areaId)
+			local a = areas[areaId]
+			if type(a) ~= "table" then
+				return tostring(areaId)
+			end
+			local lv = a.minLevel or (type(a.levels) == "table" and a.levels[1])
+			local nm = a.name or tostring(areaId)
+			if lv and lv > 1 then
+				return nm .. " (Lv " .. tostring(lv) .. "+)"
+			end
+			return nm
+		end
+
+		-- Scan ALL chest pools dynamically so future updates adding new chest categories auto-register
+		for areaId, def in pairs(bossChests) do
+			if type(def) == "table" then
+				local zLabel = areaLabel(areaId)
+				for _, m in ipairs(def.materials or {}) do
+					local mid = type(m) == "table" and m.itemId or m
+					addMatArea(mid, (areas[areaId] and areas[areaId].name) or tostring(areaId))
+				end
+				for poolKey, pool in pairs(def) do
+					if poolKey ~= "materials" and poolKey ~= "gold" and type(pool) == "table" then
+						for _, row in ipairs(pool) do
+							local gid = type(row) == "table" and (row.itemId or row.id) or row
+							if type(gid) == "string" and items[gid] and items[gid].slot then
+								local pTag = (poolKey == "gear" or poolKey == "drops") and "Boss Chest" or ("Chest (" .. tostring(poolKey) .. ")")
+								addSrc(gid, { label = pTag .. ": " .. zLabel, zone = zLabel })
+							end
+						end
+					end
+				end
+			end
+		end
+
+		for areaId, a in pairs(areas) do
+			if type(a) == "table" and type(a.scavengePool) == "table" then
+				for _, mid in ipairs(a.scavengePool) do
+					addMatArea(mid, (a.name or tostring(areaId)) .. " (Scavenge)")
+				end
+			end
+		end
+
+		-- MountDrops table across all areas (current + future updates)
+		local mChance = (const.MOUNT_DROP and const.MOUNT_DROP.CHANCE) and string.format("%.1f%%", const.MOUNT_DROP.CHANCE * 100) or "Boss Drop"
+		for areaId, mList in pairs(mountDrops) do
+			if type(mList) == "table" then
+				local zLabel = areaLabel(areaId)
+				for _, mid in ipairs(mList) do
+					local mId = type(mid) == "table" and (mid.itemId or mid.id) or mid
+					addSrc(mId, { label = "Boss Mount Drop (" .. mChance .. "): " .. zLabel, zone = zLabel })
+				end
+			end
+		end
+
+		if const.MYTHIC_FINDS and type(const.MYTHIC_FINDS.ITEMS) == "table" then
+			local mArea = const.MYTHIC_FINDS.AREA or "Myth"
+			local zLabel = areaLabel(mArea)
+			for _, mf in ipairs(const.MYTHIC_FINDS.ITEMS) do
+				if type(mf) == "table" and mf.id then
+					local pct = string.format("%.1f%%–%.1f%%", (mf.chance or 0) * 100, (mf.mythicChance or mf.chance or 0) * 100)
+					addSrc(mf.id, {
+						label = "Mythic Rare Drop: " .. zLabel .. " (" .. pct .. "/chest)",
+						zone = zLabel,
+						isRareMythic = true,
+					})
+				end
+			end
+		end
+
+		for _, rec in pairs(recipes) do
+			if type(rec) == "table" and rec.output and rec.output.itemId then
+				local outId = rec.output.itemId
+				local ingParts = {}
+				local matZones = {}
+				for _, inp in ipairs(rec.inputs or {}) do
+					local mDef = items[inp.itemId]
+					local mName = (mDef and mDef.name) or tostring(inp.itemId)
+					table.insert(ingParts, tostring(inp.count or 1) .. "x " .. mName)
+					for _, mz in ipairs(matAreas[inp.itemId] or {}) do
+						if not table.find(matZones, mz) then
+							table.insert(matZones, mz)
+						end
+					end
+				end
+				local zTxt = (#matZones > 0) and (" [Mats: " .. table.concat(matZones, ", ") .. "]") or ""
+				addSrc(outId, {
+					label = "Craft at Workbench: " .. table.concat(ingParts, " + ") .. zTxt,
+					zone = (#matZones > 0) and ("Craft (" .. matZones[1] .. ")") or "Crafting Bench",
+				})
+			end
+		end
+
+		-- Scan Quest item rewards
+		for qid, q in pairs(type(quests.byId) == "table" and quests.byId or quests) do
+			if type(q) == "table" and type(q.rewards) == "table" then
+				local qTitle = q.title or q.name or tostring(qid)
+				for _, rKey in ipairs({ "items", "gear", "rewards" }) do
+					if type(q.rewards[rKey]) == "table" then
+						for _, row in ipairs(q.rewards[rKey]) do
+							local rid = type(row) == "table" and (row.itemId or row.id) or row
+							addSrc(rid, { label = "Quest Reward: " .. qTitle, zone = "Quests" })
+						end
+					end
+				end
+			end
+		end
+
+		-- Pets, Mounts, Starter evolutions, Rotating Shop & future-update areaId fallbacks
+		local maxItemLv = (const.LEVEL and const.LEVEL.MAX) or 56
+		for id, it in pairs(items) do
+			if type(it) == "table" and it.slot and not (mods.RetiredItems and mods.RetiredItems[id]) then
+				if mods.LevelGate and type(mods.LevelGate.itemLevel) == "function" then
+					local okL, lv = pcall(mods.LevelGate.itemLevel, id)
+					if okL and type(lv) == "number" and lv > maxItemLv then
+						maxItemLv = lv
+					end
+				end
+				if it.slot == "Pet" and not it.exotic and not it.kit then
+					local eggNote
+					if it.rarity == "Legendary" or it.rarity == "Mythic" then
+						eggNote = "Hatch " .. tostring(it.rarity) .. "/High Egg (Boss/Mythic Chests)"
+					elseif it.rarity == "Epic" then
+						eggNote = "Hatch Epic/Legendary Egg (Boss Chests)"
+					else
+						eggNote = "Hatch Egg (Boss Chests)"
+					end
+					if not it.eggOnly and mods.Shop and type(mods.Shop.buyPrice) == "function" then
+						local okP, pr = pcall(mods.Shop.buyPrice, id)
+						if okP and (tonumber(pr) or 0) > 0 then
+							eggNote = eggNote .. " or Pet Shop (" .. tostring(pr) .. " Gems)"
+						end
+					end
+					addSrc(id, { label = eggNote, zone = "Pet Hatching / Pet Shop" })
+				elseif it.slot == "Mount" and not it.exotic and not it.kit and not it.shelf then
+					if mods.Shop and type(mods.Shop.buyPrice) == "function" then
+						local okP, pr = pcall(mods.Shop.buyPrice, id)
+						if okP and (tonumber(pr) or 0) > 0 then
+							addSrc(id, { label = "Pet Shop Mount (" .. tostring(pr) .. " Gems)", zone = "Pet Shop / Boss Mount Drop" })
+						end
+					end
+					local recNow = srcByItem[id]
+					if (not recNow or #recNow.labels == 0) and it.areaId then
+						local zLabel = areaLabel(it.areaId)
+						addSrc(id, { label = "Mount Drop: " .. zLabel, zone = zLabel })
+					end
+				elseif it.starter then
+					addSrc(id, { label = "Blacksmith: Upgrade Starter Weapon", zone = "Blacksmith Forge (Weapon Upgrade)" })
+				elseif not it.exotic and not it.part and mods.Shop and type(mods.Shop.featurable) == "function" then
+					local okF, feat = pcall(mods.Shop.featurable, id)
+					if okF and feat then
+						local rec = srcByItem[id]
+						if not rec or #rec.labels == 0 then
+							addSrc(id, { label = "Lobby Rotating Shop (Gold/Gems)", zone = "Lobby Shop Rotation" })
+						else
+							addSrc(id, { label = "Also rotates in Lobby Shop" })
+						end
+					end
+				end
+				-- Future update safety fallback: if an item has areaId or Rare+ stats without explicit pool entry
+				local recFinal = srcByItem[id]
+				if (not recFinal or #recFinal.labels == 0) and not it.exotic and not it.kit and not it.part and not it.adminOnly and not it.testOnly then
+					if it.areaId then
+						local zLabel = areaLabel(it.areaId)
+						addSrc(id, { label = "Drop / Area: " .. zLabel, zone = zLabel })
+					elseif type(it.stats) == "table" and next(it.stats) ~= nil and getRarityWeight(mods, it.rarity) >= 3 then
+						addSrc(id, { label = "Check New Update Area / Shop / Quests", zone = "New Update Content" })
+					end
+				end
+			end
+		end
+
+		cachedCatalogSig = sig
+		cachedCatalog = { srcByItem = srcByItem, matAreas = matAreas, maxItemLevel = maxItemLv }
+		return cachedCatalog
+	end
+
+	local function isObtainableEndgameDef(mods, id, def, mySchool, catalog, allowedMaxLv)
+		if type(def) ~= "table" or not def.slot or def.category == "Card" then
+			return false
+		end
+		if def.exotic or def.kit or def.part or def.retired or def.adminOnly or def.testOnly or def.shelf then
+			return false
+		end
+		if def.rarity == "Exotic" then
+			return false
+		end
+		if mods.RetiredItems and mods.RetiredItems[id] then
+			return false
+		end
+		if not mods.Inventory.schoolCanWear(mySchool, id) then
+			return false
+		end
+		if allowedMaxLv and mods.LevelGate and type(mods.LevelGate.canWear) == "function" then
+			local okW, wearable = pcall(mods.LevelGate.canWear, allowedMaxLv, id)
+			if okW and not wearable then
+				return false
+			end
+		end
+		local src = catalog.srcByItem[id]
+		if not src or #src.labels == 0 then
+			return false
+		end
+		return true
+	end
+
+	local function computeEndgameGuide(mods, profile)
+		local catalog = buildGuideSourceCatalog(mods)
+		local Inventory = mods.Inventory
+		local mySchool = profile.primarySchool or "Storm"
+		local schoolOverride = (GuideCfg.SchoolOverride ~= "Auto (My School)") and GuideCfg.SchoolOverride or nil
+		local buildSpec = resolveAutoBuildProfile(mods, profile, schoolOverride, GuideCfg.RoleOverride)
+		local targetSchool = buildSpec.school or mySchool
+		local schoolDef = targetSchool and mods.Schools and mods.Schools.defs and mods.Schools.defs[targetSchool]
+		local levelCap = (mods.Constants and mods.Constants.LEVEL and tonumber(mods.Constants.LEVEL.MAX)) or 56
+		local playerLevel = tonumber(profile.level) or 1
+		local allowedMaxLv = nil
+		if GuideCfg.CapMode == "Current Cap" then
+			allowedMaxLv = math.max(levelCap, playerLevel)
+		elseif GuideCfg.CapMode == "My Level" then
+			allowedMaxLv = playerLevel
+		end
+		local evalLevel = allowedMaxLv or math.max(levelCap, catalog.maxItemLevel or 70, playerLevel)
+		local useMaxBs = (GuideCfg.CompareTier ~= "Base Drops")
+
+		local slotsOrder = { "Weapon", "Offhand", "Helmet", "Outfit", "Backpack", "Charm1", "Charm2", "Charm3", "Pet", "Mount" }
+
+		-- Index player's currently equipped & owned items by defId (keep highest tier/rolled copy per defId)
+		local invList = type(profile.inventory) == "table" and profile.inventory or {}
+		local equipped = type(profile.equipped) == "table" and profile.equipped or {}
+		local curBySlot = {}
+		local ownedByDef = {}
+		for _, item in ipairs(invList) do
+			if type(item) == "table" and type(item.defId) == "string" and not Inventory.expired(item) then
+				local def = mods.Items[item.defId]
+				if def then
+					local prev = ownedByDef[item.defId]
+					local curT = tonumber(item.tier) or 0
+					local prevT = prev and (tonumber(prev.tier) or 0) or -1
+					if not prev or curT > prevT then
+						ownedByDef[item.defId] = item
+					end
+					for _, slot in ipairs(slotsOrder) do
+						if equipped[slot] == item.uid then
+							curBySlot[slot] = { item = item, def = def }
+						end
+					end
+				end
+			end
+		end
+
+		-- Synthesize candidates for EVERY obtainable item in mods.Items for targetSchool
+		local guideProfile = {
+			level = evalLevel,
+			primarySchool = targetSchool,
+			talents = (not schoolOverride or schoolOverride == mySchool) and profile.talents or {},
+			deck = (not schoolOverride or schoolOverride == mySchool) and profile.deck or {},
+		}
+		local slotCandidates = {}
+		for _, slot in ipairs(slotsOrder) do
+			local cands = {}
+			local seenDef = {}
+			for id, def in pairs(mods.Items or {}) do
+				if isObtainableEndgameDef(mods, id, def, targetSchool, catalog, allowedMaxLv) and Inventory.fits(def, slot) and not seenDef[id] then
+					seenDef[id] = true
+					local baseItem = {
+						uid = "GUIDE_" .. id,
+						defId = id,
+						tier = 0,
+						count = 1,
+					}
+					local evalItem = (useMaxBs and slot ~= "Pet" and slot ~= "Mount") and makeBlacksmithMaxCopy(mods, baseItem, def, true) or baseItem
+					local singleSt, singleHp, singleIncHp = deriveBuildTotals(mods, guideProfile, { evalItem }, { [slot] = evalItem.uid }, targetSchool, false)
+					local okRaw, rawSt = pcall(Inventory.equippedStats, { inventory = { evalItem }, equipped = { [slot] = evalItem.uid }, level = guideProfile.level, primarySchool = targetSchool })
+					local rawCheck = (okRaw and type(rawSt) == "table") and rawSt or singleSt
+					local isSame = getItemElementMatch(mods, id, rawCheck, targetSchool, schoolDef)
+					local rarityVal = getRarityWeight(mods, def.rarity)
+					local quality = (rarityVal * 0.4) + ((evalItem.tier or 0) * 1.2)
+					local sc = scoreBuildStats(mods, singleSt, singleHp, targetSchool, schoolDef, buildSpec, isSame and 1 or 0, quality, singleIncHp)
+					table.insert(cands, {
+						item = evalItem,
+						def = def,
+						sameElement = isSame,
+						quality = quality,
+						score = sc,
+						dmgVal = ((schoolDef and (tonumber(rawCheck[schoolDef.damageBonus]) or 0) or 0) + (tonumber(rawCheck.AllDamage) or 0)),
+						critVal = (tonumber(rawCheck.CritChance) or 0) * 2 + (tonumber(rawCheck.CritDamage) or 0),
+						healVal = (tonumber(rawCheck.HealingBonus) or 0) * 2 + (tonumber(rawCheck.PowerPipChance) or 0),
+					})
+				end
+			end
+			table.sort(cands, function(a, b)
+				return a.score > b.score
+			end)
+			local trimmed = {}
+			for i = 1, math.min(14, #cands) do
+				table.insert(trimmed, cands[i])
+			end
+			slotCandidates[slot] = trimmed
+		end
+
+		local seeds = { nil }
+		if buildSpec.mode == "Support" then
+			table.insert(seeds, "healVal")
+			table.insert(seeds, "dmgVal")
+		else
+			table.insert(seeds, "critVal")
+			table.insert(seeds, "dmgVal")
+		end
+		local bestPlan, bestPlanScore, bestStats, bestHp, bestIncHp = nil, -math.huge, {}, 0, false
+		for _, seedField in ipairs(seeds) do
+			local pSeed, scSeed, stSeed, hpSeed, incSeed = optimizeSlotPlanSeed(mods, guideProfile, slotCandidates, slotsOrder, targetSchool, schoolDef, buildSpec, seedField)
+			if not bestPlan or scSeed > bestPlanScore then
+				bestPlan, bestPlanScore, bestStats, bestHp, bestIncHp = pSeed, scSeed, stSeed, hpSeed, incSeed
+			end
+		end
+
+		-- Compute current actual stats for Now -> BiS comparison
+		local curStats, curHp, curIncHp = deriveBuildTotals(mods, profile, invList, equipped, targetSchool, false)
+
+		local rows = {}
+		local maxedCount = 0
+		local playerLevel = tonumber(profile.level) or 1
+		local usedAltDefs = {}
+		for _, slot in ipairs(slotsOrder) do
+			local rec = bestPlan and bestPlan[slot]
+			if rec then
+				usedAltDefs[rec.def.id] = true
+			end
+		end
+
+		for _, slot in ipairs(slotsOrder) do
+			local bisRec = bestPlan and bestPlan[slot]
+			local bisDef = bisRec and bisRec.def
+			local curRec = curBySlot[slot]
+			if bisDef then
+				local srcInfo = catalog.srcByItem[bisDef.id] or { labels = { "Boss Chest / Shop" }, zones = {} }
+				local altDef = nil
+				if srcInfo.isRareMythic then
+					for _, cand in ipairs(slotCandidates[slot] or {}) do
+						local cSrc = catalog.srcByItem[cand.def.id]
+						if cand.def.id ~= bisDef.id and not usedAltDefs[cand.def.id] and (not cSrc or not cSrc.isRareMythic) then
+							altDef = cand.def
+							usedAltDefs[cand.def.id] = true
+							break
+						end
+					end
+				end
+
+				local isSameEquipped = curRec and curRec.item.defId == bisDef.id
+				local ownedBest = isSameEquipped and curRec.item or ownedByDef[bisDef.id]
+				local maxTier = getBlacksmithMaxTier(mods, bisDef)
+				local curTier = ownedBest and (tonumber(ownedBest.tier) or 0) or 0
+				local needsUpg = ownedBest and maxTier and curTier < maxTier
+				local needLv = (mods.LevelGate and type(mods.LevelGate.itemLevel) == "function" and select(2, pcall(mods.LevelGate.itemLevel, bisDef.id))) or bisDef.minLevel or 1
+				needLv = tonumber(needLv) or 1
+
+				local status, statusColor
+				if isSameEquipped and not needsUpg then
+					status = "MAXED"
+					statusColor = C_OK
+					maxedCount += 1
+				elseif isSameEquipped and needsUpg then
+					status = string.format("UPGRADE T%d/%d", curTier, maxTier)
+					statusColor = C_WARN
+				elseif ownedBest then
+					status = (playerLevel < needLv) and ("IN BAG (LV " .. tostring(needLv) .. ")") or "IN BAG · EQUIP IT"
+					statusColor = C_BAG
+				elseif playerLevel < needLv then
+					status = "MISSING · LV " .. tostring(needLv)
+					statusColor = srcInfo.isRareMythic and C_MYTH or C_MISS
+				else
+					status = srcInfo.isRareMythic and "MYTHIC CHASE" or "MISSING"
+					statusColor = srcInfo.isRareMythic and C_MYTH or C_MISS
+				end
+
+				table.insert(rows, {
+					slot = slot,
+					bisDef = bisDef,
+					bisItem = bisRec.item,
+					bisStatsText = summarizeItemStats(bisDef, bisRec.item, mods),
+					curRec = curRec,
+					ownedBest = ownedBest,
+					altDef = altDef,
+					altSrc = altDef and (catalog.srcByItem[altDef.id] and catalog.srcByItem[altDef.id].labels[1]),
+					sources = srcInfo.labels,
+					zones = srcInfo.zones,
+					status = status,
+					statusColor = statusColor,
+					isMaxed = (status == "MAXED"),
+					isMythicRare = srcInfo.isRareMythic,
+					needLv = needLv,
+					maxTier = maxTier,
+					curTier = curTier,
+				})
+			end
+		end
+
+		-- Missing Endgame Spells & Deck Card Tiers checklist
+		local learnedSet = {}
+		for _, aid in ipairs(profile.learnedAbilities or profile.knownAbilities or {}) do
+			learnedSet[aid] = true
+		end
+		if type(profile.learned) == "table" then
+			for _, aid in ipairs(profile.learned) do
+				learnedSet[aid] = true
+			end
+		end
+		if type(profile.decks) == "table" then
+			local aIdx = tonumber(profile.activeDeck) or 1
+			local rawD = (profile.decks[aIdx] and profile.decks[aIdx].cards) or profile.deck or {}
+			for cid, cnt in pairs(rawD) do
+				if (tonumber(cnt) or 0) > 0 then
+					learnedSet[cid] = true
+				end
+			end
+		end
+
+		local cardFindings = {}
+		local seraph = mods.Seraph or {}
+		local seraphSet = {}
+		for _, sid in ipairs(seraph.CARDS or {}) do
+			seraphSet[sid] = true
+			if not learnedSet[sid] then
+				local ab = mods.Abilities and mods.Abilities[sid]
+				local cost = (seraph.LEARN and seraph.LEARN[sid]) or 2
+				table.insert(cardFindings, {
+					tag = "MISSING SERAPH SPELL",
+					color = C_MYTH,
+					title = (ab and ab.name) or sid,
+					detail = string.format("%s · Cost: %d Mythic Essence (Talk to Sariel after The Abyss)", tostring(ab and ab.school or "Abyss"), cost),
+				})
+			end
+		end
+		local trainer = mods.Trainers and mods.Trainers[targetSchool]
+		if type(trainer) == "table" and type(trainer.teaches) == "table" then
+			for _, row in ipairs(trainer.teaches) do
+				local aid = row.abilityId
+				if aid and not learnedSet[aid] and not seraphSet[aid] then
+					local ab = mods.Abilities and mods.Abilities[aid]
+					if ab and not ab.hidden then
+						table.insert(cardFindings, {
+							tag = "TRAINER SPELL (LV " .. tostring(row.level or 1) .. "+)",
+							color = C_WARN,
+							title = ab.name or aid,
+							detail = string.format("%s Trainer in Lobby · Rank %d · %dg", targetSchool, tonumber(row.rank) or 0, tonumber(row.price) or 0),
+						})
+					end
+				end
+			end
+		end
+		-- Check equipped/active deck cards below Tier 5
+		local maxCardTier = (mods.CardTiers and (mods.CardTiers.MAX or mods.CardTiers.MAX_TIER)) or 5
+		local cTiers = type(profile.cardTiers) == "table" and profile.cardTiers or {}
+		local activeCards = {}
+		if type(profile.decks) == "table" then
+			local aIdx = tonumber(profile.activeDeck) or 1
+			activeCards = (profile.decks[aIdx] and profile.decks[aIdx].cards) or profile.deck or {}
+		elseif type(profile.deck) == "table" then
+			activeCards = profile.deck
+		end
+		for cid, cnt in pairs(activeCards) do
+			if (tonumber(cnt) or 0) > 0 then
+				local tNow = tonumber(cTiers[cid]) or 0
+				if tNow < maxCardTier then
+					local ab = mods.Abilities and mods.Abilities[cid]
+					if ab and not ab.hidden then
+						table.insert(cardFindings, {
+							tag = string.format("CARD TIER %d/%d", tNow, maxCardTier),
+							color = C_BAG,
+							title = ab.name or cid,
+							detail = "Upgrade Card Tier at Card Forge (Copies + Gold/Gems)",
+						})
+					end
+				end
+			end
+		end
+		if (tonumber(profile.unspentTalentPoints) or 0) > 0 then
+			table.insert(cardFindings, 1, {
+				tag = "UNSPENT TALENTS",
+				color = C_MISS,
+				title = tostring(profile.unspentTalentPoints) .. " Unspent Talent Point(s)",
+				detail = "Open Talents UI and invest into your " .. tostring(buildSpec.label or "build") .. " path!",
+			})
+		end
+
+		return {
+			buildSpec = buildSpec,
+			targetSchool = targetSchool,
+			playerLevel = playerLevel,
+			levelCap = levelCap,
+			evalLevel = evalLevel,
+			maxedCount = maxedCount,
+			totalSlots = #rows,
+			rows = rows,
+			cardFindings = cardFindings,
+			curStats = curStats,
+			curHp = curIncHp and math.max(curHp, tonumber(curStats.MaxHealth) or 0) or ((tonumber(curStats.MaxHealth) or 0) + curHp),
+			bisStats = bestStats,
+			bisHp = bestIncHp and math.max(bestHp, tonumber(bestStats.MaxHealth) or 0) or ((tonumber(bestStats.MaxHealth) or 0) + bestHp),
+			schoolDef = schoolDef,
+		}
+	end
+
+	local function addGuideCard(badgeText, badgeColor, headline, subline1, subline2)
+		local card = create("Frame", {
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundColor3 = Theme.Elevated,
+			BorderSizePixel = 0,
+			Parent = guideListFrame,
+		}, {
+			create("UICorner", { CornerRadius = UDim.new(0, 7) }),
+			create("UIStroke", { Color = Theme.BorderSoft, Thickness = 1 }),
+			create("UIListLayout", {
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Padding = UDim.new(0, 2),
+			}),
+			create("UIPadding", {
+				PaddingLeft = UDim.new(0, 8),
+				PaddingRight = UDim.new(0, 8),
+				PaddingTop = UDim.new(0, 6),
+				PaddingBottom = UDim.new(0, 6),
+			}),
+		})
+
+		create("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 14),
+			BackgroundTransparency = 1,
+			Text = badgeText,
+			Font = Enum.Font.RobotoMono,
+			TextSize = 10,
+			TextColor3 = badgeColor or Theme.Accent,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextWrapped = true,
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Parent = card,
+		})
+
+		create("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 15),
+			BackgroundTransparency = 1,
+			Text = headline,
+			Font = Enum.Font.GothamBold,
+			TextSize = 11,
+			TextColor3 = Theme.TextPrimary,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextWrapped = true,
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Parent = card,
+		})
+
+		if subline1 and subline1 ~= "" then
+			create("TextLabel", {
+				Size = UDim2.new(1, 0, 0, 13),
+				BackgroundTransparency = 1,
+				Text = subline1,
+				Font = Enum.Font.Gotham,
+				TextSize = 10,
+				TextColor3 = C_SUB,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextWrapped = true,
+				AutomaticSize = Enum.AutomaticSize.Y,
+				Parent = card,
+			})
+		end
+
+		if subline2 and subline2 ~= "" then
+			create("TextLabel", {
+				Size = UDim2.new(1, 0, 0, 13),
+				BackgroundTransparency = 1,
+				Text = subline2,
+				Font = Enum.Font.RobotoMono,
+				TextSize = 10,
+				TextColor3 = Theme.TextSecondary,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextWrapped = true,
+				AutomaticSize = Enum.AutomaticSize.Y,
+				Parent = card,
+			})
+		end
+	end
+
+	local lastPlaceVer = game.PlaceVersion
+	local lastAutoProfileAt = 0
+
+	renderGuide = function(forceFetch, forceModsReload)
+		if not State.Alive or not guideListFrame or not guideListFrame.Parent then
+			return
+		end
+		local verChanged = (game.PlaceVersion ~= lastPlaceVer)
+		if verChanged then
+			lastPlaceVer = game.PlaceVersion
+		end
+		if forceModsReload or verChanged then
+			cachedCatalogSig = nil
+			cachedCatalog = nil
+		end
+		local mods = getGameMods(forceModsReload or verChanged)
+		if not mods or not mods.Items or not mods.Inventory then
+			guideBuildCard:Set("WAITING GAME DATA")
+			guideGapCard:Set("—")
+			return
+		end
+		local profile = (not forceFetch and mods.Net.peekProfile and mods.Net.peekProfile()) or nil
+		if forceFetch or type(profile) ~= "table" then
+			local okP, p = pcall(mods.Net.getProfile)
+			if okP and type(p) == "table" then
+				profile = p
+			end
+		end
+		if type(profile) ~= "table" then
+			guideBuildCard:Set("OPEN IN LOBBY / WAIT")
+			guideGapCard:Set("—")
+			return
+		end
+
+		for _, child in ipairs(guideListFrame:GetChildren()) do
+			if child:IsA("GuiObject") then
+				child:Destroy()
+			end
+		end
+
+		local okRes, data = pcall(computeEndgameGuide, mods, profile)
+		if not okRes or type(data) ~= "table" then
+			guideBuildCard:Set("ERR")
+			addGuideCard("ERROR", C_MISS, "Guide evaluation failed", tostring(data), nil)
+			return
+		end
+
+		local sch = string.upper(tostring(data.targetSchool or "?"))
+		local lbl = tostring(data.buildSpec.label or data.buildSpec.mode or "Build")
+		local scopeTag = (GuideCfg.CapMode == "Uncapped (All)") and "ALL" or ("LV" .. tostring(data.evalLevel or data.levelCap or 56))
+		guideBuildCard:Set(string.format("%s · %s · %s · %d/%d BiS", scopeTag, sch, lbl, data.maxedCount, data.totalSlots))
+
+		local sd = data.schoolDef
+		local curD = ((sd and data.curStats[sd.damageBonus] or 0) + (data.curStats.AllDamage or 0) + (data.curStats.OwnDamage or 0)) * 100
+		local bisD = ((sd and data.bisStats[sd.damageBonus] or 0) + (data.bisStats.AllDamage or 0) + (data.bisStats.OwnDamage or 0)) * 100
+		local curC = math.min(60, math.max(0, (data.curStats.CritChance or 0) * 100))
+		local bisC = math.min(60, math.max(0, (data.bisStats.CritChance or 0) * 100))
+		local curP = math.min(100, (data.curStats.PowerPipChance or 0) * 100)
+		local bisP = math.min(100, (data.bisStats.PowerPipChance or 0) * 100)
+		local curH = math.min(100, (data.curStats.HealingBonus or 0) * 100)
+		local bisH = math.min(100, (data.bisStats.HealingBonus or 0) * 100)
+
+		if data.buildSpec.mode == "Support" then
+			guideGapCard:Set(string.format("Heal %d%%->%d%% · Pip %d%%->%d%% · HP %d->%d",
+				math.floor(curH + 0.5), math.floor(bisH + 0.5),
+				math.floor(curP + 0.5), math.floor(bisP + 0.5),
+				math.floor(data.curHp + 0.5), math.floor(data.bisHp + 0.5)))
+		else
+			guideGapCard:Set(string.format("Dmg %d%%->%d%% · Crit %d%%->%d%% · Pip %d%%->%d%%",
+				math.floor(curD + 0.5), math.floor(bisD + 0.5),
+				math.floor(curC + 0.5), math.floor(bisC + 0.5),
+				math.floor(curP + 0.5), math.floor(bisP + 0.5)))
+		end
+
+		local mode = GuideCfg.ViewMode
+		if mode == "Endgame Cards & Tiers" then
+			if #data.cardFindings == 0 then
+				addGuideCard("COMPLETE", C_OK, "All Trainer / Seraph spells & active card tiers maxed!", "Check your Smart Deck in Combat Tab anytime.", nil)
+			else
+				for _, cf in ipairs(data.cardFindings) do
+					addGuideCard(cf.tag, cf.color, cf.title, cf.detail, nil)
+				end
+			end
+			return
+		end
+
+		if mode == "Farm Routes (Where to Get)" then
+			local byZone = {}
+			local zoneOrder = {}
+			local function addTask(zoneName, color, textLine)
+				if not byZone[zoneName] then
+					byZone[zoneName] = { color = color, items = {} }
+					table.insert(zoneOrder, zoneName)
+				end
+				table.insert(byZone[zoneName].items, textLine)
+			end
+			for _, r in ipairs(data.rows) do
+				if not r.isMaxed then
+					if r.status == "IN BAG · EQUIP IT" or string.find(r.status, "^IN BAG") then
+						addTask("1. Bag (Ready to Equip)", C_BAG, string.format("[%s] %s (%s)", r.slot, r.bisDef.name, r.status))
+					elseif string.find(r.status, "^UPGRADE") then
+						addTask("2. Blacksmith Forge (Upgrade & Reforge)", C_WARN, string.format("[%s] %s · %s", r.slot, r.bisDef.name, r.status))
+					else
+						local z = (r.zones and r.zones[1]) or "Boss Chests / Shop"
+						local altNote = r.altDef and (" (Alt: " .. r.altDef.name .. ")") or ""
+						addTask(z, r.isMythicRare and C_MYTH or C_MISS, string.format("[%s] %s — %s%s", r.slot, r.bisDef.name, r.sources[1] or z, altNote))
+					end
+				end
+			end
+			if #data.cardFindings > 0 then
+				for _, cf in ipairs(data.cardFindings) do
+					if string.find(cf.tag, "SERAPH") then
+						addTask("Sariel (The Abyss Mythic Essence)", C_MYTH, cf.title .. " · " .. cf.detail)
+					elseif string.find(cf.tag, "TRAINER") then
+						addTask("Lobby School Trainer", C_WARN, cf.title .. " · " .. cf.detail)
+					elseif string.find(cf.tag, "TALENTS") then
+						addTask("0. Immediate Action", C_MISS, cf.title)
+					end
+				end
+			end
+			if #zoneOrder == 0 then
+				addGuideCard("ENDGAME COMPLETE", C_OK, "Nothing missing! All BiS gear & key spells unlocked.", nil, nil)
+			else
+				table.sort(zoneOrder)
+				for _, zName in ipairs(zoneOrder) do
+					local g = byZone[zName]
+					addGuideCard(string.upper(zName), g.color, tostring(#g.items) .. " Upgrade(s) Here:", table.concat(g.items, "\n"), nil)
+				end
+			end
+			return
+		end
+
+		-- "All Slots (Full BiS)" or "Missing Only"
+		local shown = 0
+		for _, r in ipairs(data.rows) do
+			if mode ~= "Missing Only" or not r.isMaxed then
+				shown += 1
+				local curName = r.curRec and ((mods.Items[r.curRec.item.defId] and mods.Items[r.curRec.item.defId].name or r.curRec.item.defId) .. " [T" .. tostring(r.curRec.item.tier or 0) .. "]") or "Empty"
+				local header = string.format("[%s] %s", string.upper(r.slot), r.status)
+				local bisTitle = string.format("BiS: %s (%s)", r.bisDef.name or r.bisDef.id, r.bisDef.rarity or "?")
+				local line1 = string.format("Now: %s\nStats: %s", curName, r.bisStatsText)
+				local srcText = r.isMaxed and "Equipped & Maxed!" or ("Get: " .. table.concat(r.sources, " | "))
+				if not r.isMaxed and r.altDef then
+					srcText = srcText .. string.format("\nAlt (Easier): %s — %s", r.altDef.name or r.altDef.id, tostring(r.altSrc or "Boss Chest"))
+				end
+				addGuideCard(header, r.statusColor, bisTitle, line1, srcText)
+			end
+		end
+		if mode == "Missing Only" and shown == 0 then
+			addGuideCard("ALL GEAR MAXED", C_OK, "Every BiS endgame slot is equipped and Tier-maxed!", "Switch View Mode to 'Endgame Cards & Tiers' to check spell tiers.", nil)
+		end
+	end
+
+	State.RefreshGuide = renderGuide
+
+	trackConnection(GuideTab.Page:GetPropertyChangedSignal("Visible"):Connect(function()
+		if GuideTab.Page.Visible and State.Alive then
+			task.spawn(renderGuide, false, false)
+		end
+	end))
+
+	task.spawn(function()
+		task.wait(1.0)
+		if not State.Alive then
+			return
+		end
+		renderGuide(false, false)
+		local mods = getGameMods(false)
+		if mods and mods.Net and type(mods.Net.onClientEvent) == "function" then
+			trackConnection(mods.Net.onClientEvent("ProfileChanged", function()
+				if State.Alive and GuideTab.Page.Visible and (os.clock() - lastAutoProfileAt) >= 1.5 then
+					lastAutoProfileAt = os.clock()
+					task.delay(0.25, function()
+						if State.Alive and GuideTab.Page.Visible then
+							renderGuide(false, false)
+						end
+					end)
+				end
+			end))
+		end
+	end)
+end
+
+--// =========================================================================
+--// TAB 9: SETTINGS
 --// =========================================================================
 local SettingsTab = Window:AddTab("Settings")
 SettingsTab:AddSection("Auto-Update Sync")
@@ -11081,6 +12539,9 @@ local function refreshAllGameData(force)
 	versionCard:Set("v" .. tostring(game.PlaceVersion) .. " · " .. tostring(mods.VersionId))
 	local s = mods.Stats
 	syncedDataCard:Set(string.format("%d cards · %d bosses · %d trivia", tonumber(s and s.Abilities) or 0, tonumber(s and s.Bosses) or 0, tonumber(s and s.Trivia) or 0))
+	if type(State.RefreshGuide) == "function" then
+		task.spawn(State.RefreshGuide, force == true, force == true)
+	end
 end
 
 task.spawn(function()
