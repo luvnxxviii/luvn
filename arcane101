@@ -6,6 +6,9 @@ local env = (typeof(getgenv) == "function" and getgenv()) or _G
 if type(env.__MonochromeCleanup) == "function" then
 	pcall(env.__MonochromeCleanup)
 end
+if env ~= _G and type(_G.__MonochromeCleanup) == "function" then
+	pcall(_G.__MonochromeCleanup)
+end
 
 --// Services
 local function getService(name)
@@ -60,38 +63,94 @@ local function trackRestore(fn)
 	table.insert(State.RestoreHooks, fn)
 end
 
+function State.DestroyGuis()
+	if State.Gui then
+		pcall(function()
+			State.Gui:Destroy()
+		end)
+		State.Gui = nil
+	end
+	local containers = {}
+	if typeof(gethui) == "function" then
+		local ok, hui = pcall(gethui)
+		if ok and typeof(hui) == "Instance" then
+			table.insert(containers, hui)
+		end
+	end
+	pcall(function()
+		if CoreGui and CoreGui.Name then
+			table.insert(containers, CoreGui)
+		end
+	end)
+	local pg = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if pg then
+		table.insert(containers, pg)
+	end
+	for _, root in ipairs(containers) do
+		pcall(function()
+			for _, child in ipairs(root:GetChildren()) do
+				if child:IsA("ScreenGui") and child.Name == "MonochromeHub" then
+					child:Destroy()
+				end
+			end
+		end)
+	end
+end
+
 local function cleanup()
 	if not State.Alive then
+		State.DestroyGuis()
 		return
 	end
 	State.Alive = false
+
+	-- Clear global re-execution guards immediately so a fresh execute works right away
+	if env.__MonochromeCleanup == cleanup then
+		env.__MonochromeCleanup = nil
+	end
+	env.__MonochromeBooted = nil
+	if _G.__MonochromeCleanup == cleanup then
+		_G.__MonochromeCleanup = nil
+	end
+	_G.__MonochromeBooted = nil
+
+	-- Destroy hub UI immediately before tearing down hooks & threads
+	State.DestroyGuis()
+
+	for _, conn in ipairs(State.Connections) do
+		pcall(function()
+			if conn and conn.Disconnect then
+				conn:Disconnect()
+			end
+		end)
+	end
+	table.clear(State.Connections)
+
+	local currentThread = pcall(coroutine.running) and coroutine.running() or nil
+	for _, thread in ipairs(State.Threads) do
+		if typeof(thread) == "thread" and thread ~= currentThread then
+			local okSt, st = pcall(coroutine.status, thread)
+			if okSt and st ~= "dead" then
+				pcall(task.cancel, thread)
+			end
+		end
+	end
+	table.clear(State.Threads)
 
 	for _, restoreFn in ipairs(State.RestoreHooks) do
 		pcall(restoreFn)
 	end
 	table.clear(State.RestoreHooks)
 
-	for _, conn in ipairs(State.Connections) do
-		pcall(function()
-			conn:Disconnect()
-		end)
+	if type(State.StatusFlushers) == "table" then
+		table.clear(State.StatusFlushers)
 	end
-	table.clear(State.Connections)
-
-	for _, thread in ipairs(State.Threads) do
-		pcall(task.cancel, thread)
-	end
-	table.clear(State.Threads)
-
-	if State.Gui and State.Gui.Parent then
-		pcall(function()
-			State.Gui:Destroy()
-		end)
-	end
-	State.Gui = nil
 end
 
 env.__MonochromeCleanup = cleanup
+if env ~= _G then
+	_G.__MonochromeCleanup = cleanup
+end
 
 --// Persistent Config & Auto-Execute on Server Join (Per-Account Isolated)
 local CONFIG_DIR = "MonochromeHub"
@@ -298,6 +357,8 @@ function UI.CreateWindow(opts)
 	local width = opts.Width or 432
 	local height = opts.Height or 384
 	local toggleKey = opts.ToggleKey or Enum.KeyCode.RightShift
+
+	State.DestroyGuis()
 
 	local screenGui = create("ScreenGui", {
 		Name = "MonochromeHub",
@@ -1532,6 +1593,10 @@ local function getGameMods(forceReload)
 			Deck = safeRequire(Campaign.Systems:FindFirstChild("Deck")),
 			Loadout = safeRequire(Campaign.Systems:FindFirstChild("Loadout")),
 			Inventory = safeRequire(Campaign.Systems:FindFirstChild("Inventory")),
+			Upgrade = safeRequire(Campaign.Systems:FindFirstChild("Upgrade")),
+			WeaponUpgrade = safeRequire(Campaign.Systems:FindFirstChild("WeaponUpgrade")),
+			Hatch = safeRequire(Campaign.Systems:FindFirstChild("Hatch")),
+			PetLevels = safeRequire(Campaign.Systems:FindFirstChild("PetLevels")),
 			Shop = safeRequire(Campaign.Systems:FindFirstChild("Shop")),
 			Schools = safeRequire(Campaign.Shared:FindFirstChild("Schools")),
 			Stats = safeRequire(Campaign.Shared:FindFirstChild("Stats")),
@@ -4762,6 +4827,7 @@ local DungeonAuto = {
 	LastRequeueAt = 0,
 	LastQuickSellAt = 0,
 	BootedAt = os.clock(),
+	QuickSellToggles = {},
 }
 
 local dungeonStatusCard
@@ -4870,7 +4936,7 @@ local function runQuickSellTrash(silent, statusFn)
 	end
 	quickSellBusy = true
 	local sold = 0
-	local okRun, errMsg = pcall(function()
+	local okRun = pcall(function()
 		-- Lock matching high-rarity drops before sweeping unequipped gear
 		if AutoLock.Enabled then
 			pcall(AutoLock.Run, true, nil)
@@ -4890,33 +4956,109 @@ local function runQuickSellTrash(silent, statusFn)
 		end
 
 		local maxRank = QUICKSELL_TIER_MAX_RANK[sellRarityMode] or 1
+		local targets = {}
+		local targetUids = {}
 		for _, item in ipairs(profile.inventory or {}) do
 			if not State.Alive or LocalPlayer:GetAttribute("InCombat") == true then
 				break
 			end
-			local def = mods.Items[item.defId]
-			local rank = def and AutoLock.GetRarityRank(mods, def) or 99
-			if def
-				and not equippedUids[item.uid]
-				and item.locked ~= true
-				and not AutoLock.LockedCache[item.uid]
-				and (item.tier or 0) == 0
-				and def.slot
-				and def.slot ~= "Pet"
-				and def.slot ~= "Mount"
-				and rank <= maxRank
-			then
-				local okSell, res = pcall(function()
-					return mods.Net.func("QuickSell"):InvokeServer({ defId = item.defId, uid = item.uid })
-				end)
-				if okSell and (res == true or (type(res) == "table" and res.ok ~= false)) then
-					sold += 1
+			if type(item) == "table" and item.defId and item.uid then
+				local def = mods.Items[item.defId]
+				local rank = def and AutoLock.GetRarityRank(mods, def) or 99
+				local sellUnit = (mods.Shop and mods.Shop.sellPrice) and mods.Shop.sellPrice(item.defId) or 1
+				local inVanity = mods.Inventory and mods.Inventory.vanitySlotOf and mods.Inventory.vanitySlotOf(profile, item.uid) ~= nil
+				local isLocked = (mods.Inventory and mods.Inventory.isLocked and mods.Inventory.isLocked(item)) or item.locked == true or AutoLock.LockedCache[item.uid] == true
+				if def
+					and sellUnit > 0
+					and not equippedUids[item.uid]
+					and not inVanity
+					and not isLocked
+					and not item.expiresAt
+					and (item.tier or 0) == 0
+					and def.slot
+					and def.slot ~= "Pet"
+					and def.slot ~= "Mount"
+					and rank <= maxRank
+				then
+					table.insert(targets, item)
+					targetUids[item.uid] = true
 				end
-				task.wait(0.06)
 			end
 		end
+
+		if #targets == 0 then
+			if not silent and statusFn then
+				statusFn("SELL · NONE MATCHING")
+			end
+			return
+		end
+
+		local lastErr = nil
+		-- In Lobby/Town, ShopController uses SellMany in batches; fall back to QuickSell if needed or during a run
+		if LocalPlayer:GetAttribute("InRun") ~= true then
+			for i = 1, #targets, 25 do
+				if not State.Alive or LocalPlayer:GetAttribute("InCombat") == true then
+					break
+				end
+				local batch = {}
+				for j = i, math.min(#targets, i + 24) do
+					local it = targets[j]
+					table.insert(batch, { defId = it.defId, count = it.count or 1, uid = it.uid })
+				end
+				pcall(function()
+					mods.Net.fireServer("SellMany", { items = batch })
+				end)
+				task.wait(0.14)
+			end
+
+			task.wait(0.25)
+			local okAfter, profAfter = pcall(mods.Net.func("GetProfile").InvokeServer, mods.Net.func("GetProfile"))
+			if okAfter and type(profAfter) == "table" and type(profAfter.inventory) == "table" then
+				local stillThere = {}
+				for _, it in ipairs(profAfter.inventory) do
+					if it.uid and targetUids[it.uid] then
+						stillThere[it.uid] = it
+					end
+				end
+				for uid in pairs(targetUids) do
+					if not stillThere[uid] then
+						sold += 1
+					end
+				end
+				-- Rebuild targets list from any remaining items in case SellMany didn't process all
+				local rem = {}
+				for _, it in ipairs(targets) do
+					if stillThere[it.uid] then
+						table.insert(rem, it)
+					end
+				end
+				targets = rem
+			end
+		end
+
+		for _, item in ipairs(targets) do
+			if not State.Alive or LocalPlayer:GetAttribute("InCombat") == true then
+				break
+			end
+			local okSell, res, errMsg = pcall(function()
+				return mods.Net.func("QuickSell"):InvokeServer({ defId = item.defId, uid = item.uid })
+			end)
+			if okSell and (res == true or (type(res) == "table" and res.ok == true)) then
+				sold += 1
+			else
+				lastErr = (type(errMsg) == "string" and errMsg) or (type(res) == "table" and res.reason) or lastErr
+			end
+			task.wait(0.06)
+		end
+
 		if statusFn and (sold > 0 or not silent) then
-			statusFn("SOLD · " .. tostring(sold) .. " items")
+			if sold > 0 then
+				statusFn("SOLD · " .. tostring(sold) .. " items")
+			elseif lastErr then
+				statusFn("SELL · " .. tostring(lastErr))
+			else
+				statusFn("SOLD · 0 items")
+			end
 		end
 	end)
 	DungeonAuto.LastQuickSellAt = os.clock()
@@ -4925,6 +5067,19 @@ local function runQuickSellTrash(silent, statusFn)
 		statusFn("QUICK-SELL ERR")
 	end
 	return sold
+end
+
+function DungeonAuto.SetAutoQuickSell(enabled, statusFn)
+	DungeonAuto.AutoQuickSell = enabled == true
+	Config.Set("Dungeon_AutoQuickSell", DungeonAuto.AutoQuickSell)
+	for _, tg in ipairs(DungeonAuto.QuickSellToggles) do
+		if tg:Get() ~= DungeonAuto.AutoQuickSell then
+			tg:Set(DungeonAuto.AutoQuickSell, true)
+		end
+	end
+	if DungeonAuto.AutoQuickSell and LocalPlayer:GetAttribute("InCombat") ~= true and State.Alive then
+		task.spawn(runQuickSellTrash, true, statusFn or setDungeonStatus)
+	end
 end
 
 DungeonTab:AddSection("Run Automation")
@@ -5444,18 +5599,14 @@ DungeonTab:AddButton({
 	end,
 })
 
-DungeonTab:AddToggle({
+table.insert(DungeonAuto.QuickSellToggles, DungeonTab:AddToggle({
 	Title = "Auto Quick-Sell Trash",
 	Description = "Sells unlocked gear up to your chosen tier after chests, runs & merchant",
 	Default = DungeonAuto.AutoQuickSell,
 	Callback = function(enabled)
-		DungeonAuto.AutoQuickSell = enabled
-		Config.Set("Dungeon_AutoQuickSell", enabled)
-		if enabled and LocalPlayer:GetAttribute("InCombat") ~= true then
-			task.spawn(runQuickSellTrash, true, setDungeonStatus)
-		end
+		DungeonAuto.SetAutoQuickSell(enabled, setDungeonStatus)
 	end,
-})
+}))
 
 table.insert(quickSellTierDropdowns, DungeonTab:AddDropdown({
 	Title = "Quick-Sell Tier",
@@ -5913,7 +6064,8 @@ trackThread(function()
 			if chestTick % 5 == 0 then
 				if DungeonAuto.AutoChests then
 					openAllChestsSafe(true)
-				elseif DungeonAuto.AutoQuickSell and LocalPlayer:GetAttribute("InCombat") ~= true then
+				end
+				if DungeonAuto.AutoQuickSell and LocalPlayer:GetAttribute("InCombat") ~= true and (os.clock() - DungeonAuto.LastQuickSellAt) >= 8.0 then
 					runQuickSellTrash(true, setDungeonStatus)
 				end
 			end
@@ -6160,6 +6312,80 @@ CarnivalTab:AddButton({
 	end,
 })
 
+do
+	CarnivalAuto.AutoHatch = Config.Get("AutoHatchEggs", false)
+	CarnivalAuto.HatchLastAt = 0
+	CarnivalAuto.HatchedUids = {}
+
+	function CarnivalAuto.HatchReadyEggs(silent)
+		if not State.Alive or LocalPlayer:GetAttribute("InRun") == true then
+			return 0
+		end
+		local mods = getGameMods()
+		if not mods or not mods.Net or not mods.Items then
+			return 0
+		end
+		local okP, profile = pcall(mods.Net.getProfile)
+		if not okP or type(profile) ~= "table" then
+			return 0
+		end
+		local nowSec = os.time()
+		local nowClk = os.clock()
+		local hatched = 0
+		for _, item in ipairs(profile.inventory or {}) do
+			if not State.Alive or LocalPlayer:GetAttribute("InRun") == true then
+				break
+			end
+			if type(item) == "table" and item.uid and item.defId then
+				local def = mods.Items[item.defId]
+				local isEgg = (mods.Hatch and mods.Hatch.isEgg and mods.Hatch.isEgg(item.defId))
+					or (def and def.category == "Egg")
+				if isEgg then
+					local readyBySys = mods.Hatch and mods.Hatch.isReady and mods.Hatch.isReady(item, nowSec)
+					local readyAtTs = tonumber(item.hatchAt or item.hatchesAt)
+					local isReady = readyBySys or (readyAtTs ~= nil and nowSec >= readyAtTs)
+					local lastTried = CarnivalAuto.HatchedUids[item.uid] or 0
+					if isReady and (nowClk - lastTried) >= 4.0 then
+						CarnivalAuto.HatchedUids[item.uid] = nowClk
+						pcall(function()
+							mods.Net.fireServer("HatchEgg", { uid = item.uid })
+						end)
+						hatched += 1
+						task.wait(0.15)
+					end
+				end
+			end
+		end
+		CarnivalAuto.HatchLastAt = os.clock()
+		if hatched > 0 then
+			setCarnivalStatus("HATCHED · " .. tostring(hatched) .. " EGGS")
+		elseif not silent then
+			setCarnivalStatus("NO READY EGGS")
+		end
+		return hatched
+	end
+
+	CarnivalTab:AddToggle({
+		Title = "Auto Hatch Ready Eggs",
+		Description = "Automatically hatches ready incubated eggs when in Lobby",
+		Default = CarnivalAuto.AutoHatch,
+		Callback = function(enabled)
+			CarnivalAuto.AutoHatch = enabled
+			Config.Set("AutoHatchEggs", enabled)
+			if enabled then
+				task.spawn(CarnivalAuto.HatchReadyEggs, true)
+			end
+		end,
+	})
+
+	CarnivalTab:AddButton({
+		Title = "Hatch Ready Eggs Now",
+		Callback = function()
+			CarnivalAuto.HatchReadyEggs(false)
+		end,
+	})
+end
+
 carnivalStatusCard = CarnivalTab:AddStatusCard({
 	Title = "Carnival Status",
 	Value = "IDLE",
@@ -6174,6 +6400,9 @@ trackThread(function()
 		if CarnivalAuto.Farming then
 			local okCall, okRun = pcall(playCarnivalOnce, CarnivalAuto.Game)
 			task.wait((okCall and okRun) and 1.2 or 2.5)
+		end
+		if CarnivalAuto.AutoHatch and LocalPlayer:GetAttribute("InRun") ~= true and (os.clock() - (CarnivalAuto.HatchLastAt or 0)) >= 10.0 then
+			pcall(CarnivalAuto.HatchReadyEggs, true)
 		end
 	end
 end)
@@ -6324,6 +6553,87 @@ LobbyTab:AddButton({
 	end,
 })
 
+do
+	local autoLearn = Config.Get("AutoLearnLessons", false)
+	local lastLearnAt = 0
+
+	local function learnAvailableLessons(silent)
+		if not State.Alive or LocalPlayer:GetAttribute("InRun") == true then
+			return 0
+		end
+		local mods = getGameMods()
+		if not mods or not mods.Loadout or type(mods.Loadout.readyToLearn) ~= "function" then
+			return 0
+		end
+		local okP, profile = pcall(mods.Net.getProfile)
+		if not okP or type(profile) ~= "table" then
+			return 0
+		end
+		local okR, lessons = pcall(mods.Loadout.readyToLearn, profile)
+		if not okR or type(lessons) ~= "table" or #lessons == 0 then
+			if not silent then
+				setLobbyStatus("NO READY LESSONS")
+			end
+			return 0
+		end
+		local learned = 0
+		for _, lesson in ipairs(lessons) do
+			if not State.Alive or LocalPlayer:GetAttribute("InRun") == true then
+				break
+			end
+			if type(lesson) == "table" and type(lesson.abilityId) == "string" then
+				pcall(function()
+					mods.Net.fireServer("LearnLesson", { abilityId = lesson.abilityId })
+				end)
+				learned += 1
+				task.wait(0.12)
+			end
+		end
+		lastLearnAt = os.clock()
+		if learned > 0 or not silent then
+			setLobbyStatus(learned > 0 and ("LEARNED · " .. tostring(learned) .. " SPELLS") or "NO READY LESSONS")
+		end
+		return learned
+	end
+
+	LobbyTab:AddToggle({
+		Title = "Auto Learn School Spells",
+		Description = "Auto-learns affordable unlocked trainer spells in Lobby",
+		Default = autoLearn,
+		Callback = function(enabled)
+			autoLearn = enabled
+			Config.Set("AutoLearnLessons", enabled)
+			if enabled then
+				task.spawn(learnAvailableLessons, false)
+			end
+		end,
+	})
+
+	LobbyTab:AddButton({
+		Title = "Learn Available Spells Now",
+		Callback = function()
+			learnAvailableLessons(false)
+		end,
+	})
+
+	task.spawn(function()
+		task.wait(0.8)
+		local mods = getGameMods()
+		if mods and mods.Net and State.Alive then
+			trackConnection(mods.Net.onClientEvent("ProfileChanged", function()
+				if autoLearn and State.Alive and (os.clock() - lastLearnAt) >= 4.0 and LocalPlayer:GetAttribute("InRun") ~= true then
+					lastLearnAt = os.clock()
+					task.delay(0.6, function()
+						if autoLearn and State.Alive then
+							learnAvailableLessons(true)
+						end
+					end)
+				end
+			end))
+		end
+	end)
+end
+
 LobbyTab:AddInput({
 	Title = "Code",
 	Placeholder = "Enter redeem code...",
@@ -6377,6 +6687,11 @@ local AutoEquip = {
 	Enabled = Config.Get("AutoEquip", false),
 	BuildMode = Config.Get("AutoEquipBuild", "Damage"),
 	Element = Config.Get("AutoEquipElement", "Auto (My School)"),
+	IncludePet = Config.Get("AutoEquip_IncludePet", true),
+	DeckAware = Config.Get("AutoEquip_DeckAware", true),
+	RespectCaps = Config.Get("AutoEquip_RespectCaps", true),
+	KeepVanity = Config.Get("KeepVanity", false),
+	SavedVanity = Config.Get("VanitySaved", nil),
 	Busy = false,
 	LastRunAt = 0,
 }
@@ -6404,43 +6719,69 @@ end
 
 local function scoreBuildStats(mods, stats, bonusHp, targetSchool, schoolDef, buildMode, elementMatchCount, gearQualitySum)
 	local isSupport = (buildMode == "Support")
+	local caps = (AutoEquip.RespectCaps and mods and mods.Constants and mods.Constants.STAT_CAPS) or nil
+	local function eff(statKey, rawVal)
+		rawVal = tonumber(rawVal) or 0
+		if rawVal <= 0 or not caps then
+			return rawVal
+		end
+		local cap = caps[statKey]
+		if type(cap) == "number" and cap > 0 and rawVal > cap then
+			return cap + (rawVal - cap) * 0.03
+		end
+		return rawVal
+	end
+
 	local score = 0
+	local healBonus = eff("HealingBonus", stats.HealingBonus)
+	local powerPip = eff("PowerPipChance", stats.PowerPipChance)
+	local allRes = stats.AllResistance or 0
+	local statusRes = eff("StatusResistance", stats.StatusResistance)
+	local blockChc = eff("BlockChance", stats.BlockChance)
+	local blockStr = eff("BlockStrength", stats.BlockStrength)
+	local haste = eff("Haste", stats.Haste)
+	local acc = eff("Accuracy", stats.Accuracy)
+	local critChc = eff("CritChance", stats.CritChance)
+	local critDmg = eff("CritDamage", stats.CritDamage)
+	local pierce = eff("Pierce", stats.Pierce)
+	local statusPow = eff("StatusPower", stats.StatusPower)
 
 	if isSupport then
-		-- Support Build: maximize Healing, Power Pip, Max HP, All/Status Resist, Block & Haste
-		score += (stats.HealingBonus or 0) * 1450
-		score += (stats.PowerPipChance or 0) * 850
+		-- Support Build: maximize Healing (up to cap), Power Pip (up to 100%), Max HP, Resists, Block & Haste
+		score += healBonus * 1450
+		score += powerPip * 860
 		score += ((stats.MaxHealth or 0) + (bonusHp or 0)) * 2.8
-		score += (stats.AllResistance or 0) * 720
-		score += (stats.StatusResistance or 0) * 520
-		score += (stats.BlockChance or 0) * 460
-		score += (stats.Haste or 0) * 340
-		score += (stats.Accuracy or 0) * 260
+		score += eff("StatusResistance", allRes + statusRes) * 520 + allRes * 240
+		score += blockChc * 460 + blockStr * 180
+		score += haste * 340
+		score += acc * 260
 		if schoolDef then
-			score += (stats[schoolDef.resistance] or 0) * 420
+			local schRes = eff(schoolDef.resistance, (stats[schoolDef.resistance] or 0) + allRes) - eff(schoolDef.resistance, allRes)
+			score += math.max(0, schRes) * 420
 			score += (stats[schoolDef.damageBonus] or 0) * 220
 			score += (stats[schoolDef.pierce] or 0) * 110
 		end
 		score += ((stats.AllDamage or 0) + (stats.OwnDamage or 0)) * 180
-		score += (stats.CritChance or 0) * 90
+		score += critChc * 90 + statusPow * 120
 	else
-		-- Damage Build: maximize School/All Damage, Pierce, Crit, Accuracy & Power Pip
+		-- Damage Build: maximize School/All Damage, Pierce (up to cap), Crit (up to cap), CritDmg, Accuracy & Power Pip
 		if schoolDef then
 			score += (stats[schoolDef.damageBonus] or 0) * 1400
-			score += (stats[schoolDef.pierce] or 0) * 780
-			score += (stats[schoolDef.resistance] or 0) * 180
+			local schPierce = eff("Pierce", (stats[schoolDef.pierce] or 0) + pierce) - pierce
+			score += math.max(0, schPierce) * 780
+			score += eff(schoolDef.resistance, (stats[schoolDef.resistance] or 0) + allRes) * 150
 		end
 		score += ((stats.AllDamage or 0) + (stats.OwnDamage or 0)) * 1250
-		score += (stats.Pierce or 0) * 680
-		score += (stats.CritChance or 0) * 580
-		score += (stats.PowerPipChance or 0) * 540
-		score += (stats.CritDamage or 0) * 340
-		score += (stats.Accuracy or 0) * 320
-		score += (stats.Haste or 0) * 220
-		score += (stats.AllResistance or 0) * 150
-		score += (stats.BlockChance or 0) * 110
-		score += (stats.StatusResistance or 0) * 90
-		score += (stats.HealingBonus or 0) * ((targetSchool == "Light" or targetSchool == "Nature") and 240 or 60)
+		score += pierce * 680
+		score += critChc * 580
+		score += powerPip * 540
+		score += critDmg * 340
+		score += acc * 320
+		score += haste * 220
+		score += allRes * 150
+		score += blockChc * 110 + blockStr * 40
+		score += statusRes * 90 + statusPow * 80
+		score += healBonus * ((targetSchool == "Light" or targetSchool == "Nature") and 240 or 60)
 		score += ((stats.MaxHealth or 0) + (bonusHp or 0)) * 0.9
 
 		-- Small fallback credit for off-element offensive stats
@@ -6457,7 +6798,7 @@ local function scoreBuildStats(mods, stats, bonusHp, targetSchool, schoolDef, bu
 		end
 	end
 
-	-- Soft element compatibility & gear tier tiebreakers (prefer same-school synergies without forcing weak Common gear over real upgrades)
+	-- Soft element compatibility & gear tier tiebreakers
 	score += (elementMatchCount or 0) * (isSupport and 45 or 65)
 	score += (gearQualitySum or 0)
 	return score
@@ -6498,7 +6839,87 @@ local function evaluatePlanLoadout(mods, profile, chosenItems, slotsOrder, targe
 	end
 
 	local totalScore = scoreBuildStats(mods, stats, bonusHp, targetSchool, schoolDef, buildMode, elemMatches, qualitySum)
+
+	-- Deck & granted equipment ability compatibility via Loadout.gearFor / Loadout.meets
+	if AutoEquip.DeckAware and mods.Loadout and mods.Abilities then
+		local okGear, gearInfo = pcall(mods.Loadout.gearFor, fakeEq, fakeInv)
+		if okGear and type(gearInfo) == "table" then
+			if type(profile.deck) == "table" then
+				for cardId, cnt in pairs(profile.deck) do
+					if (tonumber(cnt) or 0) > 0 then
+						local ab = mods.Abilities[cardId]
+						if ab and ab.requires and mods.Loadout.meets then
+							local okMeet, canUse = pcall(mods.Loadout.meets, ab, gearInfo)
+							if okMeet and not canUse then
+								totalScore -= 350 * (tonumber(cnt) or 1)
+							end
+						end
+					end
+				end
+			end
+			if type(gearInfo.grants) == "table" then
+				local isSupport = (buildMode == "Support")
+				for cardId, cnt in pairs(gearInfo.grants) do
+					local ab = mods.Abilities[cardId]
+					local c = math.min(3, tonumber(cnt) or 1)
+					if ab and not ab.hidden then
+						local kind = tostring(ab.kind or "")
+						if isSupport and (kind == "Heal" or kind == "Shield" or kind == "Ward" or kind == "Cleanse" or kind == "Utility") then
+							totalScore += 32 * c
+						elseif not isSupport and (kind == "Attack" or kind == "Blade" or kind == "Trap" or kind == "Global") then
+							totalScore += 22 * c
+						else
+							totalScore += 8 * c
+						end
+					end
+				end
+			end
+		end
+	end
+
 	return totalScore, stats, bonusHp
+end
+
+function AutoEquip.ApplySavedVanity(mods, profile, silent)
+	if not AutoEquip.KeepVanity or type(AutoEquip.SavedVanity) ~= "table" or not mods or not mods.Inventory then
+		return 0
+	end
+	local currentProf = profile
+	if not currentProf then
+		local okP, p = pcall(mods.Net.getProfile)
+		if not okP or type(p) ~= "table" then
+			return 0
+		end
+		currentProf = p
+	end
+	local applied = 0
+	local vanityNow = currentProf.vanityLooks or {}
+	local eqNow = currentProf.equipped or {}
+	for slot, savedUid in pairs(AutoEquip.SavedVanity) do
+		if type(savedUid) == "string" and vanityNow[slot] ~= savedUid then
+			local savedItem = mods.Inventory.find(currentProf, savedUid)
+			local savedDef = savedItem and mods.Items[savedItem.defId]
+			if savedItem and savedDef then
+				local okFit = true
+				if mods.Inventory.HELD_LOOK_SLOTS and mods.Inventory.HELD_LOOK_SLOTS[slot] then
+					local eqItem = eqNow[slot] and mods.Inventory.find(currentProf, eqNow[slot])
+					local eqDef = eqItem and mods.Items[eqItem.defId]
+					okFit = mods.Inventory.lookMatches(slot, savedDef, eqDef)
+				end
+				if okFit and eqNow[slot] ~= savedUid then
+					pcall(function()
+						mods.Net.fireServer("SetVanity", { slot = slot, uid = savedUid })
+					end)
+					applied += 1
+					task.wait(0.05)
+				end
+			end
+		end
+	end
+	if applied > 0 and not silent then
+		setGearStatus("APPLIED · " .. tostring(applied) .. " VANITY")
+	end
+	return applied
 end
 
 local function runSmartAutoEquip(silentNoChange)
@@ -6531,16 +6952,33 @@ local function runSmartAutoEquip(silentNoChange)
 		local playerLevel = profile.level or 1
 		local equipped = profile.equipped or {}
 
-		local slotsOrder = EQUIP_SLOTS_ORDER
+		local deckNeedsShield = false
+		if AutoEquip.DeckAware and type(profile.deck) == "table" and mods.Abilities then
+			for cardId, cnt in pairs(profile.deck) do
+				if (tonumber(cnt) or 0) > 0 then
+					local ab = mods.Abilities[cardId]
+					if ab and type(ab.requires) == "table" and ab.requires.offhandKind == "Shield" then
+						deckNeedsShield = true
+						break
+					end
+				end
+			end
+		end
+
+		local slotsOrder = {}
 		if mods.Enums and type(mods.Enums.EquipSlotOrder) == "table" and #mods.Enums.EquipSlotOrder > 0 then
-			slotsOrder = {}
 			for _, s in ipairs(mods.Enums.EquipSlotOrder) do
-				if s ~= "Pet" and s ~= "Mount" then
+				if s ~= "Mount" and (s ~= "Pet" or AutoEquip.IncludePet) then
 					table.insert(slotsOrder, s)
 				end
 			end
-			if #slotsOrder == 0 then
-				slotsOrder = EQUIP_SLOTS_ORDER
+		end
+		if #slotsOrder == 0 then
+			for _, s in ipairs(EQUIP_SLOTS_ORDER) do
+				table.insert(slotsOrder, s)
+			end
+			if AutoEquip.IncludePet then
+				table.insert(slotsOrder, "Pet")
 			end
 		end
 
@@ -6551,7 +6989,7 @@ local function runSmartAutoEquip(silentNoChange)
 			local cands = {}
 			for _, item in ipairs(profile.inventory or {}) do
 				local def = mods.Items[item.defId]
-				local skipShieldCards = (buildMode == "Damage" and slot == "Offhand" and def and def.kind == "Shield" and targetSchool ~= "Steel")
+				local skipShieldCards = (buildMode == "Damage" and slot == "Offhand" and def and def.kind == "Shield" and targetSchool ~= "Steel" and not deckNeedsShield)
 				if def
 					and def.category ~= "Card"
 					and not skipShieldCards
@@ -6575,6 +7013,25 @@ local function runSmartAutoEquip(silentNoChange)
 					local rarityVal = RARITY_WEIGHT[def.rarity] or 1
 					local quality = (rarityVal * 0.4) + ((item.tier or 0) * 0.8) + ((equipped[slot] == item.uid) and 0.002 or 0)
 					local itemScore = scoreBuildStats(mods, st, hp, targetSchool, schoolDef, buildMode, isSame and 1 or 0, quality)
+					-- Check weapon/offhand deck compatibility at single-item stage so compatible weapons stay in top 7
+					if AutoEquip.DeckAware and (slot == "Weapon" or slot == "Offhand") and mods.Loadout and type(profile.deck) == "table" and mods.Abilities then
+						local okG, gInfo = pcall(mods.Loadout.gearFor, { [slot] = item.uid }, { item })
+						if okG and type(gInfo) == "table" then
+							for cardId, cnt in pairs(profile.deck) do
+								if (tonumber(cnt) or 0) > 0 then
+									local ab = mods.Abilities[cardId]
+									if ab and ab.requires and ((slot == "Weapon" and (ab.requires.weaponKind or ab.requires.weaponId or ab.requires.weaponElement or ab.requires.weight or ab.requires.blunt ~= nil or ab.requires.gun ~= nil))
+										or (slot == "Offhand" and ab.requires.offhandKind))
+									then
+										local okM, m = pcall(mods.Loadout.meets, ab, gInfo)
+										if okM and not m then
+											itemScore -= 350 * (tonumber(cnt) or 1)
+										end
+									end
+								end
+							end
+						end
+					end
 					local rec = {
 						item = item,
 						def = def,
@@ -6591,10 +7048,10 @@ local function runSmartAutoEquip(silentNoChange)
 			table.sort(cands, function(a, b)
 				return a.score > b.score
 			end)
-			-- Keep top 5 candidates + currently equipped piece for whole-build optimization
+			-- Keep top 7 candidates + currently equipped piece for whole-build optimization
 			local trimmed = {}
 			local keptUids = {}
-			for i = 1, math.min(5, #cands) do
+			for i = 1, math.min(7, #cands) do
 				table.insert(trimmed, cands[i])
 				keptUids[cands[i].item.uid] = true
 			end
@@ -6617,15 +7074,14 @@ local function runSmartAutoEquip(silentNoChange)
 			end
 		end
 
-		-- Step 3: Coordinate-ascent whole-loadout refinement (evaluates real set bonuses & combined stats via Inventory.equippedStats)
+		-- Step 3: Coordinate-ascent whole-loadout refinement (stat caps + deck synergy + set interactions)
 		local bestPlanScore, bestStats, bestHp = evaluatePlanLoadout(mods, profile, plan, slotsOrder, targetSchool, schoolDef, buildMode)
-		for _ = 1, 2 do
+		for _ = 1, 3 do
 			local improved = false
 			for _, slot in ipairs(slotsOrder) do
 				local prevRec = plan[slot]
 				for _, cand in ipairs(slotCandidates[slot]) do
 					if not prevRec or cand.item.uid ~= prevRec.item.uid then
-						-- Check if this UID is used in another slot so we can test a swap too
 						local otherSlot = nil
 						if usedUids[cand.item.uid] then
 							for _, s2 in ipairs(slotsOrder) do
@@ -6676,7 +7132,7 @@ local function runSmartAutoEquip(silentNoChange)
 					changes += 1
 					task.wait(0.06)
 				end
-			elseif buildMode == "Damage" and slot == "Offhand" and equipped.Offhand and targetSchool ~= "Steel" then
+			elseif buildMode == "Damage" and slot == "Offhand" and equipped.Offhand and targetSchool ~= "Steel" and not deckNeedsShield then
 				for _, item in ipairs(profile.inventory or {}) do
 					if item.uid == equipped.Offhand then
 						local def = mods.Items[item.defId]
@@ -6691,9 +7147,15 @@ local function runSmartAutoEquip(silentNoChange)
 			end
 		end
 
+		if changes > 0 and AutoEquip.KeepVanity then
+			task.wait(0.15)
+			local okNew, newProf = pcall(mods.Net.getProfile)
+			AutoEquip.ApplySavedVanity(mods, okNew and newProf or profile, true)
+		end
+
 		local dmgPct = ((schoolDef and bestStats[schoolDef.damageBonus] or 0) + (bestStats.AllDamage or 0) + (bestStats.OwnDamage or 0)) * 100
 		local healPct = (bestStats.HealingBonus or 0) * 100
-		local pipPct = (bestStats.PowerPipChance or 0) * 100
+		local pipPct = math.min(100, (bestStats.PowerPipChance or 0) * 100)
 		local summaryNote = (buildMode == "Support")
 			and string.format("+%d%% Heal, +%d%% Pip, +%d HP", math.floor(healPct + 0.5), math.floor(pipPct + 0.5), math.floor((bestStats.MaxHealth or 0) + bestHp + 0.5))
 			or string.format("+%d%% Dmg, +%d%% Pip", math.floor(dmgPct + 0.5), math.floor(pipPct + 0.5))
@@ -6934,11 +7396,57 @@ task.spawn(function()
 					end
 				end)
 			end
+			if DungeonAuto.AutoQuickSell and not quickSellBusy and LocalPlayer:GetAttribute("InCombat") ~= true and (os.clock() - DungeonAuto.LastQuickSellAt) >= 4.0 then
+				task.delay(0.65, function()
+					if State.Alive and DungeonAuto.AutoQuickSell and not quickSellBusy and LocalPlayer:GetAttribute("InCombat") ~= true then
+						runQuickSellTrash(true, setGearStatus)
+					end
+				end)
+			end
 		end
 		trackConnection(mods.Net.onClientEvent("ProfileChanged", onLootOrProfile))
 		trackConnection(mods.Net.onClientEvent("ChestOpened", onLootOrProfile))
 	end
 end)
+
+GearTab:AddToggle({
+	Title = "Include Best Pet",
+	Description = "Also plans & swaps best Damage or Support pet from your bag",
+	Default = AutoEquip.IncludePet,
+	Callback = function(enabled)
+		AutoEquip.IncludePet = enabled
+		Config.Set("AutoEquip_IncludePet", enabled)
+		if AutoEquip.Enabled then
+			task.spawn(runSmartAutoEquip, false)
+		end
+	end,
+})
+
+GearTab:AddToggle({
+	Title = "Respect Deck Card Rules",
+	Description = "Prevents equipping weapons/offhands that lock out deck spells",
+	Default = AutoEquip.DeckAware,
+	Callback = function(enabled)
+		AutoEquip.DeckAware = enabled
+		Config.Set("AutoEquip_DeckAware", enabled)
+		if AutoEquip.Enabled then
+			task.spawn(runSmartAutoEquip, false)
+		end
+	end,
+})
+
+GearTab:AddToggle({
+	Title = "Respect Stat Caps",
+	Description = "Clamps Crit, Pip, Pierce, Accuracy, Haste & Heal at hard caps",
+	Default = AutoEquip.RespectCaps,
+	Callback = function(enabled)
+		AutoEquip.RespectCaps = enabled
+		Config.Set("AutoEquip_RespectCaps", enabled)
+		if AutoEquip.Enabled then
+			task.spawn(runSmartAutoEquip, false)
+		end
+	end,
+})
 
 GearTab:AddButton({
 	Title = "Smart Auto Equip Now",
@@ -6946,6 +7454,203 @@ GearTab:AddButton({
 		runSmartAutoEquip(false)
 	end,
 })
+
+GearTab:AddSection("Vanity Looks (Cosmetics)")
+
+do
+	local VANITY_ORDER = { "Outfit", "Helmet", "Backpack", "Weapon", "Offhand", "Mount", "Pet" }
+
+	GearTab:AddToggle({
+		Title = "Keep Saved Vanity on Equip",
+		Description = "Auto-reapplies your cosmetic look after Smart Equip changes gear",
+		Default = AutoEquip.KeepVanity,
+		Callback = function(enabled)
+			AutoEquip.KeepVanity = enabled
+			Config.Set("KeepVanity", enabled)
+			if enabled and type(AutoEquip.SavedVanity) == "table" then
+				local mods = getGameMods()
+				if mods then
+					task.spawn(AutoEquip.ApplySavedVanity, mods, nil, false)
+				end
+			end
+		end,
+	})
+
+	GearTab:AddButton({
+		Title = "Save Current Look as Vanity",
+		Callback = function()
+			local mods = getGameMods()
+			if not mods or not mods.Net then
+				return
+			end
+			local okP, profile = pcall(mods.Net.getProfile)
+			if not okP or type(profile) ~= "table" then
+				setGearStatus("ERR · NO PROFILE")
+				return
+			end
+			local vanityNow = profile.vanityLooks or {}
+			local eqNow = profile.equipped or {}
+			local snap = {}
+			local savedCount = 0
+			for _, slot in ipairs(VANITY_ORDER) do
+				local uid = vanityNow[slot] or eqNow[slot]
+				if type(uid) == "string" and uid ~= "" then
+					snap[slot] = uid
+					savedCount += 1
+				end
+			end
+			AutoEquip.SavedVanity = snap
+			Config.Set("VanitySaved", snap)
+			setGearStatus("SAVED · " .. tostring(savedCount) .. " VANITY SLOTS")
+		end,
+	})
+
+	GearTab:AddButton({
+		Title = "Apply Saved Vanity Now",
+		Callback = function()
+			local mods = getGameMods()
+			if not mods then
+				return
+			end
+			if type(AutoEquip.SavedVanity) ~= "table" or next(AutoEquip.SavedVanity) == nil then
+				setGearStatus("SAVE A LOOK FIRST")
+				return
+			end
+			local count = AutoEquip.ApplySavedVanity(mods, nil, false)
+			if count == 0 then
+				setGearStatus("VANITY ALREADY ACTIVE")
+			end
+		end,
+	})
+
+	GearTab:AddButton({
+		Title = "Clear Saved Vanity",
+		Callback = function()
+			AutoEquip.SavedVanity = nil
+			Config.Set("VanitySaved", nil)
+			local mods = getGameMods()
+			if mods and mods.Net then
+				for _, slot in ipairs(VANITY_ORDER) do
+					pcall(function()
+						mods.Net.fireServer("SetVanity", { slot = slot })
+					end)
+				end
+			end
+			setGearStatus("CLEARED SAVED VANITY")
+		end,
+	})
+end
+
+GearTab:AddSection("Upgrades & Reforge")
+
+do
+	local upgradeReadyCard = GearTab:AddStatusCard({
+		Title = "Next Gear Upgrade",
+		Value = "Click Scan or Upgrade...",
+	})
+
+	local UPGRADE_SLOTS = { "Outfit", "Helmet", "Backpack", "Charm1", "Charm2", "Charm3", "Offhand" }
+
+	local function findBestUpgradePlan(mods, profile)
+		if not mods or not mods.Upgrade or not profile then
+			return nil, nil
+		end
+		local equipped = profile.equipped or {}
+		local bestCandidate, bestPlan = nil, nil
+		for _, slot in ipairs(UPGRADE_SLOTS) do
+			local uid = equipped[slot]
+			if uid then
+				local item = mods.Inventory.find(profile, uid)
+				local def = item and mods.Items[item.defId]
+				if item and def and def.slot ~= "Weapon" and not def.exotic then
+					local okSug, fuel = pcall(mods.Upgrade.suggestFuel, profile, uid)
+					local okPlan, plan = pcall(mods.Upgrade.plan, profile, uid, okSug and fuel or {})
+					if okPlan and type(plan) == "table" and plan.ok then
+						local rarityRank = AutoLock.GetRarityRank(mods, def)
+						if not bestCandidate or rarityRank > bestCandidate.rank or (rarityRank == bestCandidate.rank and plan.goldCost < bestPlan.goldCost) then
+							bestCandidate = { slot = slot, item = item, def = def, rank = rarityRank }
+							bestPlan = plan
+						end
+					end
+				end
+			end
+		end
+		return bestCandidate, bestPlan
+	end
+
+	GearTab:AddButton({
+		Title = "Upgrade Best Equipped Armor/Charm",
+		Callback = function()
+			if LocalPlayer:GetAttribute("InRun") == true then
+				setGearStatus("EXIT RUN TO UPGRADE")
+				return
+			end
+			local mods = getGameMods()
+			if not mods or not mods.Upgrade then
+				return
+			end
+			local okP, profile = pcall(mods.Net.getProfile)
+			if not okP or type(profile) ~= "table" then
+				setGearStatus("ERR · NO PROFILE")
+				return
+			end
+			local cand, plan = findBestUpgradePlan(mods, profile)
+			if not cand or not plan then
+				upgradeReadyCard:Set("No ready armor/charm (maxed or need fuel/gold)")
+				setGearStatus("NO READY UPGRADE")
+				return
+			end
+			pcall(function()
+				mods.Net.fireServer("UpgradeItem", { uid = cand.item.uid, fuelUids = plan.consume })
+			end)
+			local nm = tostring(cand.def.name or cand.item.defId)
+			upgradeReadyCard:Set(string.format("%s T%d→T%d (%dg, %d fuel)", nm, plan.tier, plan.nextTier, plan.goldCost, #plan.consume))
+			setGearStatus("UPGRADED · " .. nm .. " T" .. tostring(plan.nextTier))
+		end,
+	})
+
+	GearTab:AddButton({
+		Title = "Scan Gear Rolls (Reforge Check)",
+		Callback = function()
+			local mods = getGameMods()
+			if not mods or not mods.Inventory or not mods.Items then
+				return
+			end
+			local okP, profile = pcall(mods.Net.getProfile)
+			if not okP or type(profile) ~= "table" then
+				return
+			end
+			local equipped = profile.equipped or {}
+			local badNames = {}
+			for _, slot in ipairs({ "Weapon", "Offhand", "Helmet", "Outfit", "Backpack", "Charm1", "Charm2", "Charm3" }) do
+				local uid = equipped[slot]
+				local item = uid and mods.Inventory.find(profile, uid)
+				if item and type(item.rolledStats) == "table" and mods.Inventory.rolls(item.defId) then
+					local def = mods.Items[item.defId]
+					local negSum = 0
+					for k, v in pairs(item.rolledStats) do
+						local r = mods.Inventory.rollOf(def, k, v)
+						if r < 0 then
+							negSum += 1
+						end
+					end
+					if negSum > 0 then
+						table.insert(badNames, string.format("%s (-%d)", tostring(def and def.name or slot), negSum))
+					end
+				end
+			end
+			local cand, plan = findBestUpgradePlan(mods, profile)
+			if cand and plan then
+				upgradeReadyCard:Set(string.format("Next: %s T%d→T%d (%dg)", tostring(cand.def.name or cand.item.defId), plan.tier, plan.nextTier, plan.goldCost))
+			elseif #badNames > 0 then
+				upgradeReadyCard:Set("Reforge: " .. table.concat(badNames, ", "))
+			else
+				upgradeReadyCard:Set("Equipped rolls clean")
+			end
+			setGearStatus(#badNames > 0 and ("REFORGE · " .. #badNames .. " WEAK ROLLS") or "ROLLS CLEAN")
+		end,
+	})
+end
 
 GearTab:AddSection("Auto Lock")
 
@@ -6983,6 +7688,15 @@ GearTab:AddButton({
 })
 
 GearTab:AddSection("Quick-Sell")
+
+table.insert(DungeonAuto.QuickSellToggles, GearTab:AddToggle({
+	Title = "Auto Quick-Sell Trash",
+	Description = "Auto-sells unlocked trash after Auto Lock & Smart Equip",
+	Default = DungeonAuto.AutoQuickSell,
+	Callback = function(enabled)
+		DungeonAuto.SetAutoQuickSell(enabled, setGearStatus)
+	end,
+}))
 
 table.insert(quickSellTierDropdowns, GearTab:AddDropdown({
 	Title = "Quick-Sell Tier",
@@ -7679,8 +8393,42 @@ do
 	end)
 end
 
+trackRestore(function()
+	AntiAFK.Enabled = false
+	CombatAuto.Enabled = false
+	CombatAuto.Busy = false
+	DungeonAuto.AutoReady = false
+	DungeonAuto.AutoEncounter = false
+	DungeonAuto.AutoSkipMerchant = false
+	DungeonAuto.AutoReplay = false
+	DungeonAuto.AutoChests = false
+	DungeonAuto.AutoQuickSell = false
+	DungeonAuto.AutoRequeue = false
+	DungeonAuto.RequeueBusy = false
+	CarnivalAuto.Farming = false
+	CarnivalAuto.AutoHatch = false
+	AutoEquip.Enabled = false
+	AutoEquip.Busy = false
+	AutoLock.Enabled = false
+	AutoLock.Busy = false
+	ShopSniper.Enabled = false
+	ShopSniper.Busy = false
+	quickSellBusy = false
+
+	if GameMods and GameMods.CombatUI then
+		if type(GameMods.CombatUI.stopAiming) == "function" then
+			pcall(GameMods.CombatUI.stopAiming)
+		end
+		if type(GameMods.CombatUI.setBusy) == "function" then
+			pcall(GameMods.CombatUI.setBusy, false)
+		end
+	end
+	GameMods = nil
+	GameModsError = nil
+end)
+
 --// =========================================================================
---// TAB 6: SETTINGS
+--// TAB 8: SETTINGS
 --// =========================================================================
 local SettingsTab = Window:AddTab("Settings")
 SettingsTab:AddSection("Auto-Update Sync")
