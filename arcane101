@@ -1,6 +1,6 @@
 -- Arcane 101 · Monochrome Minimalist Hub
 -- Modular Luau Script | Theme: Monochrome Minimalist Sleek
-local SCRIPT_VERSION = "V1.2"
+local SCRIPT_VERSION = "V1.3"
 
 local env = (typeof(getgenv) == "function" and getgenv()) or _G
 if type(env.__MonochromeCleanup) == "function" then
@@ -1647,8 +1647,15 @@ local function getGameMods(forceReload)
 			Deck = safeRequire(Campaign.Systems:FindFirstChild("Deck")),
 			Loadout = safeRequire(Campaign.Systems:FindFirstChild("Loadout")),
 			Inventory = safeRequire(Campaign.Systems:FindFirstChild("Inventory")),
+			CharacterStats = safeRequire(Campaign.Systems:FindFirstChild("CharacterStats")),
+			LevelGate = safeRequire(Campaign.Systems:FindFirstChild("LevelGate")),
+			Talents = safeRequire(Campaign.Systems:FindFirstChild("Talents")),
+			TalentPaths = safeRequire(Campaign.Data:FindFirstChild("TalentPaths")),
+			TalentDefs = safeRequire(Campaign.Data:FindFirstChild("Talents")),
 			Upgrade = safeRequire(Campaign.Systems:FindFirstChild("Upgrade")),
 			WeaponUpgrade = safeRequire(Campaign.Systems:FindFirstChild("WeaponUpgrade")),
+			Reforge = safeRequire(Campaign.Systems:FindFirstChild("Reforge")),
+			Trade = safeRequire(Campaign.Systems:FindFirstChild("Trade")),
 			Hatch = safeRequire(Campaign.Systems:FindFirstChild("Hatch")),
 			PetLevels = safeRequire(Campaign.Systems:FindFirstChild("PetLevels")),
 			Shop = safeRequire(Campaign.Systems:FindFirstChild("Shop")),
@@ -1696,8 +1703,8 @@ local Window = UI.CreateWindow({
 local GeneralTab = Window:AddTab("General")
 
 local AntiAFK = {
-	Enabled = true,
-	Mode = "Idled + Pulse",
+	Enabled = Config.Get("AntiAFK", true),
+	Mode = (Config.Get("AntiAFKMethod", "Hybrid") == "Idled") and "Idled" or "Idled + Pulse",
 	BlockedCount = 0,
 	StartedAt = os.clock(),
 	IdledConn = nil,
@@ -1774,7 +1781,7 @@ antiAfkStatus = GeneralTab:AddStatusCard({
 	Title = "AFK Telemetry",
 	Value = "00m 00s · 0 blocked",
 })
-updateAntiAfkReadout()
+setAntiAfkEnabled(AntiAFK.Enabled)
 
 GeneralTab:AddSection("Movement & Performance")
 
@@ -1920,7 +1927,8 @@ local CombatTab = Window:AddTab("Combat")
 
 local CombatAuto = {
 	Enabled = Config.Get("AutoCombat", false),
-	Style = Config.Get("AttackStyle", "Attack"),
+	StyleChoice = Config.Get("AttackStyle", "Auto (My Path)"),
+	Style = "Attack",
 	TargetPriority = Config.Get("TargetPriority", "Smart Effective"),
 	SavePipMinCost = 4,
 	AutoHeal = Config.Get("AutoHeal", false),
@@ -1936,6 +1944,58 @@ local CombatAuto = {
 	LastDiscardTurnKey = nil,
 	AimingSince = nil,
 }
+
+if not Config.Get("CombatStylePathAwareV1", false) then
+	CombatAuto.StyleChoice = "Auto (My Path)"
+	Config.Set("AttackStyle", "Auto (My Path)")
+	Config.Set("CombatStylePathAwareV1", true)
+end
+if CombatAuto.StyleChoice == "Support" or CombatAuto.StyleChoice == "Attack" then
+	CombatAuto.Style = CombatAuto.StyleChoice
+end
+
+function CombatAuto.RefreshResolvedStyle(mods, profileOpt)
+	if CombatAuto.StyleChoice == "Support" or CombatAuto.StyleChoice == "Attack" then
+		CombatAuto.Style = CombatAuto.StyleChoice
+		return CombatAuto.Style
+	end
+	local prof = profileOpt or (mods and mods.Net and mods.Net.peekProfile and mods.Net.peekProfile())
+	if type(prof) == "table" then
+		if mods and mods.Talents and type(mods.Talents.pathOf) == "function" then
+			local okP, pid = pcall(mods.Talents.pathOf, prof)
+			if okP and type(pid) == "string" then
+				CombatAuto.Style = (pid == "Verdant" or pid == "Sanctuary" or pid == "Glacier") and "Support" or "Attack"
+				return CombatAuto.Style
+			end
+		end
+		for _, tid in ipairs(prof.talents or {}) do
+			local baseId = type(tid) == "string" and string.match(tid, "^([A-Za-z]+)%d*$") or nil
+			if baseId == "Verdant" or baseId == "Sanctuary" or baseId == "Glacier" then
+				CombatAuto.Style = "Support"
+				return "Support"
+			elseif baseId ~= nil and baseId ~= "" then
+				CombatAuto.Style = "Attack"
+				return "Attack"
+			end
+		end
+	end
+	CombatAuto.Style = "Attack"
+	return "Attack"
+end
+
+function CombatAuto.GetPathGrants(mods, me)
+	if type(me) == "table" and type(me.grants) == "table" and next(me.grants) ~= nil then
+		return me.grants
+	end
+	local prof = mods and mods.Net and mods.Net.peekProfile and mods.Net.peekProfile()
+	if type(prof) == "table" and mods.Talents and type(mods.Talents.grants) == "function" then
+		local okG, gTbl = pcall(mods.Talents.grants, prof)
+		if okG and type(gTbl) == "table" then
+			return gTbl
+		end
+	end
+	return {}
+end
 
 CombatTab:AddSection("Combat Automation")
 
@@ -1962,11 +2022,12 @@ CombatTab:AddToggle({
 
 CombatTab:AddDropdown({
 	Title = "Attack Style",
-	Options = { "Attack", "Support" },
-	Default = CombatAuto.Style,
+	Options = { "Auto (My Path)", "Attack", "Support" },
+	Default = CombatAuto.StyleChoice,
 	Callback = function(choice)
-		CombatAuto.Style = choice
+		CombatAuto.StyleChoice = choice
 		Config.Set("AttackStyle", choice)
+		CombatAuto.RefreshResolvedStyle(getGameMods())
 	end,
 })
 
@@ -2990,6 +3051,7 @@ local function getAliveEnemies(mods, state, me)
 				combatant = c,
 				name = c.name or c.enemyId or id,
 				hp = hp,
+				maxHp = math.max(1, (c.derived and c.derived.maxHp) or c.maxHp or hp),
 				shield = shield,
 				effectiveHp = ehp,
 				isBoss = isBoss,
@@ -3024,6 +3086,29 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 	local totalEnemies = #aliveEnemies
 	local directScaled = entry.info.scaledByCaster == true
 	local bossFocusMult = (CombatAuto.TargetPriority == "Boss First") and 1.65 or 1.25
+	local grants = CombatAuto.GetPathGrants(mods, me)
+	local execThresh = tonumber(grants.execute) or 0
+	local execBonus = tonumber(grants.executeBonus) or 0
+	local killPips = tonumber(grants.killPips) or 0
+	local energyOnCrit = (tonumber(grants.energyOnCrit) or 0) > 0
+	local critBolt = tonumber(grants.critBolt) or 0
+	local myCrit = math.min(0.60, math.max(0, (me.scaling and tonumber(me.scaling.CritChance)) or 0))
+	local critMultEst = math.min(3.0, 1.5 + ((me.scaling and tonumber(me.scaling.CritDamage)) or 0))
+	local expectedCritScale = 1 + myCrit * (critMultEst - 1)
+
+	local function projectEnemyDmgAndKill(e, mult)
+		local eMaxHp = e.maxHp or math.max(1, e.hp)
+		local belowHalfMult = (execBonus > 0 and (e.hp / eMaxHp) < 0.50) and (1 + execBonus) or 1
+		local rawDmg = base * mult * belowHalfMult
+		local dmg = rawDmg * expectedCritScale
+		if isAoe == false and totalEnemies >= 2 and critBolt > 0 and myCrit > 0 then
+			dmg += rawDmg * myCrit * critMultEst * critBolt * 0.65
+		end
+		local remainingHpAfterHit = e.hp - math.max(0, rawDmg - e.shield)
+		local autoExecKill = (not e.isBoss) and execThresh > 0 and (remainingHpAfterHit <= eMaxHp * execThresh)
+		local canKill = (not e.evades) and ((rawDmg >= e.effectiveHp * 0.99) or autoExecKill)
+		return dmg, canKill
+	end
 
 	if isAoe then
 		local totalDmg = 0
@@ -3034,7 +3119,7 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 		local overkill = 0
 		for _, e in ipairs(aliveEnemies) do
 			local mult = getElementMultiplier(mods, atkSchool, e.combatant, me, directScaled)
-			local dmg = base * mult
+			local dmg, canKill = projectEnemyDmgAndKill(e, mult)
 			local eff = math.min(dmg, e.effectiveHp)
 			local okAmt = math.max(0, dmg - e.effectiveHp)
 			totalDmg += eff
@@ -3043,10 +3128,9 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 				bossDamage = eff
 			end
 			tactical += eff * (e.isBoss and bossFocusMult or 1)
-			local canKill = (not e.evades) and (dmg >= e.effectiveHp * 0.99)
 			if canKill then
 				killCount += 1
-				tactical += (e.isBoss and 400 or 120)
+				tactical += (e.isBoss and 400 or 120) + (killPips * 55)
 				if e.isBoss then
 					killsBoss = true
 				end
@@ -3065,6 +3149,10 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 					end
 				end
 			end
+		end
+		if energyOnCrit and totalEnemies >= 2 and (me.energy or 0) <= 3 then
+			-- Multi-target hit gives multiple crit rolls to refund +1 pip via Tempest energyOnCrit
+			tactical += 75
 		end
 		tactical -= (overkill * 0.3)
 		return {
@@ -3091,12 +3179,11 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 
 	for _, e in ipairs(aliveEnemies) do
 		local mult = getElementMultiplier(mods, atkSchool, e.combatant, me, directScaled)
-		local dmg = base * mult
+		local dmg, canKill = projectEnemyDmgAndKill(e, mult)
 		local eff = math.min(dmg, e.effectiveHp)
 		if e.isBoss and eff > bossDamage then
 			bossDamage = eff
 		end
-		local canKill = (not e.evades) and (dmg >= e.effectiveHp * 0.99)
 		if canKill then
 			anyKill = true
 			if e.isBoss then
@@ -3107,7 +3194,7 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 		local overkill = math.max(0, dmg - e.effectiveHp)
 		local s = (eff * (e.isBoss and bossFocusMult or 1)) - (overkill * 0.65) - (eff * (e.reprisal or 0) * 0.85)
 		if canKill then
-			s += (e.isBoss and 500 or 140)
+			s += (e.isBoss and 500 or 140) + (killPips * 55)
 		else
 			if entry.info.appliesControl and not e.evades then
 				s += 90
@@ -3958,12 +4045,19 @@ local function pickSupportEntry(mods, state, me, entries, deckRem)
 					end
 				end
 
-				-- 3. Heal when allies need healing (scaled higher when urgent)
-				if info.healScore > 0 and needsHeal then
-					local urgencyBonus = (healthInfo.lowestRatio <= CombatAuto.HealThreshold) and 2200 or 0
-					score += 4000 + urgencyBonus + info.healScore
-					if ab.targetKind == "AllAllies" and (healthInfo.multiHurtCount >= 2 or healthInfo.hurtCount >= 2) then
-						score += 500
+				-- 3. Heal when allies need healing OR when Verdant/Sanctuary shields + Regrowth convert overheals safely
+				local supGrants = CombatAuto.GetPathGrants(mods, me)
+				local healConvertsToShield = (tonumber(supGrants.overhealShield) or 0) > 0 or (tonumber(supGrants.healShieldShare) or 0) > 0
+				local healAddsRegrow = (tonumber(supGrants.regrowOnHeal) or 0) > 0
+				if info.healScore > 0 then
+					if needsHeal then
+						local urgencyBonus = (healthInfo.lowestRatio <= CombatAuto.HealThreshold) and 2200 or 0
+						score += 4000 + urgencyBonus + info.healScore + ((healConvertsToShield or healAddsRegrow) and 450 or 0)
+						if ab.targetKind == "AllAllies" and (healthInfo.multiHurtCount >= 2 or healthInfo.hurtCount >= 2) then
+							score += 500
+						end
+					elseif fightDangerous and (healConvertsToShield or healAddsRegrow) and unshieldedCarryExists and (ab.energyCost or 0) <= 3 then
+						score += 1100 + info.healScore * 0.35
 					end
 				end
 
@@ -4088,16 +4182,23 @@ local function pickTargetId(mods, state, me, ability, info, preferMode, evalResu
 		local bestMeta = nil
 		local atkSchool = ability.school or me.school
 		local directDmg = (info and info.directDamage) or 0
+		local tGrants = CombatAuto.GetPathGrants(mods, me)
+		local tExecThresh = tonumber(tGrants.execute) or 0
+		local tExecBonus = tonumber(tGrants.executeBonus) or 0
 		for id, c in pairs(state.combatants) do
 			if c.team ~= me.team and not c.isPet and CombatSim.isAlive(c) then
 				local hp = c.hp or 0
 				local shield = tonumber(c.shield) or 0
 				local ehp = math.max(1, hp + shield)
-				local maxHp = (c.derived and c.derived.maxHp) or hp
+				local maxHp = math.max(1, (c.derived and c.derived.maxHp) or c.maxHp or hp)
 				local isBoss = isBossCombatant(mods, c, id)
 				local mult = getElementMultiplier(mods, atkSchool, c, me, directScaled)
+				if tExecBonus > 0 and (hp / maxHp) < 0.50 then
+					mult *= (1 + tExecBonus)
+				end
 				local projDmg = directDmg * mult
-				local canKill = (directDmg > 0) and (projDmg >= ehp * 0.99)
+				local autoExec = (not isBoss) and tExecThresh > 0 and ((hp - math.max(0, projDmg - shield)) <= maxHp * tExecThresh)
+				local canKill = (directDmg > 0) and ((projDmg >= ehp * 0.99) or autoExec)
 				local score
 				if directDmg <= 0 then
 					-- Non-damage support debuff (Hex, Beguile, Lantern Flash, etc.): pick un-debuffed Boss / highest-threat enemy
@@ -4468,6 +4569,7 @@ local function runCombatStep()
 	LiveCombat.BusySince = nil
 
 	local me = state.combatants[myId]
+	CombatAuto.RefreshResolvedStyle(mods)
 	local entries = collectEntries(mods, state, me, false)
 	local deckRem = getDeckRemainingSummary(mods, state, me)
 	local casterFlags = getCasterRedirectInfo(mods.Statuses, me)
@@ -4889,6 +4991,7 @@ end
 local DungeonAuto = {
 	AutoReady = Config.Get("Dungeon_AutoReady", false),
 	AutoEncounter = Config.Get("Dungeon_AutoEncounter", false),
+	PrioritizeQuests = Config.Get("Dungeon_PrioritizeQuests", true),
 	Priority1 = Config.Get("Dungeon_Prio1", "Heal (Always)"),
 	Priority2 = Config.Get("Dungeon_Prio2", "Loot"),
 	Priority3 = Config.Get("Dungeon_Prio3", "Fight"),
@@ -4897,6 +5000,7 @@ local DungeonAuto = {
 	AutoReplay = Config.Get("Dungeon_AutoReplay", false),
 	AutoChests = Config.Get("Dungeon_AutoChests", false),
 	AutoQuickSell = Config.Get("Dungeon_AutoQuickSell", false),
+	ReserveUpgradeFuel = Config.Get("Dungeon_ReserveFuel", true),
 	AutoRequeue = Config.Get("Dungeon_AutoRequeue", false),
 	RequeueMode = Config.Get("Dungeon_RequeueMode", "Auto (Last Party)"),
 	LastAreaId = Config.Get("Dungeon_LastArea", ""),
@@ -4924,6 +5028,7 @@ end
 local AutoLock = {
 	Enabled = Config.Get("AutoLock", false),
 	Rarity = Config.Get("AutoLockRarity", "Rare+"),
+	LockBuildSpares = Config.Get("AutoLock_BuildSpares", true),
 	Options = { "Uncommon+", "Rare+", "Epic+", "Legendary+", "Mythic+", "Divine+", "Exotic Only", "All Gears" },
 	MinRankMap = {
 		["All Gears"] = 1,
@@ -4971,6 +5076,23 @@ function AutoLock.Run(silent, statusFn)
 		end
 
 		local minRank = AutoLock.MinRankMap[AutoLock.Rarity] or 3
+		local mergeProtectDefIds = {}
+		local upgradeEvalCache = {}
+		if AutoLock.LockBuildSpares then
+			local eqMap = profile.equipped or {}
+			for _, wSlot in ipairs({ "Weapon", "Offhand" }) do
+				local eqUid = eqMap[wSlot]
+				local eqIt = eqUid and mods.Inventory.find(profile, eqUid)
+				if eqIt and eqIt.defId and mods.WeaponUpgrade and mods.WeaponUpgrade.needsSpare then
+					-- Protect spare copies of equipped Weapon/Offhand for Tier 6 merge unless already merged/maxed
+					local curWpnTier = (mods.WeaponUpgrade.tierOf and mods.WeaponUpgrade.tierOf(eqIt)) or ((eqIt.tier or 0) + 1)
+					if curWpnTier < ((mods.Constants and mods.Constants.WEAPON_UPGRADE and mods.Constants.WEAPON_UPGRADE.MAX) or 6) then
+						mergeProtectDefIds[eqIt.defId] = true
+					end
+				end
+			end
+		end
+
 		for _, item in ipairs(profile.inventory or {}) do
 			if not State.Alive then
 				break
@@ -4981,7 +5103,23 @@ function AutoLock.Run(silent, statusFn)
 				elseif not AutoLock.LockedCache[item.uid] and mods.Inventory.lockable(item.defId) then
 					local def = mods.Items[item.defId]
 					local rank = AutoLock.GetRarityRank(mods, def)
-					if rank >= minRank then
+					local shouldLock = (rank >= minRank)
+					if not shouldLock and AutoLock.LockBuildSpares and def then
+						if mergeProtectDefIds[item.defId] then
+							shouldLock = true
+						elseif rank >= 2 and def.slot and def.slot ~= "Mount" and AutoEquip and AutoEquip.EvaluateDefForBuild then
+							local ev = upgradeEvalCache[item.defId]
+							if ev == nil then
+								local okE, resE = pcall(AutoEquip.EvaluateDefForBuild, mods, profile, item.defId, def)
+								ev = (okE and type(resE) == "table" and resE.isUpgrade == true) or false
+								upgradeEvalCache[item.defId] = ev
+							end
+							if ev then
+								shouldLock = true
+							end
+						end
+					end
+					if shouldLock then
 						local okLock, res = pcall(function()
 							return mods.Net.func("LockItem"):InvokeServer({ uid = item.uid, locked = true })
 						end)
@@ -5047,6 +5185,49 @@ local function runQuickSellTrash(silent, statusFn)
 		end
 
 		local maxRank = QUICKSELL_TIER_MAX_RANK[sellRarityMode] or 1
+		local reserveFuelUids = {}
+		if DungeonAuto.ReserveUpgradeFuel and mods.Upgrade and mods.Upgrade.tierOf and mods.Upgrade.fuelCost then
+			-- Keep enough unlocked fuel items for any non-maxed equipped armor/offhand/charm/pet upgrade
+			local neededFuel = 0
+			for _, eqUid in pairs(profile.equipped or {}) do
+				local eqIt = mods.Inventory.find(profile, eqUid)
+				local eqDef = eqIt and mods.Items[eqIt.defId]
+				if eqIt and eqDef and eqDef.slot ~= "Weapon" and not eqDef.exotic then
+					local curT = mods.Upgrade.tierOf(eqIt)
+					local maxT = (mods.Constants and mods.Constants.UPGRADE and mods.Constants.UPGRADE.MAX_TIER) or 5
+					if curT < maxT then
+						neededFuel += mods.Upgrade.fuelCost(curT)
+					end
+				end
+			end
+			if neededFuel > 0 and mods.Upgrade.isValidFuel then
+				local fuelCands = {}
+				for _, fIt in ipairs(profile.inventory or {}) do
+					if type(fIt) == "table" and fIt.uid and fIt.defId and (fIt.tier or 0) == 0 and mods.Upgrade.isValidFuel(profile, fIt, "") then
+						local fDef = mods.Items[fIt.defId]
+						local fRank = fDef and AutoLock.GetRarityRank(mods, fDef) or 1
+						if fRank <= 2 and fDef.slot ~= "Pet" and fDef.slot ~= "Mount" then
+							table.insert(fuelCands, { item = fIt, rank = fRank, sell = (mods.Shop and mods.Shop.sellPrice and mods.Shop.sellPrice(fIt.defId)) or 0 })
+						end
+					end
+				end
+				table.sort(fuelCands, function(a, b)
+					if a.rank ~= b.rank then
+						return a.rank < b.rank
+					end
+					return a.sell < b.sell
+				end)
+				local held = 0
+				for _, fc in ipairs(fuelCands) do
+					if held >= neededFuel then
+						break
+					end
+					reserveFuelUids[fc.item.uid] = true
+					held += (mods.Upgrade.fuelValue and mods.Upgrade.fuelValue(fc.item)) or 1
+				end
+			end
+		end
+
 		local byKind = { Weapon = {}, Accessory = {} }
 		local attemptedUids = {}
 		local totalTargets = 0
@@ -5066,6 +5247,7 @@ local function runQuickSellTrash(silent, statusFn)
 					and not equippedUids[item.uid]
 					and not inVanity
 					and not isLocked
+					and not reserveFuelUids[item.uid]
 					and not item.expiresAt
 					and (item.tier or 0) == 0
 					and def.slot
@@ -5356,7 +5538,7 @@ local function scoreEncounterKind(kind, hpRatio)
 			return rw[2]
 		end
 	end
-	local fallback = { Scavenge = 300, Fight = 250, Continue = 200, Quest = 180, Dialogue = 150, StatCheck = 150, ShortRest = 90, Shop = 40, Merchant = 40 }
+	local fallback = { Quest = 350, Scavenge = 300, Fight = 250, Continue = 200, Dialogue = 150, StatCheck = 150, ShortRest = 90, Shop = 40, Merchant = 40 }
 	return fallback[kind] or 10
 end
 
@@ -5489,6 +5671,11 @@ local function pickBestEncounterOffer(mods, offers, hpRatio)
 			local def = mods.Encounters and mods.Encounters[offer.id]
 			local kind = offer.kind or (def and def.kind) or ""
 			local score = scoreEncounterKind(kind, ratio)
+			local oid = string.lower(tostring(offer.id or ""))
+			local oname = string.lower(tostring(offer.name or ""))
+			if DungeonAuto.PrioritizeQuests and (kind == "Quest" or offer.quest ~= nil or string.find(oid, "seraph", 1, true) ~= nil or string.find(oname, "fallen light", 1, true) ~= nil) then
+				score += 2000
+			end
 			if score > bestScore then
 				bestScore = score
 				bestIdx = idx
@@ -5525,6 +5712,16 @@ DungeonTab:AddToggle({
 				task.spawn(pickBestEncounterOffer, mods, DungeonAuto.PendingOffers, DungeonAuto.CurrentHpRatio)
 			end
 		end
+	end,
+})
+
+DungeonTab:AddToggle({
+	Title = "Prioritize Quest Encounters",
+	Description = "Always picks active story/Seraph quest offers (e.g. Sariel) first",
+	Default = DungeonAuto.PrioritizeQuests,
+	Callback = function(enabled)
+		DungeonAuto.PrioritizeQuests = enabled
+		Config.Set("Dungeon_PrioritizeQuests", enabled)
 	end,
 })
 
@@ -6537,8 +6734,77 @@ CarnivalTab:AddButton({
 
 do
 	CarnivalAuto.AutoHatch = Config.Get("AutoHatchEggs", false)
+	CarnivalAuto.AutoFeed = Config.Get("AutoFeedPet", false)
 	CarnivalAuto.HatchLastAt = 0
+	CarnivalAuto.FeedLastAt = 0
 	CarnivalAuto.HatchedUids = {}
+
+	function CarnivalAuto.FeedEquippedSnacks(silent)
+		if not State.Alive or LocalPlayer:GetAttribute("InRun") == true then
+			return 0
+		end
+		local mods = getGameMods()
+		if not mods or not mods.Net or not mods.Items then
+			return 0
+		end
+		local okP, profile = pcall(mods.Net.getProfile)
+		if not okP or type(profile) ~= "table" then
+			return 0
+		end
+		local petUid = profile.equipped and profile.equipped.Pet
+		if not petUid then
+			if not silent then
+				setCarnivalStatus("NO PET EQUIPPED")
+			end
+			return 0
+		end
+		local fed = 0
+		for _, item in ipairs(profile.inventory or {}) do
+			local def = mods.Items[item.defId]
+			if def and (def.snack ~= nil or def.shelf == "Snacks" or def.petFood or def.food) then
+				local cnt = tonumber(item.count) or 1
+				if cnt > 0 then
+					pcall(function()
+						mods.Net.func("FeedPet"):InvokeServer({ uid = petUid, snackId = item.defId, count = cnt })
+					end)
+					fed += cnt
+				end
+			end
+		end
+		CarnivalAuto.FeedLastAt = os.clock()
+		if fed > 0 then
+			setCarnivalStatus("FED PET · " .. tostring(fed) .. " snacks")
+		elseif not silent then
+			setCarnivalStatus("NO SNACKS IN BAG")
+		end
+		return fed
+	end
+
+	function CarnivalAuto.GetEggSummary(mods, profile)
+		local ready, incubating, soonestSec = 0, 0, nil
+		local nowSec = os.time()
+		for _, item in ipairs((profile and profile.inventory) or {}) do
+			if type(item) == "table" and item.uid and item.defId then
+				local def = mods.Items and mods.Items[item.defId]
+				local isEgg = (mods.Hatch and mods.Hatch.isEgg and mods.Hatch.isEgg(item.defId)) or (def and def.category == "Egg")
+				if isEgg then
+					local readyAt = (mods.Hatch and mods.Hatch.readyAt and mods.Hatch.readyAt(item)) or tonumber(item.hatchesAt or item.hatchAt)
+					if readyAt and nowSec >= readyAt then
+						ready += 1
+					else
+						incubating += 1
+						if readyAt then
+							local rem = math.max(1, math.floor(readyAt - nowSec))
+							if not soonestSec or rem < soonestSec then
+								soonestSec = rem
+							end
+						end
+					end
+				end
+			end
+		end
+		return ready, incubating, soonestSec
+	end
 
 	function CarnivalAuto.HatchReadyEggs(silent)
 		if not State.Alive or LocalPlayer:GetAttribute("InRun") == true then
@@ -6565,7 +6831,7 @@ do
 					or (def and def.category == "Egg")
 				if isEgg then
 					local readyBySys = mods.Hatch and mods.Hatch.isReady and mods.Hatch.isReady(item, nowSec)
-					local readyAtTs = tonumber(item.hatchAt or item.hatchesAt)
+					local readyAtTs = (mods.Hatch and mods.Hatch.readyAt and mods.Hatch.readyAt(item)) or tonumber(item.hatchAt or item.hatchesAt)
 					local isReady = readyBySys or (readyAtTs ~= nil and nowSec >= readyAtTs)
 					local lastTried = CarnivalAuto.HatchedUids[item.uid] or 0
 					if isReady and (nowClk - lastTried) >= 4.0 then
@@ -6583,14 +6849,36 @@ do
 		if hatched > 0 then
 			setCarnivalStatus("HATCHED · " .. tostring(hatched) .. " EGGS")
 		elseif not silent then
-			setCarnivalStatus("NO READY EGGS")
+			local readyCnt, incCnt, soonSec = CarnivalAuto.GetEggSummary(mods, profile)
+			if incCnt > 0 and soonSec then
+				local mins = math.floor(soonSec / 60)
+				local secs = soonSec % 60
+				setCarnivalStatus(string.format("INCUBATING %d · NEXT %dm %02ds", incCnt, mins, secs))
+			elseif readyCnt == 0 then
+				setCarnivalStatus("NO EGGS IN BAG")
+			else
+				setCarnivalStatus("EGGS WAIT · RETRY IN 4s")
+			end
 		end
 		return hatched
 	end
 
 	CarnivalTab:AddToggle({
+		Title = "Auto Feed Equipped Pet",
+		Description = "Automatically feeds pet snacks from your bag when in Lobby",
+		Default = CarnivalAuto.AutoFeed,
+		Callback = function(enabled)
+			CarnivalAuto.AutoFeed = enabled
+			Config.Set("AutoFeedPet", enabled)
+			if enabled then
+				task.spawn(CarnivalAuto.FeedEquippedSnacks, true)
+			end
+		end,
+	})
+
+	CarnivalTab:AddToggle({
 		Title = "Auto Hatch Ready Eggs",
-		Description = "Automatically hatches ready incubated eggs when in Lobby",
+		Description = "Automatically hatches ready incubating eggs when in Lobby",
 		Default = CarnivalAuto.AutoHatch,
 		Callback = function(enabled)
 			CarnivalAuto.AutoHatch = enabled
@@ -6602,7 +6890,7 @@ do
 	})
 
 	CarnivalTab:AddButton({
-		Title = "Hatch Ready Eggs Now",
+		Title = "Check / Hatch Ready Eggs Now",
 		Callback = function()
 			CarnivalAuto.HatchReadyEggs(false)
 		end,
@@ -6624,8 +6912,13 @@ trackThread(function()
 			local okCall, okRun = pcall(playCarnivalOnce, CarnivalAuto.Game)
 			task.wait((okCall and okRun) and 1.2 or 2.5)
 		end
-		if CarnivalAuto.AutoHatch and LocalPlayer:GetAttribute("InRun") ~= true and (os.clock() - (CarnivalAuto.HatchLastAt or 0)) >= 10.0 then
-			pcall(CarnivalAuto.HatchReadyEggs, true)
+		if LocalPlayer:GetAttribute("InRun") ~= true then
+			if CarnivalAuto.AutoHatch and (os.clock() - (CarnivalAuto.HatchLastAt or 0)) >= 10.0 then
+				pcall(CarnivalAuto.HatchReadyEggs, true)
+			end
+			if CarnivalAuto.AutoFeed and (os.clock() - (CarnivalAuto.FeedLastAt or 0)) >= 12.0 then
+				pcall(CarnivalAuto.FeedEquippedSnacks, true)
+			end
 		end
 	end
 end)
@@ -6908,19 +7201,136 @@ GearTab:AddSection("Smart Auto Equip")
 
 local AutoEquip = {
 	Enabled = Config.Get("AutoEquip", false),
-	BuildMode = Config.Get("AutoEquipBuild", "Damage"),
+	BuildMode = Config.Get("AutoEquipBuild", "Auto (My Path)"),
 	Element = Config.Get("AutoEquipElement", "Auto (My School)"),
 	IncludePet = Config.Get("AutoEquip_IncludePet", true),
 	DeckAware = Config.Get("AutoEquip_DeckAware", true),
 	RespectCaps = Config.Get("AutoEquip_RespectCaps", true),
+	BlacksmithPotential = Config.Get("AutoEquip_BlacksmithPotential", false),
 	KeepVanity = Config.Get("KeepVanity", false),
 	SavedVanity = Config.Get("VanitySaved", nil),
 	Busy = false,
 	LastRunAt = 0,
 }
 
+if not Config.Get("AutoEquipPathAwareV2", false) then
+	AutoEquip.BuildMode = "Auto (My Path)"
+	Config.Set("AutoEquipBuild", "Auto (My Path)")
+	Config.Set("AutoEquipPathAwareV2", true)
+end
+
 local EQUIP_SLOTS_ORDER = { "Weapon", "Offhand", "Helmet", "Outfit", "Backpack", "Charm1", "Charm2", "Charm3" }
 local RARITY_WEIGHT = { Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5, Mythic = 6, Divine = 7, Exotic = 8 }
+
+local TALENT_PATH_PROFILES = {
+	Tempest = { mode = "Damage", archetype = "StormCrit", label = "Tempest Crit" },
+	ChainLightning = { mode = "Damage", archetype = "RawDamage", label = "Chain Storm" },
+	Verdant = { mode = "Support", archetype = "NatureHeal", label = "Verdant Heal" },
+	WildGrowth = { mode = "Damage", archetype = "DoTDamage", label = "Wild Growth" },
+	Sanctuary = { mode = "Support", archetype = "LightHeal", label = "Sanctuary Heal" },
+	Radiance = { mode = "Damage", archetype = "LightCritHeal", label = "Radiance DPS" },
+	Reaper = { mode = "Damage", archetype = "CritExecute", label = "Reaper Crit" },
+	Hunger = { mode = "Damage", archetype = "DrainBruiser", label = "Hunger Drain" },
+	Cataclysm = { mode = "Damage", archetype = "RawDamage", label = "Cataclysm DPS" },
+	Wildfire = { mode = "Damage", archetype = "DoTDamage", label = "Wildfire Burn" },
+	Glacier = { mode = "Support", archetype = "ShieldTank", label = "Glacier Tank" },
+	WintersGrip = { mode = "Damage", archetype = "DoTDamage", label = "Winter's Grip" },
+	Bulwark = { mode = "Damage", archetype = "TankBruiser", label = "Bulwark" },
+	Riposte = { mode = "Damage", archetype = "TankCounter", label = "Riposte" },
+	Flurry = { mode = "Damage", archetype = "CritTempo", label = "Flurry DPS" },
+	Tailwind = { mode = "Damage", archetype = "HasteTempo", label = "Tailwind Haste" },
+}
+
+local function detectProfilePathId(mods, profile)
+	if type(profile) ~= "table" then
+		return nil
+	end
+	if mods and mods.Talents and type(mods.Talents.pathOf) == "function" then
+		local okP, pid = pcall(mods.Talents.pathOf, profile)
+		if okP and type(pid) == "string" and pid ~= "" then
+			return pid
+		end
+	end
+	if type(profile.talents) == "table" then
+		for _, tId in ipairs(profile.talents) do
+			if type(tId) == "string" then
+				local baseId = string.match(tId, "^([A-Za-z]+)%d*$")
+				if baseId and TALENT_PATH_PROFILES[baseId] then
+					return baseId
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function resolveAutoBuildProfile(mods, profile, schoolOverride)
+	local mySchool = profile and profile.primarySchool
+	local targetSchool = schoolOverride
+	if not targetSchool or targetSchool == "" then
+		targetSchool = (AutoEquip.Element == "Auto (My School)" or AutoEquip.Element == "") and mySchool or AutoEquip.Element
+	end
+	local pathId = detectProfilePathId(mods, profile)
+	local pathInfo = pathId and TALENT_PATH_PROFILES[pathId] or nil
+	local grants = {}
+	if mods and mods.Talents and type(mods.Talents.grants) == "function" and type(profile) == "table" then
+		local okG, gTbl = pcall(mods.Talents.grants, profile)
+		if okG and type(gTbl) == "table" then
+			grants = gTbl
+		end
+	end
+
+	local modeChoice = AutoEquip.BuildMode
+	local resolvedMode
+	if modeChoice == "Support" or modeChoice == "Damage" then
+		resolvedMode = modeChoice
+	else
+		resolvedMode = (pathInfo and pathInfo.mode) or "Damage"
+	end
+
+	local archetype
+	local label
+	if resolvedMode == "Support" then
+		if pathInfo and pathInfo.mode == "Support" then
+			archetype = pathInfo.archetype
+			label = pathInfo.label
+		elseif targetSchool == "Frost" then
+			archetype = "ShieldTank"
+			label = "Tank/Shield"
+		elseif targetSchool == "Nature" then
+			archetype = "NatureHeal"
+			label = "Heal/Sup"
+		elseif targetSchool == "Light" then
+			archetype = "LightHeal"
+			label = "Heal/Sup"
+		else
+			archetype = "GeneralSup"
+			label = "Support"
+		end
+	else
+		if pathInfo and pathInfo.mode == "Damage" then
+			archetype = pathInfo.archetype
+			label = pathInfo.label
+		else
+			archetype = (targetSchool == "Storm" and "StormCrit")
+				or (targetSchool == "Wind" and "HasteTempo")
+				or ((targetSchool == "Flame" or targetSchool == "Shadow" or targetSchool == "Nature" or targetSchool == "Frost") and "DoTDamage")
+				or (targetSchool == "Steel" and "TankBruiser")
+				or (targetSchool == "Light" and "LightCritHeal")
+				or "RawDamage"
+			label = pathInfo and (pathInfo.label .. " (DMG)") or ((targetSchool or "Auto") .. " DPS")
+		end
+	end
+
+	return {
+		mode = resolvedMode,
+		archetype = archetype,
+		label = label,
+		pathId = pathId,
+		school = targetSchool,
+		grants = grants,
+	}
+end
 
 local function getItemElementMatch(mods, defId, statsTbl, targetSchool, schoolDef)
 	if not targetSchool then
@@ -6940,9 +7350,157 @@ local function getItemElementMatch(mods, defId, statsTbl, targetSchool, schoolDe
 	return false
 end
 
-local function scoreBuildStats(mods, stats, bonusHp, targetSchool, schoolDef, buildMode, elementMatchCount, gearQualitySum)
+local function getBlacksmithMaxTier(mods, def)
+	if not def or not def.slot or def.exotic then
+		return nil
+	end
+	if mods and mods.Inventory and mods.Inventory.isStackable and mods.Inventory.isStackable(def.id or "") then
+		return nil
+	end
+	local c = mods and mods.Constants
+	if def.slot == "Weapon" then
+		-- WeaponUpgrade uses tierOf(item) = (item.tier or 0) + 1 up to MAX (6), so stored tier max is MAX - 1 (5)
+		return math.max(1, ((c and c.WEAPON_UPGRADE and c.WEAPON_UPGRADE.MAX) or 6) - 1)
+	end
+	return (c and c.UPGRADE and c.UPGRADE.MAX_TIER) or 5
+end
+
+local function makeBlacksmithMaxCopy(mods, item, def, includeReforge)
+	if type(item) ~= "table" then
+		return item
+	end
+	def = def or (mods and mods.Items and mods.Items[item.defId])
+	if not def then
+		return item
+	end
+	local copyItem = {}
+	for k, v in pairs(item) do
+		copyItem[k] = v
+	end
+	local maxTier = getBlacksmithMaxTier(mods, def)
+	if maxTier and (copyItem.tier or 0) < maxTier then
+		copyItem.tier = maxTier
+	end
+	if includeReforge ~= false and mods and mods.Inventory and mods.Inventory.rolls and mods.Inventory.rolls(item.defId) and type(def.stats) == "table" then
+		local spread = (mods.Constants and mods.Constants.GEAR_ROLL and mods.Constants.GEAR_ROLL.SPREAD) or 0.10
+		local roundFn = mods.Inventory.roundRoll
+		local existing = type(item.rolledStats) == "table" and item.rolledStats or {}
+		local bestRolls = {}
+		for statKey, baseVal in pairs(def.stats) do
+			if type(baseVal) == "number" and baseVal ~= 0 then
+				local targetRoll = math.abs(baseVal) * spread
+				if roundFn then
+					targetRoll = roundFn(statKey, targetRoll)
+				end
+				local curRoll = tonumber(existing[statKey]) or -math.huge
+				if curRoll > targetRoll then
+					targetRoll = curRoll
+				end
+				if targetRoll ~= 0 then
+					bestRolls[statKey] = targetRoll
+				end
+			end
+		end
+		copyItem.rolledStats = bestRolls
+	end
+	return copyItem
+end
+
+local function getBlacksmithEnhanceCounts(mods, plan, slotsOrder)
+	local upgLeft, rollLeft = 0, 0
+	if not mods or type(plan) ~= "table" then
+		return upgLeft, rollLeft
+	end
+	local spread = (mods.Constants and mods.Constants.GEAR_ROLL and mods.Constants.GEAR_ROLL.SPREAD) or 0.10
+	local inv = mods.Inventory
+	for _, slot in ipairs(slotsOrder) do
+		local rec = plan[slot]
+		if rec and rec.item and rec.def and rec.def.exotic ~= true then
+			local item = rec.item
+			local def = rec.def
+			local maxTier = getBlacksmithMaxTier(mods, def)
+			if maxTier and (item.tier or 0) < maxTier then
+				upgLeft += 1
+			end
+			local canRoll = (mods.Reforge and mods.Reforge.canReforge and mods.Reforge.canReforge(item.defId))
+				or (inv and inv.rolls and inv.rolls(item.defId))
+			if canRoll and type(def.stats) == "table" then
+				local rolled = type(item.rolledStats) == "table" and item.rolledStats or nil
+				if not rolled or next(rolled) == nil then
+					rollLeft += 1
+				elseif inv and inv.rollOf then
+					local sumRatio, statCnt = 0, 0
+					for sk, bv in pairs(def.stats) do
+						if type(bv) == "number" and bv > 0 then
+							local rVal = tonumber(rolled[sk]) or 0
+							local rawAmt = inv.rollOf(def, sk, rVal)
+							sumRatio += (rawAmt / bv)
+							statCnt += 1
+						end
+					end
+					if statCnt > 0 and (sumRatio / statCnt) < (spread * 0.60) then
+						rollLeft += 1
+					end
+				end
+			end
+		end
+	end
+	return upgLeft, rollLeft
+end
+
+local function deriveBuildTotals(mods, profile, invList, eqMap, targetSchool, forceBlacksmithMax)
+	local evalInv = invList
+	if forceBlacksmithMax and type(invList) == "table" then
+		evalInv = {}
+		for _, it in ipairs(invList) do
+			table.insert(evalInv, makeBlacksmithMaxCopy(mods, it, nil, true))
+		end
+	end
+	local planProfile = {
+		inventory = evalInv,
+		equipped = eqMap,
+		level = profile and profile.level or 1,
+		primarySchool = targetSchool or (profile and profile.primarySchool),
+		talents = profile and profile.talents or nil,
+	}
+	if mods and mods.CharacterStats and type(mods.CharacterStats.derive) == "function" then
+		local okD, derived = pcall(mods.CharacterStats.derive, planProfile)
+		if okD and type(derived) == "table" then
+			local st = type(derived.stats) == "table" and derived.stats or (type(derived.scaling) == "table" and derived.scaling or nil)
+			if st then
+				return st, tonumber(derived.maxHp) or 0, true
+			end
+		end
+	end
+	local okS, st = pcall(mods.Inventory.equippedStats, planProfile)
+	local okH, hp = pcall(mods.Inventory.equippedMaxHp, planProfile)
+	return (okS and type(st) == "table") and st or {}, (okH and type(hp) == "number") and hp or 0, false
+end
+
+local ARCHETYPE_SYNERGY = {
+	StormCrit = { crit = 250, critDmg = 110, critPipBoost = 0.10, pierce = 40 },
+	CritExecute = { crit = 180, critDmg = 115, pierce = 130 },
+	LightCritHeal = { crit = 185, heal = 260, critDmg = 45 },
+	DoTDamage = { statusPow = 320, crit = 35 },
+	DrainBruiser = { hp = 0.45, allRes = 170, statusPow = 150 },
+	TankBruiser = { block = 350, blockStr = 130, hp = 0.35, allRes = 120 },
+	TankCounter = { block = 520, blockStr = 220, allRes = 240, hp = 0.50 },
+	CritTempo = { crit = 120, haste = 260 },
+	HasteTempo = { haste = 560, crit = 40 },
+	RawDamage = { dmg = 45, pierce = 35 },
+}
+
+local function scoreBuildStats(mods, stats, bonusHp, targetSchool, schoolDef, buildSpecOrMode, elementMatchCount, gearQualitySum, includesTotalHp)
+	local buildMode = (type(buildSpecOrMode) == "table") and buildSpecOrMode.mode or ((buildSpecOrMode == "Support") and "Support" or "Damage")
+	local archetype = (type(buildSpecOrMode) == "table") and buildSpecOrMode.archetype or nil
+	local grants = (type(buildSpecOrMode) == "table" and type(buildSpecOrMode.grants) == "table") and buildSpecOrMode.grants or nil
 	local isSupport = (buildMode == "Support")
-	local caps = (AutoEquip.RespectCaps and mods and mods.Constants and mods.Constants.STAT_CAPS) or nil
+	local caps = (AutoEquip.RespectCaps and mods and mods.Constants and (mods.Constants.CAPS or mods.Constants.STAT_CAPS)) or nil
+	local critConst = (mods and mods.Constants and mods.Constants.CRIT) or nil
+	local baseCritMult = (critConst and tonumber(critConst.BASE_DAMAGE)) or 1.5
+	local critChanceCap = (caps and tonumber(caps.CritChance)) or (critConst and tonumber(critConst.CHANCE_CAP)) or 0.6
+	local critMultCap = (caps and tonumber(caps.CritDamage)) or (critConst and tonumber(critConst.DAMAGE_CAP)) or 3.0
+
 	local function eff(statKey, rawVal)
 		rawVal = tonumber(rawVal) or 0
 		if rawVal <= 0 or not caps then
@@ -6950,84 +7508,110 @@ local function scoreBuildStats(mods, stats, bonusHp, targetSchool, schoolDef, bu
 		end
 		local cap = caps[statKey]
 		if type(cap) == "number" and cap > 0 and rawVal > cap then
-			return cap + (rawVal - cap) * 0.03
+			return cap + (rawVal - cap) * 0.01
 		end
 		return rawVal
 	end
 
-	local score = 0
+	local totalHp = includesTotalHp and math.max(tonumber(bonusHp) or 0, tonumber(stats.MaxHealth) or 0) or ((tonumber(stats.MaxHealth) or 0) + (tonumber(bonusHp) or 0))
 	local healBonus = eff("HealingBonus", stats.HealingBonus)
 	local powerPip = eff("PowerPipChance", stats.PowerPipChance)
-	local allRes = stats.AllResistance or 0
+	local allRes = tonumber(stats.AllResistance) or 0
 	local statusRes = eff("StatusResistance", stats.StatusResistance)
 	local blockChc = eff("BlockChance", stats.BlockChance)
 	local blockStr = eff("BlockStrength", stats.BlockStrength)
 	local haste = eff("Haste", stats.Haste)
 	local acc = eff("Accuracy", stats.Accuracy)
-	local critChc = eff("CritChance", stats.CritChance)
-	local critDmg = eff("CritDamage", stats.CritDamage)
-	local pierce = eff("Pierce", stats.Pierce)
+	local rawCritChc = math.max(0, tonumber(stats.CritChance) or 0)
+	local critChc = caps and math.min(critChanceCap, rawCritChc) or rawCritChc
+	local excessCritChc = caps and math.max(0, rawCritChc - critChanceCap) or 0
+	local rawCritBonus = math.max(0, tonumber(stats.CritDamage) or 0)
+	local critMult = caps and math.min(critMultCap, baseCritMult + rawCritBonus) or (baseCritMult + rawCritBonus)
+	local excessCritMult = caps and math.max(0, (baseCritMult + rawCritBonus) - critMultCap) or 0
 	local statusPow = eff("StatusPower", stats.StatusPower)
 
-	if isSupport then
-		-- Support Build: maximize Healing (up to cap), Power Pip (up to 100%), Max HP, Resists, Block & Haste
-		score += healBonus * 1450
-		score += powerPip * 860
-		score += ((stats.MaxHealth or 0) + (bonusHp or 0)) * 2.8
-		score += eff("StatusResistance", allRes + statusRes) * 520 + allRes * 240
-		score += blockChc * 460 + blockStr * 180
-		score += haste * 340
-		score += acc * 260
-		if schoolDef then
-			local schRes = eff(schoolDef.resistance, (stats[schoolDef.resistance] or 0) + allRes) - eff(schoolDef.resistance, allRes)
-			score += math.max(0, schRes) * 420
-			score += (stats[schoolDef.damageBonus] or 0) * 220
-			score += (stats[schoolDef.pierce] or 0) * 110
-		end
-		score += ((stats.AllDamage or 0) + (stats.OwnDamage or 0)) * 180
-		score += critChc * 90 + statusPow * 120
-	else
-		-- Damage Build: maximize School/All Damage, Pierce (up to cap), Crit (up to cap), CritDmg, Accuracy & Power Pip
-		if schoolDef then
-			score += (stats[schoolDef.damageBonus] or 0) * 1400
-			local schPierce = eff("Pierce", (stats[schoolDef.pierce] or 0) + pierce) - pierce
-			score += math.max(0, schPierce) * 780
-			score += eff(schoolDef.resistance, (stats[schoolDef.resistance] or 0) + allRes) * 150
-		end
-		score += ((stats.AllDamage or 0) + (stats.OwnDamage or 0)) * 1250
-		score += pierce * 680
-		score += critChc * 580
-		score += powerPip * 540
-		score += critDmg * 340
-		score += acc * 320
-		score += haste * 220
-		score += allRes * 150
-		score += blockChc * 110 + blockStr * 40
-		score += statusRes * 90 + statusPow * 80
-		score += healBonus * ((targetSchool == "Light" or targetSchool == "Nature") and 240 or 60)
-		score += ((stats.MaxHealth or 0) + (bonusHp or 0)) * 0.9
+	local schDmg = (schoolDef and (tonumber(stats[schoolDef.damageBonus]) or 0) or 0) + (tonumber(stats.AllDamage) or 0) + (tonumber(stats.OwnDamage) or 0)
+	local schPierce = schoolDef and (tonumber(stats[schoolDef.pierce]) or 0) or 0
+	local totalPierce = caps and math.min(caps.Pierce or 0.4, (tonumber(stats.Pierce) or 0) + schPierce) or ((tonumber(stats.Pierce) or 0) + schPierce)
+	local schRes = schoolDef and (tonumber(stats[schoolDef.resistance]) or 0) or 0
+	local resCap = (caps and schoolDef and caps[schoolDef.resistance]) or 0.6
+	local totalSchRes = caps and math.min(resCap, allRes + schRes) or (allRes + schRes)
 
-		-- Small fallback credit for off-element offensive stats
+	local score = 0
+	if isSupport then
+		-- Support Build: Verdant (Nature) & Sanctuary (Light) prioritize 100% Heal * 100% PowerPip -> Resist/HP -> Offense once capped;
+		-- Glacier (Frost Tank) balances HealingBonus (shield growth) + MaxHP + Resists + Block + FrostDamage
+		local isTankSup = (archetype == "ShieldTank")
+		local healMult = 1 + healBonus
+		local pipFactor = 1 + math.min(1, powerPip) * (isTankSup and 0.45 or 0.55)
+		score += (healMult * pipFactor) * (isTankSup and 1200 or 2300)
+		score += totalHp * (isTankSup and 2.8 or 2.2)
+		score += (math.min(caps and (caps.StatusResistance or 0.7) or 0.7, statusRes) + allRes) * (isTankSup and 580 or 540)
+		score += totalSchRes * (isTankSup and 420 or 380)
+		score += blockChc * (isTankSup and 480 or 420) + blockStr * (isTankSup and 180 or 160)
+		score += haste * 380
+		score += acc * 260
+		score += schDmg * (isTankSup and 420 or 240) + totalPierce * (isTankSup and 200 or 140)
+		score += critChc * 110 + statusPow * 110
+	else
+		-- Damage Build: true multiplicative (1 + SchoolDmg) * ((1 - Crit) + Crit * CritMult) + PowerPip & talent-path synergies
+		local syn = (archetype and ARCHETYPE_SYNERGY[archetype]) or {}
+		local critPipBoost = syn.critPipBoost or (grants and grants.energyOnCrit and 0.10 or 0)
+		local expectedHitMult = (1 + schDmg) * ((1 - critChc) + critChc * critMult)
+		local pipFactor = 1 + math.min(1, powerPip + critChc * critPipBoost) * 0.40
+		local pierceMult = 1 + totalPierce * 0.65
+
+		local schoolSynergy = 0
+		schoolSynergy += critChc * (syn.crit or 0)
+		schoolSynergy += (critMult - baseCritMult) * (syn.critDmg or 0)
+		schoolSynergy += totalPierce * (syn.pierce or 0)
+		schoolSynergy += haste * (syn.haste or 0)
+		schoolSynergy += statusPow * (syn.statusPow or 0)
+		schoolSynergy += blockChc * (syn.block or 0) + blockStr * (syn.blockStr or 0)
+		schoolSynergy += healBonus * (syn.heal or 0)
+		schoolSynergy += schDmg * (syn.dmg or 0)
+		schoolSynergy += allRes * (syn.allRes or 0)
+		schoolSynergy += totalHp * (syn.hp or 0)
+
+		if targetSchool == "Nature" and archetype == "DoTDamage" then
+			-- Wild Growth step 4 grants +8% HealingBonus and bleeds
+			schoolSynergy += healBonus * 140
+		end
+		if grants and grants.healOnDamage and (syn.heal or 0) == 0 then
+			schoolSynergy += healBonus * 180
+		end
+
+		score += (expectedHitMult * pipFactor * pierceMult) * 1000
+		score += acc * 280
+		score += haste * 210
+		score += schoolSynergy
+		score += healBonus * ((targetSchool == "Light" or targetSchool == "Nature") and 110 or 35)
+		score += totalSchRes * 130 + allRes * 160 + statusRes * 80
+		score += blockChc * 95 + blockStr * 35
+		score += statusPow * 65
+		score += totalHp * 0.75
+		score += (excessCritChc + excessCritMult) * 12
+
 		for statName, val in pairs(stats) do
 			if type(val) == "number" and val > 0 then
 				if string.find(statName, "Damage$") and statName ~= "AllDamage" and statName ~= "OwnDamage" and statName ~= "CritDamage" and (not schoolDef or statName ~= schoolDef.damageBonus) then
-					score += val * 30
+					score += val * 25
 				elseif string.find(statName, "Pierce$") and statName ~= "Pierce" and (not schoolDef or statName ~= schoolDef.pierce) then
-					score += val * 20
+					score += val * 18
 				elseif string.find(statName, "Resistance$") and statName ~= "AllResistance" and statName ~= "StatusResistance" and (not schoolDef or statName ~= schoolDef.resistance) then
-					score += val * 12
+					score += val * 10
 				end
 			end
 		end
 	end
 
 	-- Soft element compatibility & gear tier tiebreakers
-	score += (elementMatchCount or 0) * (isSupport and 45 or 65)
+	score += (elementMatchCount or 0) * (isSupport and 6 or 65)
 	score += (gearQualitySum or 0)
 	return score
 end
 
-local function evaluatePlanLoadout(mods, profile, chosenItems, slotsOrder, targetSchool, schoolDef, buildMode)
+local function evaluatePlanLoadout(mods, profile, chosenItems, slotsOrder, targetSchool, schoolDef, buildSpec)
 	local fakeInv = {}
 	local fakeEq = {}
 	local elemMatches = 0
@@ -7045,23 +7629,8 @@ local function evaluatePlanLoadout(mods, profile, chosenItems, slotsOrder, targe
 		end
 	end
 
-	local planProfile = {
-		inventory = fakeInv,
-		equipped = fakeEq,
-		level = profile.level or 1,
-		primarySchool = targetSchool or profile.primarySchool,
-	}
-
-	local okStats, stats = pcall(mods.Inventory.equippedStats, planProfile)
-	local okHp, bonusHp = pcall(mods.Inventory.equippedMaxHp, planProfile)
-	if not okStats or type(stats) ~= "table" then
-		stats = {}
-	end
-	if not okHp or type(bonusHp) ~= "number" then
-		bonusHp = 0
-	end
-
-	local totalScore = scoreBuildStats(mods, stats, bonusHp, targetSchool, schoolDef, buildMode, elemMatches, qualitySum)
+	local stats, bonusHp, includesTotalHp = deriveBuildTotals(mods, profile, fakeInv, fakeEq, targetSchool, AutoEquip.BlacksmithPotential)
+	local totalScore = scoreBuildStats(mods, stats, bonusHp, targetSchool, schoolDef, buildSpec, elemMatches, qualitySum, includesTotalHp)
 
 	-- Deck & granted equipment ability compatibility via Loadout.gearFor / Loadout.meets
 	if AutoEquip.DeckAware and mods.Loadout and mods.Abilities then
@@ -7074,14 +7643,14 @@ local function evaluatePlanLoadout(mods, profile, chosenItems, slotsOrder, targe
 						if ab and ab.requires and mods.Loadout.meets then
 							local okMeet, canUse = pcall(mods.Loadout.meets, ab, gearInfo)
 							if okMeet and not canUse then
-								totalScore -= 350 * (tonumber(cnt) or 1)
+								totalScore -= 450 * (tonumber(cnt) or 1)
 							end
 						end
 					end
 				end
 			end
 			if type(gearInfo.grants) == "table" then
-				local isSupport = (buildMode == "Support")
+				local isSupport = (type(buildSpec) == "table" and buildSpec.mode == "Support") or (buildSpec == "Support")
 				for cardId, cnt in pairs(gearInfo.grants) do
 					local ab = mods.Abilities[cardId]
 					local c = math.min(3, tonumber(cnt) or 1)
@@ -7100,7 +7669,7 @@ local function evaluatePlanLoadout(mods, profile, chosenItems, slotsOrder, targe
 		end
 	end
 
-	return totalScore, stats, bonusHp
+	return totalScore, stats, bonusHp, includesTotalHp
 end
 
 function AutoEquip.ApplySavedVanity(mods, profile, silent)
@@ -7145,6 +7714,89 @@ function AutoEquip.ApplySavedVanity(mods, profile, silent)
 	return applied
 end
 
+local function optimizeSlotPlanSeed(mods, profile, slotCandidates, slotsOrder, targetSchool, schoolDef, buildSpec, seedField)
+	local plan = {}
+	local usedUids = {}
+	for _, slot in ipairs(slotsOrder) do
+		local list = slotCandidates[slot]
+		if #list > 0 then
+			local chosen = nil
+			if seedField then
+				local bestVal = -math.huge
+				for _, rec in ipairs(list) do
+					if not usedUids[rec.item.uid] then
+						local v = tonumber(rec[seedField]) or 0
+						if v > bestVal then
+							bestVal = v
+							chosen = rec
+						end
+					end
+				end
+			end
+			if not chosen then
+				for _, rec in ipairs(list) do
+					if not usedUids[rec.item.uid] then
+						chosen = rec
+						break
+					end
+				end
+			end
+			if chosen then
+				plan[slot] = chosen
+				usedUids[chosen.item.uid] = true
+			end
+		end
+	end
+
+	local bestPlanScore, bestStats, bestHp, bestIncludesHp = evaluatePlanLoadout(mods, profile, plan, slotsOrder, targetSchool, schoolDef, buildSpec)
+	for _ = 1, 3 do
+		local improved = false
+		for _, slot in ipairs(slotsOrder) do
+			local prevRec = plan[slot]
+			for _, cand in ipairs(slotCandidates[slot]) do
+				if not prevRec or cand.item.uid ~= prevRec.item.uid then
+					local otherSlot = nil
+					if usedUids[cand.item.uid] then
+						for _, s2 in ipairs(slotsOrder) do
+							if s2 ~= slot and plan[s2] and plan[s2].item.uid == cand.item.uid then
+								otherSlot = s2
+								break
+							end
+						end
+					end
+					local canPlace = (not otherSlot) or (not prevRec) or mods.Inventory.fits(prevRec.def, otherSlot)
+					if canPlace then
+						local otherPrev = otherSlot and plan[otherSlot] or nil
+						plan[slot] = cand
+						if otherSlot then
+							plan[otherSlot] = prevRec
+						end
+						local sc, stTbl, hpVal, incHp = evaluatePlanLoadout(mods, profile, plan, slotsOrder, targetSchool, schoolDef, buildSpec)
+						if sc > (bestPlanScore + 0.0005) then
+							bestPlanScore, bestStats, bestHp, bestIncludesHp = sc, stTbl, hpVal, incHp
+							if prevRec and not otherSlot then
+								usedUids[prevRec.item.uid] = nil
+							end
+							usedUids[cand.item.uid] = true
+							prevRec = cand
+							improved = true
+						else
+							plan[slot] = prevRec
+							if otherSlot then
+								plan[otherSlot] = otherPrev
+							end
+						end
+					end
+				end
+			end
+		end
+		if not improved then
+			break
+		end
+	end
+	return plan, bestPlanScore, bestStats, bestHp, bestIncludesHp
+end
+
 local function runSmartAutoEquip(silentNoChange)
 	if AutoEquip.Busy then
 		return
@@ -7169,24 +7821,11 @@ local function runSmartAutoEquip(silentNoChange)
 
 		local Inventory = mods.Inventory
 		local mySchool = profile.primarySchool
-		local targetSchool = (AutoEquip.Element == "Auto (My School)" or AutoEquip.Element == "") and mySchool or AutoEquip.Element
-		local buildMode = (AutoEquip.BuildMode == "Support") and "Support" or "Damage"
+		local buildSpec = resolveAutoBuildProfile(mods, profile)
+		local targetSchool = buildSpec.school or mySchool
 		local schoolDef = targetSchool and mods.Schools.defs[targetSchool]
 		local playerLevel = profile.level or 1
 		local equipped = profile.equipped or {}
-
-		local deckNeedsShield = false
-		if AutoEquip.DeckAware and type(profile.deck) == "table" and mods.Abilities then
-			for cardId, cnt in pairs(profile.deck) do
-				if (tonumber(cnt) or 0) > 0 then
-					local ab = mods.Abilities[cardId]
-					if ab and type(ab.requires) == "table" and ab.requires.offhandKind == "Shield" then
-						deckNeedsShield = true
-						break
-					end
-				end
-			end
-		end
 
 		local slotsOrder = {}
 		if mods.Enums and type(mods.Enums.EquipSlotOrder) == "table" and #mods.Enums.EquipSlotOrder > 0 then
@@ -7205,38 +7844,47 @@ local function runSmartAutoEquip(silentNoChange)
 			end
 		end
 
-		-- Step 1: Score every legal gear piece per slot across inventory
+		-- Step 1: Score every legal gear piece per slot & keep build-defining outliers (Crit / Heal / Pip / Dmg / Defense / Equipped)
+		local LevelGate = mods.LevelGate
 		local slotCandidates = {}
 		local currentBySlot = {}
 		for _, slot in ipairs(slotsOrder) do
 			local cands = {}
+			local bestSpecial = {}
 			for _, item in ipairs(profile.inventory or {}) do
 				local def = mods.Items[item.defId]
-				local skipShieldCards = (buildMode == "Damage" and slot == "Offhand" and def and def.kind == "Shield" and targetSchool ~= "Steel" and not deckNeedsShield)
+				local canWearLv = LevelGate and LevelGate.canWear and LevelGate.canWear(playerLevel, item.defId) or ((def and def.minLevel or 1) <= playerLevel)
 				if def
 					and def.category ~= "Card"
-					and not skipShieldCards
 					and Inventory.fits(def, slot)
 					and Inventory.schoolCanWear(mySchool, item.defId)
 					and not Inventory.expired(item)
-					and (def.minLevel or 1) <= playerLevel
+					and canWearLv
 				then
-					local singleProf = {
-						inventory = { item },
-						equipped = { [slot] = item.uid },
-						level = playerLevel,
-						primarySchool = targetSchool or mySchool,
-					}
-					local okS, st = pcall(Inventory.equippedStats, singleProf)
-					local okH, hp = pcall(Inventory.equippedMaxHp, singleProf)
-					st = (okS and type(st) == "table") and st or (def.stats or {})
-					hp = (okH and type(hp) == "number") and hp or 0
+					local usePotential = AutoEquip.BlacksmithPotential
+					local evalItem = usePotential and makeBlacksmithMaxCopy(mods, item, def, true) or item
+					local singleSt, singleHp, singleIncludesHp = deriveBuildTotals(mods, profile, { evalItem }, { [slot] = evalItem.uid }, targetSchool, false)
+					local okRaw, rawSt = pcall(Inventory.equippedStats, { inventory = { evalItem }, equipped = { [slot] = evalItem.uid }, level = playerLevel, primarySchool = targetSchool or mySchool })
+					local rawCheck = (okRaw and type(rawSt) == "table") and rawSt or singleSt
+					local okRawHp, rawHpVal = pcall(Inventory.equippedMaxHp, { inventory = { evalItem }, equipped = { [slot] = evalItem.uid }, level = playerLevel, primarySchool = targetSchool or mySchool })
+					local itemHpVal = (okRawHp and type(rawHpVal) == "number") and rawHpVal or (tonumber(rawCheck.MaxHealth) or 0)
 
-					local isSame = getItemElementMatch(mods, item.defId, st, targetSchool, schoolDef)
+					local isSame = getItemElementMatch(mods, item.defId, rawCheck, targetSchool, schoolDef)
 					local rarityVal = RARITY_WEIGHT[def.rarity] or 1
-					local quality = (rarityVal * 0.4) + ((item.tier or 0) * 0.8) + ((equipped[slot] == item.uid) and 0.002 or 0)
-					local itemScore = scoreBuildStats(mods, st, hp, targetSchool, schoolDef, buildMode, isSame and 1 or 0, quality)
-					-- Check weapon/offhand deck compatibility at single-item stage so compatible weapons stay in top 7
+					-- Include actual tier, weapon attack tier power, and positive Reforge share as tiebreakers (plus small Blacksmith-enhanceable nudge)
+					local rollQual = 0
+					if mods.Reforge and mods.Reforge.shares and type(item.rolledStats) == "table" then
+						local okSh, shTbl = pcall(mods.Reforge.shares, item.defId, item.rolledStats)
+						if okSh and type(shTbl) == "table" then
+							for _, rv in pairs(shTbl) do
+								rollQual += (tonumber(rv) or 0)
+							end
+						end
+					end
+					local canEnhanceBs = (getBlacksmithMaxTier(mods, def) ~= nil) and 0.15 or 0
+					local wpnPwr = (def.slot == "Weapon" and mods.WeaponUpgrade and mods.WeaponUpgrade.power and select(2, pcall(mods.WeaponUpgrade.power, item.defId, (item.tier or 0) + 1, profile, def.rarity))) or 0
+					local quality = (rarityVal * 0.4) + ((item.tier or 0) * 1.2) + (rollQual * 2.5) + ((tonumber(wpnPwr) or 0) * 0.05) + canEnhanceBs + ((equipped[slot] == item.uid) and 0.002 or 0)
+					local itemScore = scoreBuildStats(mods, singleSt, singleHp, targetSchool, schoolDef, buildSpec, isSame and 1 or 0, quality, singleIncludesHp)
 					if AutoEquip.DeckAware and (slot == "Weapon" or slot == "Offhand") and mods.Loadout and type(profile.deck) == "table" and mods.Abilities then
 						local okG, gInfo = pcall(mods.Loadout.gearFor, { [slot] = item.uid }, { item })
 						if okG and type(gInfo) == "table" then
@@ -7248,21 +7896,32 @@ local function runSmartAutoEquip(silentNoChange)
 									then
 										local okM, m = pcall(mods.Loadout.meets, ab, gInfo)
 										if okM and not m then
-											itemScore -= 350 * (tonumber(cnt) or 1)
+											itemScore -= 450 * (tonumber(cnt) or 1)
 										end
 									end
 								end
 							end
 						end
 					end
+					local schDmgRaw = (schoolDef and (tonumber(rawCheck[schoolDef.damageBonus]) or 0) or 0) + (tonumber(rawCheck.AllDamage) or 0) + (tonumber(rawCheck.OwnDamage) or 0)
 					local rec = {
 						item = item,
 						def = def,
 						sameElement = isSame,
 						quality = quality,
 						score = itemScore,
+						critVal = (tonumber(rawCheck.CritChance) or 0) * 2 + (tonumber(rawCheck.CritDamage) or 0),
+						healVal = (tonumber(rawCheck.HealingBonus) or 0) * 2 + (tonumber(rawCheck.PowerPipChance) or 0),
+						pipVal = (tonumber(rawCheck.PowerPipChance) or 0),
+						dmgVal = schDmgRaw,
+						defVal = (tonumber(rawCheck.AllResistance) or 0) * 300 + (tonumber(rawCheck.BlockChance) or 0) * 200 + (tonumber(rawCheck.Haste) or 0) * 180 + itemHpVal * 0.5,
 					}
 					table.insert(cands, rec)
+					for _, key in ipairs({ "critVal", "healVal", "pipVal", "dmgVal", "defVal" }) do
+						if rec[key] > 0 and (not bestSpecial[key] or rec[key] > bestSpecial[key][key]) then
+							bestSpecial[key] = rec
+						end
+					end
 					if equipped[slot] == item.uid then
 						currentBySlot[slot] = rec
 					end
@@ -7271,12 +7930,18 @@ local function runSmartAutoEquip(silentNoChange)
 			table.sort(cands, function(a, b)
 				return a.score > b.score
 			end)
-			-- Keep top 7 candidates + currently equipped piece for whole-build optimization
 			local trimmed = {}
 			local keptUids = {}
-			for i = 1, math.min(7, #cands) do
+			for i = 1, math.min(12, #cands) do
 				table.insert(trimmed, cands[i])
 				keptUids[cands[i].item.uid] = true
+			end
+			for _, key in ipairs({ "critVal", "healVal", "pipVal", "dmgVal", "defVal" }) do
+				local spRec = bestSpecial[key]
+				if spRec and not keptUids[spRec.item.uid] then
+					table.insert(trimmed, spRec)
+					keptUids[spRec.item.uid] = true
+				end
 			end
 			if currentBySlot[slot] and not keptUids[currentBySlot[slot].item.uid] then
 				table.insert(trimmed, currentBySlot[slot])
@@ -7284,64 +7949,20 @@ local function runSmartAutoEquip(silentNoChange)
 			slotCandidates[slot] = trimmed
 		end
 
-		-- Step 2: Initial conflict-free greedy build assignment across all slots
-		local plan = {}
-		local usedUids = {}
-		for _, slot in ipairs(slotsOrder) do
-			for _, rec in ipairs(slotCandidates[slot]) do
-				if not usedUids[rec.item.uid] then
-					plan[slot] = rec
-					usedUids[rec.item.uid] = true
-					break
-				end
-			end
+		-- Step 2 & 3: Multi-seed whole-loadout coordinate ascent to avoid local optima around Crit/Heal caps
+		local seeds = { nil }
+		if buildSpec.mode == "Support" then
+			table.insert(seeds, "healVal")
+			table.insert(seeds, "dmgVal")
+		else
+			table.insert(seeds, "critVal")
+			table.insert(seeds, "dmgVal")
 		end
-
-		-- Step 3: Coordinate-ascent whole-loadout refinement (stat caps + deck synergy + set interactions)
-		local bestPlanScore, bestStats, bestHp = evaluatePlanLoadout(mods, profile, plan, slotsOrder, targetSchool, schoolDef, buildMode)
-		for _ = 1, 3 do
-			local improved = false
-			for _, slot in ipairs(slotsOrder) do
-				local prevRec = plan[slot]
-				for _, cand in ipairs(slotCandidates[slot]) do
-					if not prevRec or cand.item.uid ~= prevRec.item.uid then
-						local otherSlot = nil
-						if usedUids[cand.item.uid] then
-							for _, s2 in ipairs(slotsOrder) do
-								if s2 ~= slot and plan[s2] and plan[s2].item.uid == cand.item.uid then
-									otherSlot = s2
-									break
-								end
-							end
-						end
-						local canPlace = (not otherSlot) or (not prevRec) or Inventory.fits(prevRec.def, otherSlot)
-						if canPlace then
-							local otherPrev = otherSlot and plan[otherSlot] or nil
-							plan[slot] = cand
-							if otherSlot then
-								plan[otherSlot] = prevRec
-							end
-							local sc, stTbl, hpVal = evaluatePlanLoadout(mods, profile, plan, slotsOrder, targetSchool, schoolDef, buildMode)
-							if sc > (bestPlanScore + 0.0005) then
-								bestPlanScore, bestStats, bestHp = sc, stTbl, hpVal
-								if prevRec and not otherSlot then
-									usedUids[prevRec.item.uid] = nil
-								end
-								usedUids[cand.item.uid] = true
-								prevRec = cand
-								improved = true
-							else
-								plan[slot] = prevRec
-								if otherSlot then
-									plan[otherSlot] = otherPrev
-								end
-							end
-						end
-					end
-				end
-			end
-			if not improved then
-				break
+		local plan, bestPlanScore, bestStats, bestHp, bestIncludesHp = nil, -math.huge, {}, 0, false
+		for _, seedField in ipairs(seeds) do
+			local pSeed, scSeed, stSeed, hpSeed, incSeed = optimizeSlotPlanSeed(mods, profile, slotCandidates, slotsOrder, targetSchool, schoolDef, buildSpec, seedField)
+			if not plan or scSeed > bestPlanScore then
+				plan, bestPlanScore, bestStats, bestHp, bestIncludesHp = pSeed, scSeed, stSeed, hpSeed, incSeed
 			end
 		end
 
@@ -7349,24 +7970,10 @@ local function runSmartAutoEquip(silentNoChange)
 		local changes = 0
 		for _, slot in ipairs(slotsOrder) do
 			local chosen = plan[slot] and plan[slot].item or nil
-			if chosen then
-				if equipped[slot] ~= chosen.uid then
-					mods.Net.fireServer("EquipItem", { uid = chosen.uid, slot = slot })
-					changes += 1
-					task.wait(0.06)
-				end
-			elseif buildMode == "Damage" and slot == "Offhand" and equipped.Offhand and targetSchool ~= "Steel" and not deckNeedsShield then
-				for _, item in ipairs(profile.inventory or {}) do
-					if item.uid == equipped.Offhand then
-						local def = mods.Items[item.defId]
-						if def and def.kind == "Shield" then
-							mods.Net.fireServer("UnequipItem", { slot = "Offhand" })
-							changes += 1
-							task.wait(0.06)
-						end
-						break
-					end
-				end
+			if chosen and equipped[slot] ~= chosen.uid then
+				mods.Net.fireServer("EquipItem", { uid = chosen.uid, slot = slot })
+				changes += 1
+				task.wait(0.06)
 			end
 		end
 
@@ -7376,18 +7983,37 @@ local function runSmartAutoEquip(silentNoChange)
 			AutoEquip.ApplySavedVanity(mods, okNew and newProf or profile, true)
 		end
 
+		local upgLeft, rollLeft = getBlacksmithEnhanceCounts(mods, plan, slotsOrder)
+		local bsTag = ""
+		if upgLeft > 0 or rollLeft > 0 then
+			local bParts = {}
+			if upgLeft > 0 then
+				table.insert(bParts, tostring(upgLeft) .. " Upg")
+			end
+			if rollLeft > 0 then
+				table.insert(bParts, tostring(rollLeft) .. " Roll")
+			end
+			bsTag = " · BS: " .. table.concat(bParts, "/")
+		else
+			bsTag = " · BS Max"
+		end
+
 		local dmgPct = ((schoolDef and bestStats[schoolDef.damageBonus] or 0) + (bestStats.AllDamage or 0) + (bestStats.OwnDamage or 0)) * 100
-		local healPct = (bestStats.HealingBonus or 0) * 100
+		local critPct = math.min(60, math.max(0, (bestStats.CritChance or 0) * 100))
+		local critMultDisp = math.min(3.0, 1.5 + (bestStats.CritDamage or 0))
+		local healPct = math.min(100, (bestStats.HealingBonus or 0) * 100)
 		local pipPct = math.min(100, (bestStats.PowerPipChance or 0) * 100)
-		local summaryNote = (buildMode == "Support")
-			and string.format("+%d%% Heal, +%d%% Pip, +%d HP", math.floor(healPct + 0.5), math.floor(pipPct + 0.5), math.floor((bestStats.MaxHealth or 0) + bestHp + 0.5))
-			or string.format("+%d%% Dmg, +%d%% Pip", math.floor(dmgPct + 0.5), math.floor(pipPct + 0.5))
+		local dispHp = bestIncludesHp and math.max(tonumber(bestHp) or 0, tonumber(bestStats.MaxHealth) or 0) or ((tonumber(bestStats.MaxHealth) or 0) + (tonumber(bestHp) or 0))
+		local summaryNote = (buildSpec.mode == "Support")
+			and string.format("+%d%% Heal · %d%% Pip · %d HP%s", math.floor(healPct + 0.5), math.floor(pipPct + 0.5), math.floor(dispHp + 0.5), bsTag)
+			or string.format("+%d%% Dmg · %d%% Crit (%.2fx) · %d%% Pip%s", math.floor(dmgPct + 0.5), math.floor(critPct + 0.5), critMultDisp, math.floor(pipPct + 0.5), bsTag)
+		local tagText = string.upper(tostring(targetSchool or "?")) .. "·" .. tostring(buildSpec.label or buildSpec.mode) .. (AutoEquip.BlacksmithPotential and "[BS]" or "")
 
 		if changes > 0 then
-			return string.format("%s · %d slots (%s)", string.upper(buildMode == "Support" and "SUP" or "DMG"), changes, summaryNote)
+			return string.format("%s · %d slots (%s)", tagText, changes, summaryNote)
 		end
 		if not silentNoChange then
-			return string.format("BEST %s (%s)", string.upper(buildMode == "Support" and "SUP" or "DMG"), summaryNote)
+			return string.format("BEST %s (%s)", tagText, summaryNote)
 		end
 		return nil
 	end)
@@ -7405,7 +8031,7 @@ end
 
 GearTab:AddToggle({
 	Title = "Auto Equip Best Gear",
-	Description = "Plans & equips optimal full loadout for your Build Focus & Element",
+	Description = "Reads your element & talent path to equip the optimal full loadout",
 	Default = AutoEquip.Enabled,
 	Callback = function(enabled)
 		AutoEquip.Enabled = enabled
@@ -7418,7 +8044,7 @@ GearTab:AddToggle({
 
 GearTab:AddDropdown({
 	Title = "Build Focus",
-	Options = { "Damage", "Support" },
+	Options = { "Auto (My Path)", "Damage", "Support" },
 	Default = AutoEquip.BuildMode,
 	Callback = function(choice)
 		AutoEquip.BuildMode = choice
@@ -7448,8 +8074,8 @@ function AutoEquip.EvaluateDefForBuild(mods, profile, defId, def)
 	end
 	local Inventory = mods.Inventory
 	local mySchool = profile and profile.primarySchool
-	local targetSchool = (AutoEquip.Element == "Auto (My School)" or AutoEquip.Element == "") and mySchool or AutoEquip.Element
-	local buildMode = (AutoEquip.BuildMode == "Support") and "Support" or "Damage"
+	local buildSpec = resolveAutoBuildProfile(mods, profile)
+	local targetSchool = buildSpec.school or mySchool
 	local schoolDef = targetSchool and mods.Schools and mods.Schools.defs[targetSchool]
 	local playerLevel = (profile and profile.level) or 1
 	local equipped = (profile and profile.equipped) or {}
@@ -7468,6 +8094,7 @@ function AutoEquip.EvaluateDefForBuild(mods, profile, defId, def)
 
 	local fakeItem = { uid = "__shop_sim", defId = defId, count = 1 }
 	local st, hp = def.stats or {}, 0
+	local potScore = nil
 	if fitSlot then
 		local simProf = {
 			inventory = { fakeItem },
@@ -7483,23 +8110,32 @@ function AutoEquip.EvaluateDefForBuild(mods, profile, defId, def)
 		if okH and type(hRes) == "number" then
 			hp = hRes
 		end
+		-- Compare Shop items at Max Blacksmith Potential so T0 Shop BiS pieces still flag as Upgrades over T3-T5 filler
+		local maxShopItem = makeBlacksmithMaxCopy(mods, fakeItem, def, true)
+		local potSt, potHp, potIncHp = deriveBuildTotals(mods, profile, { maxShopItem }, { [fitSlot] = maxShopItem.uid }, targetSchool, false)
+		local potSame = getItemElementMatch(mods, defId, potSt, targetSchool, schoolDef)
+		local potQual = (AutoLock.GetRarityRank(mods, def) * 0.4) + ((maxShopItem.tier or 0) * 1.2)
+		potScore = scoreBuildStats(mods, potSt, potHp, targetSchool, schoolDef, buildSpec, potSame and 1 or 0, potQual, potIncHp)
 	end
 
 	local isSame = getItemElementMatch(mods, defId, st, targetSchool, schoolDef)
 	local rarityRank = AutoLock.GetRarityRank(mods, def)
 	local quality = rarityRank * 0.4
-	local itemScore = scoreBuildStats(mods, st, hp, targetSchool, schoolDef, buildMode, isSame and 1 or 0, quality)
+	local itemScore = scoreBuildStats(mods, st, hp, targetSchool, schoolDef, buildSpec, isSame and 1 or 0, quality)
 
 	local okSchool, schoolOk = pcall(Inventory.schoolCanWear, mySchool, defId)
+	local LevelGate = mods.LevelGate
+	local canWearLv = (LevelGate and LevelGate.canWear and LevelGate.canWear(playerLevel, defId)) or ((def.minLevel or 1) <= playerLevel)
 	local canWear = (def.slot ~= nil)
 		and (def.slot ~= "Mount")
 		and (not okSchool or schoolOk)
-		and (def.minLevel or 1) <= playerLevel
+		and canWearLv
 
 	local isUpgrade = false
 	local currentSlotScore = 0
-	if fitSlot and canWear and (buildMode ~= "Damage" or fitSlot ~= "Offhand" or def.kind ~= "Shield" or targetSchool == "Steel") then
+	if fitSlot and canWear then
 		local bestExistingScore = 0
+		local bestExistingPot = 0
 		local slotsToCheck = (fitSlot == "Pet") and { "Pet" } or {}
 		if #slotsToCheck == 0 then
 			for _, s in ipairs(EQUIP_SLOTS_ORDER) do
@@ -7511,6 +8147,7 @@ function AutoEquip.EvaluateDefForBuild(mods, profile, defId, def)
 		for i, s in ipairs(slotsToCheck) do
 			local eqUid = equipped[s]
 			local slotScore = 0
+			local slotPotScore = 0
 			if eqUid and profile and type(profile.inventory) == "table" then
 				for _, invItem in ipairs(profile.inventory) do
 					if invItem.uid == eqUid then
@@ -7528,7 +8165,13 @@ function AutoEquip.EvaluateDefForBuild(mods, profile, defId, def)
 							eqHp = (okEH and type(eqHp) == "number") and eqHp or 0
 							local eqSame = getItemElementMatch(mods, invItem.defId, eqSt, targetSchool, schoolDef)
 							local eqQual = (AutoLock.GetRarityRank(mods, eqDef) * 0.4) + ((invItem.tier or 0) * 0.8)
-							slotScore = scoreBuildStats(mods, eqSt, eqHp, targetSchool, schoolDef, buildMode, eqSame and 1 or 0, eqQual)
+							slotScore = scoreBuildStats(mods, eqSt, eqHp, targetSchool, schoolDef, buildSpec, eqSame and 1 or 0, eqQual)
+
+							local maxEqItem = makeBlacksmithMaxCopy(mods, invItem, eqDef, true)
+							local eqPotSt, eqPotHp, eqPotIncHp = deriveBuildTotals(mods, profile, { maxEqItem }, { [s] = maxEqItem.uid }, targetSchool, false)
+							local eqPotSame = getItemElementMatch(mods, invItem.defId, eqPotSt, targetSchool, schoolDef)
+							local eqPotQual = (AutoLock.GetRarityRank(mods, eqDef) * 0.4) + ((maxEqItem.tier or 0) * 1.2)
+							slotPotScore = scoreBuildStats(mods, eqPotSt, eqPotHp, targetSchool, schoolDef, buildSpec, eqPotSame and 1 or 0, eqPotQual, eqPotIncHp)
 						end
 						break
 					end
@@ -7537,9 +8180,12 @@ function AutoEquip.EvaluateDefForBuild(mods, profile, defId, def)
 			if i == 1 or slotScore < bestExistingScore then
 				bestExistingScore = slotScore
 			end
+			if i == 1 or slotPotScore < bestExistingPot then
+				bestExistingPot = slotPotScore
+			end
 		end
 		currentSlotScore = bestExistingScore
-		isUpgrade = (itemScore > (currentSlotScore + 0.05))
+		isUpgrade = (itemScore > (currentSlotScore + 0.05)) or (potScore ~= nil and potScore > (bestExistingPot + 0.05))
 	end
 
 	-- Format concise readable stat highlights
@@ -7588,6 +8234,26 @@ function AutoEquip.EvaluateDefForBuild(mods, profile, defId, def)
 		fitSlot = fitSlot,
 		sameElement = isSame,
 	}
+end
+
+function AutoEquip.ScoreUpgradeDelta(mods, profile, slot, item, nextTier)
+	if not mods or not profile or not item then
+		return 0
+	end
+	local buildSpec = resolveAutoBuildProfile(mods, profile)
+	local targetSchool = buildSpec.school or profile.primarySchool
+	local schoolDef = targetSchool and mods.Schools and mods.Schools.defs[targetSchool]
+	local baseSt, baseHp, baseInc = deriveBuildTotals(mods, profile, { item }, { [slot] = item.uid }, targetSchool, false)
+	local upgraded = {}
+	for k, v in pairs(item) do
+		upgraded[k] = v
+	end
+	upgraded.tier = nextTier or ((item.tier or 0) + 1)
+	local nextSt, nextHp, nextInc = deriveBuildTotals(mods, profile, { upgraded }, { [slot] = upgraded.uid }, targetSchool, false)
+	local same = getItemElementMatch(mods, item.defId, baseSt, targetSchool, schoolDef) and 1 or 0
+	local s0 = scoreBuildStats(mods, baseSt, baseHp, targetSchool, schoolDef, buildSpec, same, 0, baseInc)
+	local s1 = scoreBuildStats(mods, nextSt, nextHp, targetSchool, schoolDef, buildSpec, same, 0, nextInc)
+	return math.max(0, s1 - s0)
 end
 
 task.spawn(function()
@@ -7665,6 +8331,19 @@ GearTab:AddToggle({
 	Callback = function(enabled)
 		AutoEquip.RespectCaps = enabled
 		Config.Set("AutoEquip_RespectCaps", enabled)
+		if AutoEquip.Enabled then
+			task.spawn(runSmartAutoEquip, false)
+		end
+	end,
+})
+
+GearTab:AddToggle({
+	Title = "Plan by Blacksmith Max",
+	Description = "Scores gear at Max Upgrade + Reforge potential (still keeps your best rolled/upgraded copy)",
+	Default = AutoEquip.BlacksmithPotential,
+	Callback = function(enabled)
+		AutoEquip.BlacksmithPotential = enabled
+		Config.Set("AutoEquip_BlacksmithPotential", enabled)
 		if AutoEquip.Enabled then
 			task.spawn(runSmartAutoEquip, false)
 		end
@@ -7768,18 +8447,76 @@ GearTab:AddSection("Upgrades & Reforge")
 
 do
 	local upgradeReadyCard = GearTab:AddStatusCard({
-		Title = "Next Gear Upgrade",
-		Value = "Click Scan or Upgrade...",
+		Title = "Blacksmith Plan",
+		Value = "Click Scan to check Weapon, Armor & Rolls",
 	})
 
-	local UPGRADE_SLOTS = { "Outfit", "Helmet", "Backpack", "Charm1", "Charm2", "Charm3", "Offhand" }
+	local UPGRADE_SLOTS = { "Outfit", "Helmet", "Backpack", "Charm1", "Charm2", "Charm3", "Offhand", "Pet" }
+	local REFORGE_SLOTS = { "Weapon", "Offhand", "Helmet", "Outfit", "Backpack", "Charm1", "Charm2", "Charm3" }
+
+	local function getMatCount(profile, itemId)
+		local cnt = 0
+		for _, it in ipairs((profile and profile.inventory) or {}) do
+			if type(it) == "table" and it.defId == itemId then
+				cnt += tonumber(it.count) or 1
+			end
+		end
+		return cnt
+	end
+
+	local function scanEquippedWeaponPlan(mods, profile)
+		if not mods or not mods.WeaponUpgrade or not profile then
+			return nil
+		end
+		local equipped = profile.equipped or {}
+		local bestWpn = nil
+		for _, slot in ipairs({ "Weapon", "Offhand" }) do
+			local uid = equipped[slot]
+			local item = uid and mods.Inventory.find(profile, uid)
+			local def = item and mods.Items[item.defId]
+			if item and def and mods.WeaponUpgrade.isWeapon(item.defId) then
+				local curTier = mods.WeaponUpgrade.tierOf(item)
+				local maxTier = (mods.Constants and mods.Constants.WEAPON_UPGRADE and mods.Constants.WEAPON_UPGRADE.MAX) or 6
+				local nextTier = curTier + 1
+				local spare = (nextTier <= maxTier) and mods.WeaponUpgrade.spareFor(profile.inventory, {}, item) or nil
+				local isFree = mods.Quests and mods.Quests.freeWeaponUpgrade and mods.Quests.freeWeaponUpgrade(profile)
+				local canUp, reason = mods.WeaponUpgrade.canRaise(
+					item,
+					profile.level or 1,
+					profile.gold or 0,
+					profile.metaCurrency or 0,
+					spare,
+					function(matId) return getMatCount(profile, matId) end,
+					isFree == true
+				)
+				local price = (nextTier <= maxTier) and mods.WeaponUpgrade.price(item.defId, nextTier) or nil
+				local entry = {
+					slot = slot,
+					item = item,
+					def = def,
+					curTier = curTier,
+					nextTier = nextTier,
+					maxTier = maxTier,
+					canUp = canUp == true,
+					reason = reason,
+					price = price,
+					spare = spare,
+					needsSpare = (nextTier <= maxTier) and mods.WeaponUpgrade.needsSpare(nextTier) ~= nil,
+				}
+				if slot == "Weapon" or not bestWpn then
+					bestWpn = entry
+				end
+			end
+		end
+		return bestWpn
+	end
 
 	local function findBestUpgradePlan(mods, profile)
 		if not mods or not mods.Upgrade or not profile then
 			return nil, nil
 		end
 		local equipped = profile.equipped or {}
-		local bestCandidate, bestPlan = nil, nil
+		local bestCandidate, bestPlan, bestWeight = nil, nil, -math.huge
 		for _, slot in ipairs(UPGRADE_SLOTS) do
 			local uid = equipped[slot]
 			if uid then
@@ -7790,9 +8527,12 @@ do
 					local okPlan, plan = pcall(mods.Upgrade.plan, profile, uid, okSug and fuel or {})
 					if okPlan and type(plan) == "table" and plan.ok then
 						local rarityRank = AutoLock.GetRarityRank(mods, def)
-						if not bestCandidate or rarityRank > bestCandidate.rank or (rarityRank == bestCandidate.rank and plan.goldCost < bestPlan.goldCost) then
-							bestCandidate = { slot = slot, item = item, def = def, rank = rarityRank }
+						local buildGain = AutoEquip.ScoreUpgradeDelta(mods, profile, slot, item, plan.nextTier)
+						local weight = (buildGain * 10) + (rarityRank * 5) - ((plan.goldCost or 0) * 0.005)
+						if not bestCandidate or weight > bestWeight then
+							bestCandidate = { slot = slot, item = item, def = def, rank = rarityRank, gain = buildGain }
 							bestPlan = plan
+							bestWeight = weight
 						end
 					end
 				end
@@ -7801,8 +8541,148 @@ do
 		return bestCandidate, bestPlan
 	end
 
+	local function scanEquippedReforgeRolls(mods, profile, goldOnly)
+		if not mods or not mods.Inventory or not mods.Items or not profile then
+			return {}
+		end
+		local spread = (mods.Constants and mods.Constants.GEAR_ROLL and mods.Constants.GEAR_ROLL.SPREAD) or 0.10
+		local equipped = profile.equipped or {}
+		local list = {}
+		for _, slot in ipairs(REFORGE_SLOTS) do
+			local uid = equipped[slot]
+			local item = uid and mods.Inventory.find(profile, uid)
+			local def = item and mods.Items[item.defId]
+			if item and def and mods.Inventory.rolls(item.defId) and type(def.stats) == "table" then
+				local rolled = type(item.rolledStats) == "table" and item.rolledStats or nil
+				local sumRatio, statCnt, negCnt = 0, 0, 0
+				for sk, bv in pairs(def.stats) do
+					if type(bv) == "number" and bv > 0 then
+						local rv = rolled and tonumber(rolled[sk]) or 0
+						local amt = mods.Inventory.rollOf(def, sk, rv)
+						local ratio = amt / bv
+						sumRatio += ratio
+						statCnt += 1
+						if amt < 0 then
+							negCnt += 1
+						end
+					end
+				end
+				local avgRatio = (statCnt > 0) and (sumRatio / statCnt) or 0
+				local price = mods.Reforge and mods.Reforge.price and mods.Reforge.price(item.defId) or nil
+				local isGems = price and mods.Enums and mods.Enums.Currency and price.currency == mods.Enums.Currency.Gems
+				local plan = mods.Reforge and mods.Reforge.plan and mods.Reforge.plan(profile, item.uid) or nil
+				if not goldOnly or not isGems then
+					table.insert(list, {
+						slot = slot,
+						item = item,
+						def = def,
+						name = tostring(def.name or item.defId),
+						avgRatio = avgRatio,
+						avgPctOfMax = math.floor((avgRatio / spread) * 100 + 0.5),
+						unrolled = (rolled == nil or next(rolled) == nil),
+						negCnt = negCnt,
+						price = price,
+						isGems = isGems == true,
+						canPay = (plan and plan.ok == true) or false,
+						reason = plan and plan.reason or nil,
+					})
+				end
+			end
+		end
+		table.sort(list, function(a, b)
+			if a.negCnt ~= b.negCnt then
+				return a.negCnt > b.negCnt
+			end
+			return a.avgRatio < b.avgRatio
+		end)
+		return list
+	end
+
 	GearTab:AddButton({
-		Title = "Upgrade Best Equipped Armor/Charm",
+		Title = "Scan Weapon, Upgrades & Rolls",
+		Callback = function()
+			local mods = getGameMods()
+			if not mods or not mods.Inventory or not mods.Items then
+				return
+			end
+			local okP, profile = pcall(mods.Net.getProfile)
+			if not okP or type(profile) ~= "table" then
+				return
+			end
+			local parts = {}
+			local wpn = scanEquippedWeaponPlan(mods, profile)
+			if wpn then
+				local wName = tostring(wpn.def.name or wpn.item.defId)
+				if wpn.curTier >= wpn.maxTier then
+					table.insert(parts, "Wpn: " .. wName .. " MAX")
+				elseif wpn.canUp then
+					table.insert(parts, string.format("Wpn READY: %s T%d→T%d", wName, wpn.curTier, wpn.nextTier))
+				else
+					table.insert(parts, string.format("Wpn T%d (%s)", wpn.curTier, tostring(wpn.reason or "Locked")))
+				end
+			end
+			local cand, plan = findBestUpgradePlan(mods, profile)
+			if cand and plan then
+				table.insert(parts, string.format("Gear: %s T%d→T%d (%dg)", tostring(cand.def.name or cand.item.defId), plan.tier, plan.nextTier, plan.goldCost))
+			else
+				table.insert(parts, "Gear: none ready")
+			end
+			local rolls = scanEquippedReforgeRolls(mods, profile, false)
+			local weak = {}
+			for _, r in ipairs(rolls) do
+				if r.negCnt > 0 or r.unrolled or r.avgPctOfMax < 40 then
+					table.insert(weak, string.format("%s(%s%d%%)", r.slot, r.unrolled and "0" or (r.avgPctOfMax >= 0 and "+" or ""), r.unrolled and 0 or r.avgPctOfMax))
+				end
+			end
+			table.insert(parts, #weak > 0 and ("Rolls: " .. table.concat(weak, ", ")) or "Rolls: Clean (+)")
+			upgradeReadyCard:Set(table.concat(parts, " | "))
+			setGearStatus(#weak > 0 and ("BS SCAN · " .. #weak .. " WEAK ROLLS") or "BS SCAN · CLEAN")
+		end,
+	})
+
+	GearTab:AddButton({
+		Title = "Upgrade Equipped Weapon",
+		Callback = function()
+			if LocalPlayer:GetAttribute("InRun") == true then
+				setGearStatus("EXIT RUN TO UPGRADE")
+				return
+			end
+			local mods = getGameMods()
+			if not mods or not mods.WeaponUpgrade then
+				return
+			end
+			local okP, profile = pcall(mods.Net.getProfile)
+			if not okP or type(profile) ~= "table" then
+				setGearStatus("ERR · NO PROFILE")
+				return
+			end
+			local wpn = scanEquippedWeaponPlan(mods, profile)
+			if not wpn then
+				upgradeReadyCard:Set("No upgradeable equipped Weapon")
+				setGearStatus("NO WEAPON FOUND")
+				return
+			end
+			local wName = tostring(wpn.def.name or wpn.item.defId)
+			if wpn.curTier >= wpn.maxTier then
+				upgradeReadyCard:Set(wName .. " is already Tier " .. tostring(wpn.maxTier))
+				setGearStatus("WEAPON MAXED")
+				return
+			end
+			if not wpn.canUp then
+				upgradeReadyCard:Set(string.format("%s T%d→T%d: %s", wName, wpn.curTier, wpn.nextTier, tostring(wpn.reason or "Blocked")))
+				setGearStatus("WPN BLOCKED · " .. tostring(wpn.reason or "?"))
+				return
+			end
+			pcall(function()
+				mods.Net.fireServer("UpgradeWeapon", { uid = wpn.item.uid, tier = wpn.curTier })
+			end)
+			upgradeReadyCard:Set(string.format("Weapon: %s T%d→T%d!", wName, wpn.curTier, wpn.nextTier))
+			setGearStatus("WPN UPGRADED · " .. wName .. " T" .. tostring(wpn.nextTier))
+		end,
+	})
+
+	GearTab:AddButton({
+		Title = "Upgrade Best Armor/Charm (Path)",
 		Callback = function()
 			if LocalPlayer:GetAttribute("InRun") == true then
 				setGearStatus("EXIT RUN TO UPGRADE")
@@ -7819,7 +8699,7 @@ do
 			end
 			local cand, plan = findBestUpgradePlan(mods, profile)
 			if not cand or not plan then
-				upgradeReadyCard:Set("No ready armor/charm (maxed or need fuel/gold)")
+				upgradeReadyCard:Set("No ready armor/charm/pet (maxed or need fuel/gold)")
 				setGearStatus("NO READY UPGRADE")
 				return
 			end
@@ -7833,44 +8713,95 @@ do
 	})
 
 	GearTab:AddButton({
-		Title = "Scan Gear Rolls (Reforge Check)",
+		Title = "Upgrade All Ready Armor/Charms",
 		Callback = function()
+			if LocalPlayer:GetAttribute("InRun") == true then
+				setGearStatus("EXIT RUN TO UPGRADE")
+				return
+			end
 			local mods = getGameMods()
-			if not mods or not mods.Inventory or not mods.Items then
+			if not mods or not mods.Upgrade then
 				return
 			end
-			local okP, profile = pcall(mods.Net.getProfile)
-			if not okP or type(profile) ~= "table" then
-				return
-			end
-			local equipped = profile.equipped or {}
-			local badNames = {}
-			for _, slot in ipairs({ "Weapon", "Offhand", "Helmet", "Outfit", "Backpack", "Charm1", "Charm2", "Charm3" }) do
-				local uid = equipped[slot]
-				local item = uid and mods.Inventory.find(profile, uid)
-				if item and type(item.rolledStats) == "table" and mods.Inventory.rolls(item.defId) then
-					local def = mods.Items[item.defId]
-					local negSum = 0
-					for k, v in pairs(item.rolledStats) do
-						local r = mods.Inventory.rollOf(def, k, v)
-						if r < 0 then
-							negSum += 1
-						end
-					end
-					if negSum > 0 then
-						table.insert(badNames, string.format("%s (-%d)", tostring(def and def.name or slot), negSum))
-					end
+			local count, lastMsg = 0, nil
+			for _ = 1, 12 do
+				local okP, profile = pcall(mods.Net.getProfile)
+				if not okP or type(profile) ~= "table" then
+					break
 				end
+				local cand, plan = findBestUpgradePlan(mods, profile)
+				if not cand or not plan then
+					break
+				end
+				pcall(function()
+					mods.Net.fireServer("UpgradeItem", { uid = cand.item.uid, fuelUids = plan.consume })
+				end)
+				count += 1
+				lastMsg = string.format("%s T%d", tostring(cand.def.name or cand.item.defId), plan.nextTier)
+				task.wait(0.28)
 			end
-			local cand, plan = findBestUpgradePlan(mods, profile)
-			if cand and plan then
-				upgradeReadyCard:Set(string.format("Next: %s T%d→T%d (%dg)", tostring(cand.def.name or cand.item.defId), plan.tier, plan.nextTier, plan.goldCost))
-			elseif #badNames > 0 then
-				upgradeReadyCard:Set("Reforge: " .. table.concat(badNames, ", "))
+			if count > 0 then
+				upgradeReadyCard:Set(string.format("Upgraded %d tier(s) · Last: %s", count, tostring(lastMsg)))
+				setGearStatus("UPGRADED · " .. tostring(count) .. " TIERS")
 			else
-				upgradeReadyCard:Set("Equipped rolls clean")
+				upgradeReadyCard:Set("No ready armor/charm/pet upgrades")
+				setGearStatus("NO READY UPGRADES")
 			end
-			setGearStatus(#badNames > 0 and ("REFORGE · " .. #badNames .. " WEAK ROLLS") or "ROLLS CLEAN")
+		end,
+	})
+
+	local function refBestWeak(goldOnly)
+		if LocalPlayer:GetAttribute("InRun") == true then
+			setGearStatus("EXIT RUN TO REFORGE")
+			return
+		end
+		local mods = getGameMods()
+		if not mods or not mods.Reforge then
+			return
+		end
+		local okP, profile = pcall(mods.Net.getProfile)
+		if not okP or type(profile) ~= "table" then
+			return
+		end
+		local rolls = scanEquippedReforgeRolls(mods, profile, goldOnly)
+		local target = nil
+		for _, r in ipairs(rolls) do
+			if r.canPay and (r.negCnt > 0 or r.unrolled or r.avgPctOfMax < 55) then
+				target = r
+				break
+			end
+		end
+		if not target then
+			local firstBlocked = rolls[1]
+			if firstBlocked and not firstBlocked.canPay then
+				upgradeReadyCard:Set(string.format("%s: %s", firstBlocked.name, tostring(firstBlocked.reason or "No funds")))
+				setGearStatus("REFORGE BLOCKED · " .. tostring(firstBlocked.reason or "?"))
+			else
+				upgradeReadyCard:Set(goldOnly and "Gold rolls clean or none <55%" or "All equipped rolls clean (+55%+)!")
+				setGearStatus("REFORGE · NO WEAK TARGET")
+			end
+			return
+		end
+		local seenSig = mods.Reforge.signature(target.item.rolledStats)
+		pcall(function()
+			mods.Net.fireServer("ReforgeItem", { uid = target.item.uid, seen = seenSig })
+		end)
+		local costStr = target.price and string.format("%d %s", target.price.amount, target.isGems and "gems" or "gold") or "?"
+		upgradeReadyCard:Set(string.format("Reforged %s (was %d%%, %s)", target.name, target.unrolled and 0 or target.avgPctOfMax, costStr))
+		setGearStatus("REFORGED · " .. target.name)
+	end
+
+	GearTab:AddButton({
+		Title = "Reforge Weakest (Gold Only)",
+		Callback = function()
+			refBestWeak(true)
+		end,
+	})
+
+	GearTab:AddButton({
+		Title = "Reforge Weakest (Includes Gems)",
+		Callback = function()
+			refBestWeak(false)
 		end,
 	})
 end
@@ -7885,6 +8816,19 @@ GearTab:AddToggle({
 		AutoLock.Enabled = enabled
 		Config.Set("AutoLock", enabled)
 		if enabled then
+			task.spawn(AutoLock.Run, false, setGearStatus)
+		end
+	end,
+})
+
+GearTab:AddToggle({
+	Title = "Lock Build Upgrades & Merge Spares",
+	Description = "Also locks Weapon/Offhand T6 merge spares & Uncommon/Rare build upgrades",
+	Default = AutoLock.LockBuildSpares,
+	Callback = function(enabled)
+		AutoLock.LockBuildSpares = enabled
+		Config.Set("AutoLock_BuildSpares", enabled)
+		if AutoLock.Enabled then
 			task.spawn(AutoLock.Run, false, setGearStatus)
 		end
 	end,
@@ -7910,7 +8854,7 @@ GearTab:AddButton({
 	end,
 })
 
-GearTab:AddSection("Quick-Sell")
+GearTab:AddSection("Quick-Sell & Trade")
 
 table.insert(DungeonAuto.QuickSellToggles, GearTab:AddToggle({
 	Title = "Auto Quick-Sell Trash",
@@ -7920,6 +8864,16 @@ table.insert(DungeonAuto.QuickSellToggles, GearTab:AddToggle({
 		DungeonAuto.SetAutoQuickSell(enabled, setGearStatus)
 	end,
 }))
+
+GearTab:AddToggle({
+	Title = "Reserve Upgrade Fuel Before Selling",
+	Description = "Holds back cheap unlocked gear needed as fuel for your equipped upgrades",
+	Default = DungeonAuto.ReserveUpgradeFuel,
+	Callback = function(enabled)
+		DungeonAuto.ReserveUpgradeFuel = enabled
+		Config.Set("Dungeon_ReserveFuel", enabled)
+	end,
+})
 
 table.insert(quickSellTierDropdowns, GearTab:AddDropdown({
 	Title = "Quick-Sell Tier",
@@ -7932,6 +8886,56 @@ GearTab:AddButton({
 	Title = "Quick-Sell Unequipped Gear",
 	Callback = function()
 		runQuickSellTrash(false, setGearStatus)
+	end,
+})
+
+GearTab:AddButton({
+	Title = "Copy Tradable Legendaries (Discord)",
+	Callback = function()
+		local mods = getGameMods()
+		if not mods or not mods.Net or not mods.Items then
+			return
+		end
+		local okP, profile = pcall(mods.Net.getProfile)
+		if not okP or type(profile) ~= "table" then
+			setGearStatus("ERR · NO PROFILE")
+			return
+		end
+		local eqMap = {}
+		for _, uid in pairs(profile.equipped or {}) do
+			eqMap[uid] = true
+		end
+		local counts = {}
+		local total = 0
+		for _, it in ipairs(profile.inventory or {}) do
+			if type(it) == "table" and it.defId and it.uid and not eqMap[it.uid] then
+				local def = mods.Items[it.defId]
+				local inVanity = mods.Inventory and mods.Inventory.vanitySlotOf and mods.Inventory.vanitySlotOf(profile, it.uid) ~= nil
+				local isTradable = (not mods.Trade or not mods.Trade.allowed or mods.Trade.allowed(def)) and it.boundToOwner ~= true
+				local rank = def and AutoLock.GetRarityRank(mods, def) or 0
+				if def and rank >= 5 and isTradable and not inVanity then
+					local nm = tostring(def.name or it.defId)
+					counts[nm] = (counts[nm] or 0) + (tonumber(it.count) or 1)
+					total += (tonumber(it.count) or 1)
+				end
+			end
+		end
+		local names = {}
+		for nm in pairs(counts) do
+			table.insert(names, nm)
+		end
+		table.sort(names)
+		local lines = {}
+		for _, nm in ipairs(names) do
+			table.insert(lines, counts[nm] > 1 and string.format("- %s x%d", nm, counts[nm]) or ("- " .. nm))
+		end
+		local outText = (#lines > 0) and table.concat(lines, "\n") or "No unequipped tradable Legendaries+"
+		if typeof(setclipboard) == "function" then
+			setclipboard(outText)
+			setGearStatus(string.format("COPIED · %d TRADABLE (%d types)", total, #names))
+		else
+			setGearStatus(string.format("TRADABLE · %d (%d types)", total, #names))
+		end
 	end,
 })
 
