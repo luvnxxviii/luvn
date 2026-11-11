@@ -1532,7 +1532,9 @@ local function getGameMods(forceReload)
 			Deck = safeRequire(Campaign.Systems:FindFirstChild("Deck")),
 			Loadout = safeRequire(Campaign.Systems:FindFirstChild("Loadout")),
 			Inventory = safeRequire(Campaign.Systems:FindFirstChild("Inventory")),
+			Shop = safeRequire(Campaign.Systems:FindFirstChild("Shop")),
 			Schools = safeRequire(Campaign.Shared:FindFirstChild("Schools")),
+			Stats = safeRequire(Campaign.Shared:FindFirstChild("Stats")),
 			Constants = safeRequire(Campaign.Shared:FindFirstChild("Constants")),
 			MinigamesSys = safeRequire(Campaign.Systems:FindFirstChild("Minigames")),
 			CombatUI = require(client.UI.CombatUI),
@@ -4769,6 +4771,92 @@ local function setDungeonStatus(text)
 	end
 end
 
+local AutoLock = {
+	Enabled = Config.Get("AutoLock", false),
+	Rarity = Config.Get("AutoLockRarity", "Rare+"),
+	Options = { "Uncommon+", "Rare+", "Epic+", "Legendary+", "Mythic+", "Divine+", "Exotic Only", "All Gears" },
+	MinRankMap = {
+		["All Gears"] = 1,
+		["Uncommon+"] = 2,
+		["Rare+"] = 3,
+		["Epic+"] = 4,
+		["Legendary+"] = 5,
+		["Mythic+"] = 6,
+		["Divine+"] = 7,
+		["Exotic Only"] = 8,
+	},
+	Busy = false,
+	LastRunAt = 0,
+	LockedCache = {},
+}
+if not AutoLock.MinRankMap[AutoLock.Rarity] then
+	AutoLock.Rarity = "Rare+"
+end
+
+function AutoLock.GetRarityRank(mods, defOrRarity)
+	local rName = type(defOrRarity) == "table" and (defOrRarity.rarity or "Common") or tostring(defOrRarity or "Common")
+	local rarityTable = mods and mods.Constants and mods.Constants.RARITY
+	local rInfo = rarityTable and rarityTable[rName]
+	return (type(rInfo) == "table" and tonumber(rInfo.order)) or RARITY_ORDER_FALLBACK[rName] or 1
+end
+
+function AutoLock.Run(silent, statusFn)
+	if AutoLock.Busy or not State.Alive then
+		return 0
+	end
+	local mods = getGameMods()
+	if not mods or not mods.Inventory or not mods.Items or not mods.Net then
+		return 0
+	end
+
+	AutoLock.Busy = true
+	local lockedCount = 0
+	local okRun = pcall(function()
+		local okProf, profile = pcall(mods.Net.getProfile)
+		if not okProf or type(profile) ~= "table" then
+			if not silent and statusFn then
+				statusFn("ERR · NO PROFILE")
+			end
+			return
+		end
+
+		local minRank = AutoLock.MinRankMap[AutoLock.Rarity] or 3
+		for _, item in ipairs(profile.inventory or {}) do
+			if not State.Alive then
+				break
+			end
+			if type(item) == "table" and item.uid and item.defId then
+				if mods.Inventory.isLocked(item) then
+					AutoLock.LockedCache[item.uid] = true
+				elseif not AutoLock.LockedCache[item.uid] and mods.Inventory.lockable(item.defId) then
+					local def = mods.Items[item.defId]
+					local rank = AutoLock.GetRarityRank(mods, def)
+					if rank >= minRank then
+						local okLock, res = pcall(function()
+							return mods.Net.func("LockItem"):InvokeServer({ uid = item.uid, locked = true })
+						end)
+						if okLock and type(res) == "table" and res.ok == true then
+							AutoLock.LockedCache[item.uid] = true
+							lockedCount += 1
+						end
+						task.wait(0.04)
+					end
+				end
+			end
+		end
+
+		if statusFn and (lockedCount > 0 or not silent) then
+			statusFn(lockedCount > 0 and ("LOCKED · " .. tostring(lockedCount) .. " GEARS") or "LOCK · ALL MATCHED")
+		end
+	end)
+	AutoLock.LastRunAt = os.clock()
+	AutoLock.Busy = false
+	if not okRun and not silent and statusFn then
+		statusFn("AUTO-LOCK ERR")
+	end
+	return lockedCount
+end
+
 local function runQuickSellTrash(silent, statusFn)
 	if quickSellBusy or not State.Alive then
 		return 0
@@ -4783,6 +4871,11 @@ local function runQuickSellTrash(silent, statusFn)
 	quickSellBusy = true
 	local sold = 0
 	local okRun, errMsg = pcall(function()
+		-- Lock matching high-rarity drops before sweeping unequipped gear
+		if AutoLock.Enabled then
+			pcall(AutoLock.Run, true, nil)
+		end
+
 		local ok, profile = pcall(mods.Net.getProfile)
 		if not ok or type(profile) ~= "table" then
 			if not silent and statusFn then
@@ -4797,18 +4890,16 @@ local function runQuickSellTrash(silent, statusFn)
 		end
 
 		local maxRank = QUICKSELL_TIER_MAX_RANK[sellRarityMode] or 1
-		local rarityTable = mods.Constants and mods.Constants.RARITY
 		for _, item in ipairs(profile.inventory or {}) do
 			if not State.Alive or LocalPlayer:GetAttribute("InCombat") == true then
 				break
 			end
 			local def = mods.Items[item.defId]
-			local rName = def and (def.rarity or "Common")
-			local rInfo = rarityTable and rarityTable[rName]
-			local rank = (type(rInfo) == "table" and tonumber(rInfo.order)) or RARITY_ORDER_FALLBACK[rName] or 99
+			local rank = def and AutoLock.GetRarityRank(mods, def) or 99
 			if def
 				and not equippedUids[item.uid]
 				and item.locked ~= true
+				and not AutoLock.LockedCache[item.uid]
 				and (item.tier or 0) == 0
 				and def.slot
 				and def.slot ~= "Pet"
@@ -6217,252 +6308,7 @@ LobbyTab:AddButton({
 	end,
 })
 
-LobbyTab:AddSection("Smart Auto Equip")
-
-local AutoEquip = {
-	Enabled = Config.Get("AutoEquip", false),
-	Element = Config.Get("AutoEquipElement", "Auto (My School)"),
-	Busy = false,
-	LastRunAt = 0,
-}
-
-local EQUIP_SLOTS_ORDER = { "Weapon", "Offhand", "Helmet", "Outfit", "Backpack", "Charm1", "Charm2", "Charm3" }
-local RARITY_WEIGHT = { Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5, Mythic = 6 }
-
-local function scoreGearForSchool(mods, profile, item, def, slot, targetSchool)
-	local Inventory = mods.Inventory
-	local schoolDef = targetSchool and mods.Schools.defs[targetSchool]
-
-	local fakeProfile = {
-		inventory = { item },
-		equipped = { [slot] = item.uid },
-		level = profile.level or 1,
-		primarySchool = targetSchool or profile.primarySchool,
-	}
-
-	local okStats, stats = pcall(Inventory.equippedStats, fakeProfile)
-	local okHp, bonusHp = pcall(Inventory.equippedMaxHp, fakeProfile)
-	if not okStats or type(stats) ~= "table" then
-		stats = def.stats or {}
-	end
-	if not okHp or type(bonusHp) ~= "number" then
-		bonusHp = 0
-	end
-
-	local sameElement = false
-	if targetSchool then
-		local okNamed, named = pcall(Inventory.namesSchool, item.defId, targetSchool)
-		if okNamed and named then
-			sameElement = true
-		elseif schoolDef and (
-			(stats[schoolDef.damageBonus] or 0) > 0
-			or (stats[schoolDef.pierce] or 0) > 0
-			or (stats[schoolDef.resistance] or 0) > 0
-		) then
-			sameElement = true
-		end
-	end
-
-	local score = 0
-	if schoolDef then
-		score += (stats[schoolDef.damageBonus] or 0) * 1200
-		score += (stats[schoolDef.pierce] or 0) * 700
-		score += (stats[schoolDef.resistance] or 0) * 260
-	end
-
-	score += ((stats.AllDamage or 0) + (stats.OwnDamage or 0)) * 1050
-	score += (stats.Pierce or 0) * 600
-	score += (stats.PowerPipChance or 0) * 550
-	score += (stats.CritChance or 0) * 480
-	score += (stats.Accuracy or 0) * 320
-	score += (stats.CritDamage or 0) * 260
-	score += (stats.AllResistance or 0) * 240
-	score += (stats.Haste or 0) * 200
-	score += (stats.BlockChance or 0) * 180
-	score += (stats.StatusResistance or 0) * 160
-	local healWeight = (targetSchool == "Light" or targetSchool == "Nature") and 450 or 180
-	score += (stats.HealingBonus or 0) * healWeight
-	score += ((stats.MaxHealth or 0) + bonusHp) * 1.4
-
-	-- Small fallback credit for off-element stats only when no same-element/universal stat exists
-	for statName, val in pairs(stats) do
-		if type(val) == "number" and val > 0 then
-			if string.find(statName, "Damage$") and statName ~= "AllDamage" and statName ~= "OwnDamage" and statName ~= "CritDamage" and (not schoolDef or statName ~= schoolDef.damageBonus) then
-				score += val * 30
-			elseif string.find(statName, "Pierce$") and statName ~= "Pierce" and (not schoolDef or statName ~= schoolDef.pierce) then
-				score += val * 20
-			elseif string.find(statName, "Resistance$") and statName ~= "AllResistance" and statName ~= "StatusResistance" and (not schoolDef or statName ~= schoolDef.resistance) then
-				score += val * 15
-			end
-		end
-	end
-
-	local rarityVal = RARITY_WEIGHT[def.rarity] or 1
-	score += (rarityVal * 0.25) + ((item.tier or 0) * 0.6)
-
-	return sameElement, score
-end
-
-local function runSmartAutoEquip(silentNoChange)
-	if AutoEquip.Busy then
-		return
-	end
-	local mods = getGameMods()
-	if not mods or not mods.Inventory or not mods.Schools then
-		return
-	end
-	if mods.Place and mods.Place.loadoutLocked() then
-		if not silentNoChange then
-			setLobbyStatus("EQUIP LOCKED IN RUN")
-		end
-		return
-	end
-
-	AutoEquip.Busy = true
-	local ok, resultText = pcall(function()
-		local okProf, profile = pcall(mods.Net.getProfile)
-		if not okProf or type(profile) ~= "table" then
-			return "ERR · NO PROFILE"
-		end
-
-		local mySchool = profile.primarySchool
-		local targetSchool = (AutoEquip.Element == "Auto (My School)" or AutoEquip.Element == "") and mySchool or AutoEquip.Element
-		local playerLevel = profile.level or 1
-		local equipped = profile.equipped or {}
-		local usedUids = {}
-		local changes = 0
-
-		for _, slot in ipairs(EQUIP_SLOTS_ORDER) do
-			local bestSame, bestSameScore = nil, -math.huge
-			local bestAny, bestAnyScore = nil, -math.huge
-
-			for _, item in ipairs(profile.inventory or {}) do
-				if not usedUids[item.uid] then
-					local def = mods.Items[item.defId]
-					local skipShieldCards = (slot == "Offhand" and def and def.kind == "Shield" and targetSchool ~= "Steel")
-					if def
-						and def.category ~= "Card"
-						and not skipShieldCards
-						and mods.Inventory.fits(def, slot)
-						and mods.Inventory.schoolCanWear(mySchool, item.defId)
-						and not mods.Inventory.expired(item)
-						and (def.minLevel or 1) <= playerLevel
-					then
-						local isSame, score = scoreGearForSchool(mods, profile, item, def, slot, targetSchool)
-						local isCurrentlyEquipped = (equipped[slot] == item.uid) and 0.001 or 0
-						if isSame and (score + isCurrentlyEquipped) > bestSameScore then
-							bestSameScore = score + isCurrentlyEquipped
-							bestSame = item
-						end
-						if (score + isCurrentlyEquipped) > bestAnyScore then
-							bestAnyScore = score + isCurrentlyEquipped
-							bestAny = item
-						end
-					end
-				end
-			end
-
-			local chosen = bestSame or bestAny
-			if chosen then
-				usedUids[chosen.uid] = true
-				if equipped[slot] ~= chosen.uid then
-					mods.Net.fireServer("EquipItem", { uid = chosen.uid, slot = slot })
-					changes += 1
-					task.wait(0.06)
-				end
-			elseif slot == "Offhand" and equipped.Offhand and targetSchool ~= "Steel" then
-				for _, item in ipairs(profile.inventory or {}) do
-					if item.uid == equipped.Offhand then
-						local def = mods.Items[item.defId]
-						if def and def.kind == "Shield" then
-							mods.Net.fireServer("UnequipItem", { slot = "Offhand" })
-							changes += 1
-							task.wait(0.06)
-						end
-						break
-					end
-				end
-			end
-		end
-
-		if changes > 0 then
-			return string.format("EQUIPPED · %d slots (%s)", changes, tostring(targetSchool or "Any"))
-		end
-		return nil
-	end)
-	AutoEquip.LastRunAt = os.clock()
-	AutoEquip.Busy = false
-
-	if ok then
-		if resultText then
-			setLobbyStatus(resultText)
-		elseif not silentNoChange then
-			setLobbyStatus("BEST GEAR EQUIPPED")
-		end
-	else
-		setLobbyStatus("EQUIP ERR")
-	end
-end
-
-LobbyTab:AddToggle({
-	Title = "Auto Equip Best Gear",
-	Description = "Matches element first, then next-best weapon & armor",
-	Default = AutoEquip.Enabled,
-	Callback = function(enabled)
-		AutoEquip.Enabled = enabled
-		Config.Set("AutoEquip", enabled)
-		if enabled then
-			task.spawn(runSmartAutoEquip, false)
-		end
-	end,
-})
-
-local elementDropdown = LobbyTab:AddDropdown({
-	Title = "Preferred Element",
-	Options = { "Auto (My School)", "Flame", "Frost", "Storm", "Wind", "Light", "Nature", "Shadow", "Steel" },
-	Default = AutoEquip.Element,
-	Callback = function(choice)
-		AutoEquip.Element = choice
-		Config.Set("AutoEquipElement", choice)
-		if AutoEquip.Enabled then
-			task.spawn(runSmartAutoEquip, false)
-		end
-	end,
-})
-
-task.spawn(function()
-	local mods = getGameMods()
-	if mods and State.Alive and mods.Schools and type(mods.Schools.order) == "table" then
-		local opts = { "Auto (My School)" }
-		for _, s in ipairs(mods.Schools.order) do
-			table.insert(opts, s)
-		end
-		elementDropdown:SetOptions(opts, elementDropdown:Get())
-	end
-
-	if mods and State.Alive then
-		local function onLootOrProfile()
-			if State.Alive and AutoEquip.Enabled and (os.clock() - AutoEquip.LastRunAt) >= 1.2 then
-				task.delay(0.35, function()
-					if State.Alive and AutoEquip.Enabled then
-						runSmartAutoEquip(true)
-					end
-				end)
-			end
-		end
-		trackConnection(mods.Net.onClientEvent("ProfileChanged", onLootOrProfile))
-		trackConnection(mods.Net.onClientEvent("ChestOpened", onLootOrProfile))
-	end
-end)
-
-LobbyTab:AddButton({
-	Title = "Smart Auto Equip Now",
-	Callback = function()
-		runSmartAutoEquip(false)
-	end,
-})
-
-LobbyTab:AddSection("Account & Inventory")
+LobbyTab:AddSection("Account & Codes")
 
 LobbyTab:AddButton({
 	Title = "Claim Daily & Favorite Gift",
@@ -6475,20 +6321,6 @@ LobbyTab:AddButton({
 			end)
 			setLobbyStatus("CLAIMED DAILY + GIFT")
 		end
-	end,
-})
-
-table.insert(quickSellTierDropdowns, LobbyTab:AddDropdown({
-	Title = "Quick-Sell Tier",
-	Options = QUICKSELL_TIER_OPTIONS,
-	Default = sellRarityMode,
-	Callback = setQuickSellTier,
-}))
-
-LobbyTab:AddButton({
-	Title = "Quick-Sell Unequipped Gear",
-	Callback = function()
-		runQuickSellTrash(false, setLobbyStatus)
 	end,
 })
 
@@ -6526,6 +6358,1326 @@ lobbyStatusCard = LobbyTab:AddStatusCard({
 	Title = "Lobby Status",
 	Value = "READY",
 })
+
+--// =========================================================================
+--// TAB 6: GEAR & INVENTORY (Smart Equip, Auto Lock, Quick-Sell)
+--// =========================================================================
+local GearTab = Window:AddTab("Gear")
+
+local gearStatusCard
+local function setGearStatus(text)
+	if gearStatusCard then
+		gearStatusCard:Set(text)
+	end
+end
+
+GearTab:AddSection("Smart Auto Equip")
+
+local AutoEquip = {
+	Enabled = Config.Get("AutoEquip", false),
+	BuildMode = Config.Get("AutoEquipBuild", "Damage"),
+	Element = Config.Get("AutoEquipElement", "Auto (My School)"),
+	Busy = false,
+	LastRunAt = 0,
+}
+
+local EQUIP_SLOTS_ORDER = { "Weapon", "Offhand", "Helmet", "Outfit", "Backpack", "Charm1", "Charm2", "Charm3" }
+local RARITY_WEIGHT = { Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5, Mythic = 6, Divine = 7, Exotic = 8 }
+
+local function getItemElementMatch(mods, defId, statsTbl, targetSchool, schoolDef)
+	if not targetSchool then
+		return false
+	end
+	local okNamed, named = pcall(mods.Inventory.namesSchool, defId, targetSchool)
+	if okNamed and named then
+		return true
+	end
+	if schoolDef and type(statsTbl) == "table" and (
+		(statsTbl[schoolDef.damageBonus] or 0) > 0
+		or (statsTbl[schoolDef.pierce] or 0) > 0
+		or (statsTbl[schoolDef.resistance] or 0) > 0
+	) then
+		return true
+	end
+	return false
+end
+
+local function scoreBuildStats(mods, stats, bonusHp, targetSchool, schoolDef, buildMode, elementMatchCount, gearQualitySum)
+	local isSupport = (buildMode == "Support")
+	local score = 0
+
+	if isSupport then
+		-- Support Build: maximize Healing, Power Pip, Max HP, All/Status Resist, Block & Haste
+		score += (stats.HealingBonus or 0) * 1450
+		score += (stats.PowerPipChance or 0) * 850
+		score += ((stats.MaxHealth or 0) + (bonusHp or 0)) * 2.8
+		score += (stats.AllResistance or 0) * 720
+		score += (stats.StatusResistance or 0) * 520
+		score += (stats.BlockChance or 0) * 460
+		score += (stats.Haste or 0) * 340
+		score += (stats.Accuracy or 0) * 260
+		if schoolDef then
+			score += (stats[schoolDef.resistance] or 0) * 420
+			score += (stats[schoolDef.damageBonus] or 0) * 220
+			score += (stats[schoolDef.pierce] or 0) * 110
+		end
+		score += ((stats.AllDamage or 0) + (stats.OwnDamage or 0)) * 180
+		score += (stats.CritChance or 0) * 90
+	else
+		-- Damage Build: maximize School/All Damage, Pierce, Crit, Accuracy & Power Pip
+		if schoolDef then
+			score += (stats[schoolDef.damageBonus] or 0) * 1400
+			score += (stats[schoolDef.pierce] or 0) * 780
+			score += (stats[schoolDef.resistance] or 0) * 180
+		end
+		score += ((stats.AllDamage or 0) + (stats.OwnDamage or 0)) * 1250
+		score += (stats.Pierce or 0) * 680
+		score += (stats.CritChance or 0) * 580
+		score += (stats.PowerPipChance or 0) * 540
+		score += (stats.CritDamage or 0) * 340
+		score += (stats.Accuracy or 0) * 320
+		score += (stats.Haste or 0) * 220
+		score += (stats.AllResistance or 0) * 150
+		score += (stats.BlockChance or 0) * 110
+		score += (stats.StatusResistance or 0) * 90
+		score += (stats.HealingBonus or 0) * ((targetSchool == "Light" or targetSchool == "Nature") and 240 or 60)
+		score += ((stats.MaxHealth or 0) + (bonusHp or 0)) * 0.9
+
+		-- Small fallback credit for off-element offensive stats
+		for statName, val in pairs(stats) do
+			if type(val) == "number" and val > 0 then
+				if string.find(statName, "Damage$") and statName ~= "AllDamage" and statName ~= "OwnDamage" and statName ~= "CritDamage" and (not schoolDef or statName ~= schoolDef.damageBonus) then
+					score += val * 30
+				elseif string.find(statName, "Pierce$") and statName ~= "Pierce" and (not schoolDef or statName ~= schoolDef.pierce) then
+					score += val * 20
+				elseif string.find(statName, "Resistance$") and statName ~= "AllResistance" and statName ~= "StatusResistance" and (not schoolDef or statName ~= schoolDef.resistance) then
+					score += val * 12
+				end
+			end
+		end
+	end
+
+	-- Soft element compatibility & gear tier tiebreakers (prefer same-school synergies without forcing weak Common gear over real upgrades)
+	score += (elementMatchCount or 0) * (isSupport and 45 or 65)
+	score += (gearQualitySum or 0)
+	return score
+end
+
+local function evaluatePlanLoadout(mods, profile, chosenItems, slotsOrder, targetSchool, schoolDef, buildMode)
+	local fakeInv = {}
+	local fakeEq = {}
+	local elemMatches = 0
+	local qualitySum = 0
+
+	for _, slot in ipairs(slotsOrder) do
+		local rec = chosenItems[slot]
+		if rec and rec.item then
+			table.insert(fakeInv, rec.item)
+			fakeEq[slot] = rec.item.uid
+			if rec.sameElement then
+				elemMatches += 1
+			end
+			qualitySum += rec.quality
+		end
+	end
+
+	local planProfile = {
+		inventory = fakeInv,
+		equipped = fakeEq,
+		level = profile.level or 1,
+		primarySchool = targetSchool or profile.primarySchool,
+	}
+
+	local okStats, stats = pcall(mods.Inventory.equippedStats, planProfile)
+	local okHp, bonusHp = pcall(mods.Inventory.equippedMaxHp, planProfile)
+	if not okStats or type(stats) ~= "table" then
+		stats = {}
+	end
+	if not okHp or type(bonusHp) ~= "number" then
+		bonusHp = 0
+	end
+
+	local totalScore = scoreBuildStats(mods, stats, bonusHp, targetSchool, schoolDef, buildMode, elemMatches, qualitySum)
+	return totalScore, stats, bonusHp
+end
+
+local function runSmartAutoEquip(silentNoChange)
+	if AutoEquip.Busy then
+		return
+	end
+	local mods = getGameMods()
+	if not mods or not mods.Inventory or not mods.Schools then
+		return
+	end
+	if mods.Place and mods.Place.loadoutLocked() then
+		if not silentNoChange then
+			setGearStatus("EQUIP LOCKED IN RUN")
+		end
+		return
+	end
+
+	AutoEquip.Busy = true
+	local ok, resultText = pcall(function()
+		local okProf, profile = pcall(mods.Net.getProfile)
+		if not okProf or type(profile) ~= "table" then
+			return "ERR · NO PROFILE"
+		end
+
+		local Inventory = mods.Inventory
+		local mySchool = profile.primarySchool
+		local targetSchool = (AutoEquip.Element == "Auto (My School)" or AutoEquip.Element == "") and mySchool or AutoEquip.Element
+		local buildMode = (AutoEquip.BuildMode == "Support") and "Support" or "Damage"
+		local schoolDef = targetSchool and mods.Schools.defs[targetSchool]
+		local playerLevel = profile.level or 1
+		local equipped = profile.equipped or {}
+
+		local slotsOrder = EQUIP_SLOTS_ORDER
+		if mods.Enums and type(mods.Enums.EquipSlotOrder) == "table" and #mods.Enums.EquipSlotOrder > 0 then
+			slotsOrder = {}
+			for _, s in ipairs(mods.Enums.EquipSlotOrder) do
+				if s ~= "Pet" and s ~= "Mount" then
+					table.insert(slotsOrder, s)
+				end
+			end
+			if #slotsOrder == 0 then
+				slotsOrder = EQUIP_SLOTS_ORDER
+			end
+		end
+
+		-- Step 1: Score every legal gear piece per slot across inventory
+		local slotCandidates = {}
+		local currentBySlot = {}
+		for _, slot in ipairs(slotsOrder) do
+			local cands = {}
+			for _, item in ipairs(profile.inventory or {}) do
+				local def = mods.Items[item.defId]
+				local skipShieldCards = (buildMode == "Damage" and slot == "Offhand" and def and def.kind == "Shield" and targetSchool ~= "Steel")
+				if def
+					and def.category ~= "Card"
+					and not skipShieldCards
+					and Inventory.fits(def, slot)
+					and Inventory.schoolCanWear(mySchool, item.defId)
+					and not Inventory.expired(item)
+					and (def.minLevel or 1) <= playerLevel
+				then
+					local singleProf = {
+						inventory = { item },
+						equipped = { [slot] = item.uid },
+						level = playerLevel,
+						primarySchool = targetSchool or mySchool,
+					}
+					local okS, st = pcall(Inventory.equippedStats, singleProf)
+					local okH, hp = pcall(Inventory.equippedMaxHp, singleProf)
+					st = (okS and type(st) == "table") and st or (def.stats or {})
+					hp = (okH and type(hp) == "number") and hp or 0
+
+					local isSame = getItemElementMatch(mods, item.defId, st, targetSchool, schoolDef)
+					local rarityVal = RARITY_WEIGHT[def.rarity] or 1
+					local quality = (rarityVal * 0.4) + ((item.tier or 0) * 0.8) + ((equipped[slot] == item.uid) and 0.002 or 0)
+					local itemScore = scoreBuildStats(mods, st, hp, targetSchool, schoolDef, buildMode, isSame and 1 or 0, quality)
+					local rec = {
+						item = item,
+						def = def,
+						sameElement = isSame,
+						quality = quality,
+						score = itemScore,
+					}
+					table.insert(cands, rec)
+					if equipped[slot] == item.uid then
+						currentBySlot[slot] = rec
+					end
+				end
+			end
+			table.sort(cands, function(a, b)
+				return a.score > b.score
+			end)
+			-- Keep top 5 candidates + currently equipped piece for whole-build optimization
+			local trimmed = {}
+			local keptUids = {}
+			for i = 1, math.min(5, #cands) do
+				table.insert(trimmed, cands[i])
+				keptUids[cands[i].item.uid] = true
+			end
+			if currentBySlot[slot] and not keptUids[currentBySlot[slot].item.uid] then
+				table.insert(trimmed, currentBySlot[slot])
+			end
+			slotCandidates[slot] = trimmed
+		end
+
+		-- Step 2: Initial conflict-free greedy build assignment across all slots
+		local plan = {}
+		local usedUids = {}
+		for _, slot in ipairs(slotsOrder) do
+			for _, rec in ipairs(slotCandidates[slot]) do
+				if not usedUids[rec.item.uid] then
+					plan[slot] = rec
+					usedUids[rec.item.uid] = true
+					break
+				end
+			end
+		end
+
+		-- Step 3: Coordinate-ascent whole-loadout refinement (evaluates real set bonuses & combined stats via Inventory.equippedStats)
+		local bestPlanScore, bestStats, bestHp = evaluatePlanLoadout(mods, profile, plan, slotsOrder, targetSchool, schoolDef, buildMode)
+		for _ = 1, 2 do
+			local improved = false
+			for _, slot in ipairs(slotsOrder) do
+				local prevRec = plan[slot]
+				for _, cand in ipairs(slotCandidates[slot]) do
+					if not prevRec or cand.item.uid ~= prevRec.item.uid then
+						-- Check if this UID is used in another slot so we can test a swap too
+						local otherSlot = nil
+						if usedUids[cand.item.uid] then
+							for _, s2 in ipairs(slotsOrder) do
+								if s2 ~= slot and plan[s2] and plan[s2].item.uid == cand.item.uid then
+									otherSlot = s2
+									break
+								end
+							end
+						end
+						local canPlace = (not otherSlot) or (not prevRec) or Inventory.fits(prevRec.def, otherSlot)
+						if canPlace then
+							local otherPrev = otherSlot and plan[otherSlot] or nil
+							plan[slot] = cand
+							if otherSlot then
+								plan[otherSlot] = prevRec
+							end
+							local sc, stTbl, hpVal = evaluatePlanLoadout(mods, profile, plan, slotsOrder, targetSchool, schoolDef, buildMode)
+							if sc > (bestPlanScore + 0.0005) then
+								bestPlanScore, bestStats, bestHp = sc, stTbl, hpVal
+								if prevRec and not otherSlot then
+									usedUids[prevRec.item.uid] = nil
+								end
+								usedUids[cand.item.uid] = true
+								prevRec = cand
+								improved = true
+							else
+								plan[slot] = prevRec
+								if otherSlot then
+									plan[otherSlot] = otherPrev
+								end
+							end
+						end
+					end
+				end
+			end
+			if not improved then
+				break
+			end
+		end
+
+		-- Step 4: Apply the planned loadout changes
+		local changes = 0
+		for _, slot in ipairs(slotsOrder) do
+			local chosen = plan[slot] and plan[slot].item or nil
+			if chosen then
+				if equipped[slot] ~= chosen.uid then
+					mods.Net.fireServer("EquipItem", { uid = chosen.uid, slot = slot })
+					changes += 1
+					task.wait(0.06)
+				end
+			elseif buildMode == "Damage" and slot == "Offhand" and equipped.Offhand and targetSchool ~= "Steel" then
+				for _, item in ipairs(profile.inventory or {}) do
+					if item.uid == equipped.Offhand then
+						local def = mods.Items[item.defId]
+						if def and def.kind == "Shield" then
+							mods.Net.fireServer("UnequipItem", { slot = "Offhand" })
+							changes += 1
+							task.wait(0.06)
+						end
+						break
+					end
+				end
+			end
+		end
+
+		local dmgPct = ((schoolDef and bestStats[schoolDef.damageBonus] or 0) + (bestStats.AllDamage or 0) + (bestStats.OwnDamage or 0)) * 100
+		local healPct = (bestStats.HealingBonus or 0) * 100
+		local pipPct = (bestStats.PowerPipChance or 0) * 100
+		local summaryNote = (buildMode == "Support")
+			and string.format("+%d%% Heal, +%d%% Pip, +%d HP", math.floor(healPct + 0.5), math.floor(pipPct + 0.5), math.floor((bestStats.MaxHealth or 0) + bestHp + 0.5))
+			or string.format("+%d%% Dmg, +%d%% Pip", math.floor(dmgPct + 0.5), math.floor(pipPct + 0.5))
+
+		if changes > 0 then
+			return string.format("%s · %d slots (%s)", string.upper(buildMode == "Support" and "SUP" or "DMG"), changes, summaryNote)
+		end
+		if not silentNoChange then
+			return string.format("BEST %s (%s)", string.upper(buildMode == "Support" and "SUP" or "DMG"), summaryNote)
+		end
+		return nil
+	end)
+	AutoEquip.LastRunAt = os.clock()
+	AutoEquip.Busy = false
+
+	if ok then
+		if resultText then
+			setGearStatus(resultText)
+		end
+	else
+		setGearStatus("EQUIP ERR")
+	end
+end
+
+GearTab:AddToggle({
+	Title = "Auto Equip Best Gear",
+	Description = "Plans & equips optimal full loadout for your Build Focus & Element",
+	Default = AutoEquip.Enabled,
+	Callback = function(enabled)
+		AutoEquip.Enabled = enabled
+		Config.Set("AutoEquip", enabled)
+		if enabled then
+			task.spawn(runSmartAutoEquip, false)
+		end
+	end,
+})
+
+GearTab:AddDropdown({
+	Title = "Build Focus",
+	Options = { "Damage", "Support" },
+	Default = AutoEquip.BuildMode,
+	Callback = function(choice)
+		AutoEquip.BuildMode = choice
+		Config.Set("AutoEquipBuild", choice)
+		if AutoEquip.Enabled then
+			task.spawn(runSmartAutoEquip, false)
+		end
+	end,
+})
+
+local elementDropdown = GearTab:AddDropdown({
+	Title = "Preferred Element",
+	Options = { "Auto (My School)", "Flame", "Frost", "Storm", "Wind", "Light", "Nature", "Shadow", "Steel" },
+	Default = AutoEquip.Element,
+	Callback = function(choice)
+		AutoEquip.Element = choice
+		Config.Set("AutoEquipElement", choice)
+		if AutoEquip.Enabled then
+			task.spawn(runSmartAutoEquip, false)
+		end
+	end,
+})
+
+function AutoEquip.EvaluateDefForBuild(mods, profile, defId, def)
+	if not mods or not mods.Inventory or not mods.Items or not def then
+		return { score = 0, stats = {}, hp = 0, summary = "", isUpgrade = false, canWear = false, fitSlot = nil }
+	end
+	local Inventory = mods.Inventory
+	local mySchool = profile and profile.primarySchool
+	local targetSchool = (AutoEquip.Element == "Auto (My School)" or AutoEquip.Element == "") and mySchool or AutoEquip.Element
+	local buildMode = (AutoEquip.BuildMode == "Support") and "Support" or "Damage"
+	local schoolDef = targetSchool and mods.Schools and mods.Schools.defs[targetSchool]
+	local playerLevel = (profile and profile.level) or 1
+	local equipped = (profile and profile.equipped) or {}
+
+	local fitSlot = nil
+	if def.slot == "Pet" then
+		fitSlot = "Pet"
+	elseif def.slot then
+		for _, s in ipairs(EQUIP_SLOTS_ORDER) do
+			if Inventory.fits(def, s) then
+				fitSlot = s
+				break
+			end
+		end
+	end
+
+	local fakeItem = { uid = "__shop_sim", defId = defId, count = 1 }
+	local st, hp = def.stats or {}, 0
+	if fitSlot then
+		local simProf = {
+			inventory = { fakeItem },
+			equipped = { [fitSlot] = "__shop_sim" },
+			level = playerLevel,
+			primarySchool = targetSchool or mySchool,
+		}
+		local okS, sRes = pcall(Inventory.equippedStats, simProf)
+		local okH, hRes = pcall(Inventory.equippedMaxHp, simProf)
+		if okS and type(sRes) == "table" then
+			st = sRes
+		end
+		if okH and type(hRes) == "number" then
+			hp = hRes
+		end
+	end
+
+	local isSame = getItemElementMatch(mods, defId, st, targetSchool, schoolDef)
+	local rarityRank = AutoLock.GetRarityRank(mods, def)
+	local quality = rarityRank * 0.4
+	local itemScore = scoreBuildStats(mods, st, hp, targetSchool, schoolDef, buildMode, isSame and 1 or 0, quality)
+
+	local okSchool, schoolOk = pcall(Inventory.schoolCanWear, mySchool, defId)
+	local canWear = (def.slot ~= nil)
+		and (def.slot ~= "Mount")
+		and (not okSchool or schoolOk)
+		and (def.minLevel or 1) <= playerLevel
+
+	local isUpgrade = false
+	local currentSlotScore = 0
+	if fitSlot and canWear and (buildMode ~= "Damage" or fitSlot ~= "Offhand" or def.kind ~= "Shield" or targetSchool == "Steel") then
+		local bestExistingScore = 0
+		local slotsToCheck = (fitSlot == "Pet") and { "Pet" } or {}
+		if #slotsToCheck == 0 then
+			for _, s in ipairs(EQUIP_SLOTS_ORDER) do
+				if Inventory.fits(def, s) then
+					table.insert(slotsToCheck, s)
+				end
+			end
+		end
+		for i, s in ipairs(slotsToCheck) do
+			local eqUid = equipped[s]
+			local slotScore = 0
+			if eqUid and profile and type(profile.inventory) == "table" then
+				for _, invItem in ipairs(profile.inventory) do
+					if invItem.uid == eqUid then
+						local eqDef = mods.Items[invItem.defId]
+						if eqDef then
+							local eqProf = {
+								inventory = { invItem },
+								equipped = { [s] = invItem.uid },
+								level = playerLevel,
+								primarySchool = targetSchool or mySchool,
+							}
+							local okES, eqSt = pcall(Inventory.equippedStats, eqProf)
+							local okEH, eqHp = pcall(Inventory.equippedMaxHp, eqProf)
+							eqSt = (okES and type(eqSt) == "table") and eqSt or (eqDef.stats or {})
+							eqHp = (okEH and type(eqHp) == "number") and eqHp or 0
+							local eqSame = getItemElementMatch(mods, invItem.defId, eqSt, targetSchool, schoolDef)
+							local eqQual = (AutoLock.GetRarityRank(mods, eqDef) * 0.4) + ((invItem.tier or 0) * 0.8)
+							slotScore = scoreBuildStats(mods, eqSt, eqHp, targetSchool, schoolDef, buildMode, eqSame and 1 or 0, eqQual)
+						end
+						break
+					end
+				end
+			end
+			if i == 1 or slotScore < bestExistingScore then
+				bestExistingScore = slotScore
+			end
+		end
+		currentSlotScore = bestExistingScore
+		isUpgrade = (itemScore > (currentSlotScore + 0.05))
+	end
+
+	-- Format concise readable stat highlights
+	local parts = {}
+	local statEntries = {}
+	for k, v in pairs(st) do
+		if type(v) == "number" and math.abs(v) > 0.0001 then
+			local label = k
+			label = string.gsub(label, "Damage$", "Dmg")
+			label = string.gsub(label, "Resistance$", "Res")
+			label = string.gsub(label, "PowerPipChance", "Pip")
+			label = string.gsub(label, "HealingBonus", "Heal")
+			label = string.gsub(label, "CritChance", "Crit")
+			label = string.gsub(label, "CritDamage", "CritDmg")
+			label = string.gsub(label, "BlockChance", "Blk")
+			label = string.gsub(label, "MaxHealth", "HP")
+			label = string.gsub(label, "Accuracy", "Acc")
+			local isShare = (mods.Stats and mods.Stats.isShare and mods.Stats.isShare(k)) or (math.abs(v) < 1 and k ~= "MaxHealth")
+			local valText = isShare and string.format("+%d%%", math.floor(v * 100 + 0.5)) or string.format("+%d", math.floor(v + 0.5))
+			local prio = (k == "AllDamage" or (schoolDef and k == schoolDef.damageBonus) or k == "HealingBonus") and 3
+				or (k == "PowerPipChance" or k == "AllResistance" or k == "CritChance" or k == "Pierce") and 2 or 1
+			table.insert(statEntries, { text = valText .. " " .. label, prio = prio, mag = math.abs(v) })
+		end
+	end
+	if hp > 0 then
+		table.insert(statEntries, { text = string.format("+%d HP", math.floor(hp + 0.5)), prio = 1, mag = hp })
+	end
+	table.sort(statEntries, function(a, b)
+		if a.prio ~= b.prio then
+			return a.prio > b.prio
+		end
+		return a.mag > b.mag
+	end)
+	for i = 1, math.min(3, #statEntries) do
+		table.insert(parts, statEntries[i].text)
+	end
+
+	return {
+		score = itemScore,
+		delta = itemScore - currentSlotScore,
+		stats = st,
+		hp = hp,
+		summary = table.concat(parts, " · "),
+		isUpgrade = isUpgrade,
+		canWear = canWear,
+		fitSlot = fitSlot,
+		sameElement = isSame,
+	}
+end
+
+task.spawn(function()
+	local mods = getGameMods()
+	if mods and State.Alive and mods.Schools and type(mods.Schools.order) == "table" then
+		local opts = { "Auto (My School)" }
+		for _, s in ipairs(mods.Schools.order) do
+			table.insert(opts, s)
+		end
+		elementDropdown:SetOptions(opts, elementDropdown:Get())
+	end
+
+	if mods and State.Alive then
+		local function onLootOrProfile()
+			if not State.Alive then
+				return
+			end
+			if AutoLock.Enabled and not AutoLock.Busy and (os.clock() - AutoLock.LastRunAt) >= 1.5 then
+				task.delay(0.2, function()
+					if State.Alive and AutoLock.Enabled and not AutoLock.Busy then
+						AutoLock.Run(true, setGearStatus)
+					end
+				end)
+			end
+			if AutoEquip.Enabled and (os.clock() - AutoEquip.LastRunAt) >= 1.2 then
+				task.delay(0.35, function()
+					if State.Alive and AutoEquip.Enabled then
+						runSmartAutoEquip(true)
+					end
+				end)
+			end
+		end
+		trackConnection(mods.Net.onClientEvent("ProfileChanged", onLootOrProfile))
+		trackConnection(mods.Net.onClientEvent("ChestOpened", onLootOrProfile))
+	end
+end)
+
+GearTab:AddButton({
+	Title = "Smart Auto Equip Now",
+	Callback = function()
+		runSmartAutoEquip(false)
+	end,
+})
+
+GearTab:AddSection("Auto Lock")
+
+GearTab:AddToggle({
+	Title = "Auto Lock Gears",
+	Description = "Locks matching unlocked gears, cosmetics, pets & mounts",
+	Default = AutoLock.Enabled,
+	Callback = function(enabled)
+		AutoLock.Enabled = enabled
+		Config.Set("AutoLock", enabled)
+		if enabled then
+			task.spawn(AutoLock.Run, false, setGearStatus)
+		end
+	end,
+})
+
+GearTab:AddDropdown({
+	Title = "Auto-Lock Rarity",
+	Options = AutoLock.Options,
+	Default = AutoLock.Rarity,
+	Callback = function(choice)
+		AutoLock.Rarity = choice
+		Config.Set("AutoLockRarity", choice)
+		if AutoLock.Enabled then
+			task.spawn(AutoLock.Run, false, setGearStatus)
+		end
+	end,
+})
+
+GearTab:AddButton({
+	Title = "Auto Lock Matching Now",
+	Callback = function()
+		AutoLock.Run(false, setGearStatus)
+	end,
+})
+
+GearTab:AddSection("Quick-Sell")
+
+table.insert(quickSellTierDropdowns, GearTab:AddDropdown({
+	Title = "Quick-Sell Tier",
+	Options = QUICKSELL_TIER_OPTIONS,
+	Default = sellRarityMode,
+	Callback = setQuickSellTier,
+}))
+
+GearTab:AddButton({
+	Title = "Quick-Sell Unequipped Gear",
+	Callback = function()
+		runQuickSellTrash(false, setGearStatus)
+	end,
+})
+
+gearStatusCard = GearTab:AddStatusCard({
+	Title = "Gear Status",
+	Value = "READY",
+})
+
+--// =========================================================================
+--// TAB 7: SHOP SNIPER & LIVE FEED
+--// =========================================================================
+local ShopTab = Window:AddTab("Shop")
+
+local ShopSniper = {
+	Enabled = Config.Get("ShopSniper_Enabled", false),
+	ShopsFilter = Config.Get("ShopSniper_Shops", "All (Blacksmith+Acc+Pet)"),
+	SnipeRule = Config.Get("ShopSniper_Rule", "Upgrades + Rare+"),
+	BudgetMode = Config.Get("ShopSniper_Budget", "Gold Only (Save Gems)"),
+	SkipOwned = Config.Get("ShopSniper_SkipOwned", true),
+	FeedView = Config.Get("ShopFeed_View", "Best Picks"),
+	FeedCurrency = Config.Get("ShopFeed_Currency", "All (Gold + Gems)"),
+	Stock = nil,
+	Busy = false,
+	LastBoughtAt = 0,
+}
+
+do
+	local COSMETIC_CATEGORIES = { Outfits = true, Hats = true, Backpacks = true, Mounts = true, Pets = true }
+	local COSMETIC_SLOTS = { Outfit = true, Helmet = true, Backpack = true, Mount = true, Pet = true }
+	local SHOP_SHORT = { Weapon = "BLK", Accessory = "ACC", Pet = "PET", Snacks = "SNK" }
+
+	ShopTab:AddSection("Shop Sniper")
+
+	local restockCard = ShopTab:AddStatusCard({
+		Title = "Restock / Balance",
+		Value = "Loading...",
+	})
+
+	local sniperStatusCard = ShopTab:AddStatusCard({
+		Title = "Sniper Status",
+		Value = "READY",
+	})
+
+	local function setSniperStatus(txt)
+		sniperStatusCard:Set(txt)
+	end
+
+	local function formatGold(n)
+		n = tonumber(n) or 0
+		if n >= 10000 then
+			return string.format("%.1fk", n / 1000)
+		end
+		return tostring(math.floor(n + 0.5))
+	end
+
+	local function formatCountdown(sec)
+		sec = math.max(0, math.floor(tonumber(sec) or 0))
+		local h = math.floor(sec / 3600)
+		local m = math.floor((sec % 3600) / 60)
+		local s = sec % 60
+		if h > 0 then
+			return string.format("%dh %02dm", h, m)
+		end
+		return string.format("%02dm %02ds", m, s)
+	end
+
+	local function updateHeaderBanner(mods, profile)
+		local goldText, gemsText = "?", "?"
+		if type(profile) == "table" then
+			goldText = formatGold(profile.gold or 0) .. "g"
+			gemsText = tostring(math.floor((profile.metaCurrency or 0) + 0.5)) .. " Gems"
+		end
+		local restockText = "--:--"
+		if ShopSniper.Stock and type(ShopSniper.Stock.restockAt) == "number" then
+			restockText = formatCountdown(ShopSniper.Stock.restockAt - os.time())
+		end
+		restockCard:Set(string.format("%s · %s · %s", restockText, goldText, gemsText))
+	end
+
+	local function matchesShopSelection(entry, selection)
+		if selection == "Blacksmith (Weapons/Shields)" then
+			return entry.kind == "Weapon" and entry.category ~= "Materials"
+		elseif selection == "Accessory (Armor/Cosmetics)" then
+			return entry.kind == "Accessory"
+		elseif selection == "Pet Shop (Pets/Mounts/Eggs)" then
+			return entry.kind == "Pet"
+		elseif selection == "Cosmetics (Looks/Mounts/Pets)" then
+			return COSMETIC_CATEGORIES[entry.category] == true
+		end
+		return entry.kind == "Weapon" or entry.kind == "Accessory" or entry.kind == "Pet"
+	end
+
+	local function matchesCurrencyMode(entry, mode)
+		local cur = entry.currency or "Gold"
+		if mode == "Gold Only (Save Gems)" or mode == "Gold Only" then
+			return cur == "Gold"
+		elseif mode == "Gems Only" then
+			return cur == "Gems"
+		end
+		return true
+	end
+
+	local function matchesSnipeRule(rec, rule)
+		local e = rec.entry
+		local rank = rec.rarityRank
+		if e.category == "Materials" or e.kind == "Snacks" then
+			return false
+		end
+		if rule == "Stat Upgrades Only" then
+			return rec.eval.isUpgrade == true
+		elseif rule == "Cosmetics (Looks/Mounts/Pets)" then
+			return COSMETIC_CATEGORIES[e.category] == true or COSMETIC_SLOTS[rec.def and rec.def.slot or ""] == true
+		elseif rule == "Rare+" then
+			return rank >= 3
+		elseif rule == "Epic+" then
+			return rank >= 4
+		elseif rule == "Legendary+" then
+			return rank >= 5
+		elseif rule == "Good Pets & Mounts" then
+			return e.kind == "Pet" and (e.category == "Pets" or e.category == "Mounts") and (rec.eval.isUpgrade or rank >= 2 or e.category == "Mounts")
+		else
+			-- "Upgrades + Rare+"
+			return rec.eval.isUpgrade or rank >= 3
+		end
+	end
+
+	local function analyzeEntries(mods, profile, stock)
+		local out = {}
+		if not mods or not stock or type(stock.entries) ~= "table" then
+			return out
+		end
+		local ownedCounts = {}
+		if type(profile) == "table" and type(profile.inventory) == "table" then
+			for _, inv in ipairs(profile.inventory) do
+				if inv.defId then
+					ownedCounts[inv.defId] = (ownedCounts[inv.defId] or 0) + (inv.count or 1)
+				end
+			end
+		end
+		local rarityTable = mods.Constants and mods.Constants.RARITY
+		for _, e in ipairs(stock.entries) do
+			if type(e) == "table" and e.defId then
+				local def = mods.Items and mods.Items[e.defId]
+				local rName = (def and def.rarity) or "Common"
+				local rRank = AutoLock.GetRarityRank(mods, rName)
+				local rInfo = rarityTable and rarityTable[rName]
+				local rColor = (type(rInfo) == "table" and typeof(rInfo.color) == "Color3") and rInfo.color or Theme.Border
+				local eval = AutoEquip.EvaluateDefForBuild(mods, profile, e.defId, def)
+				local owned = (ownedCounts[e.defId] or 0) > 0
+				local isCosmetic = COSMETIC_CATEGORIES[e.category] == true or (def and COSMETIC_SLOTS[def.slot] == true)
+				table.insert(out, {
+					entry = e,
+					def = def,
+					rarityName = rName,
+					rarityRank = rRank,
+					rarityColor = rColor,
+					eval = eval,
+					owned = owned,
+					isCosmetic = isCosmetic,
+				})
+			end
+		end
+		table.sort(out, function(a, b)
+			local aRem = (a.entry.remaining or 0) > 0 and 1 or 0
+			local bRem = (b.entry.remaining or 0) > 0 and 1 or 0
+			if aRem ~= bRem then
+				return aRem > bRem
+			end
+			local aUpg = a.eval.isUpgrade and 1 or 0
+			local bUpg = b.eval.isUpgrade and 1 or 0
+			if aUpg ~= bUpg then
+				return aUpg > bUpg
+			end
+			if a.rarityRank ~= b.rarityRank then
+				return a.rarityRank > b.rarityRank
+			end
+			if math.abs(a.eval.score - b.eval.score) > 0.01 then
+				return a.eval.score > b.eval.score
+			end
+			return (a.entry.name or a.entry.defId) < (b.entry.name or b.entry.defId)
+		end)
+		return out
+	end
+
+	local feedContainer
+	local renderFeed
+
+	local function fetchStockAndProfile(forceRefreshStock)
+		local mods = getGameMods()
+		if not mods or not mods.Net then
+			return nil, nil, nil
+		end
+		local okP, profile = pcall(mods.Net.getProfile)
+		if not okP or type(profile) ~= "table" then
+			profile = nil
+		end
+		if forceRefreshStock or not ShopSniper.Stock then
+			local okS, stock = pcall(function()
+				return mods.Net.func("GetShopStock"):InvokeServer()
+			end)
+			if okS and type(stock) == "table" and type(stock.entries) == "table" then
+				ShopSniper.Stock = stock
+			end
+		end
+		updateHeaderBanner(mods, profile)
+		return mods, profile, ShopSniper.Stock
+	end
+
+	local function buyEntry(mods, defId)
+		if LocalPlayer:GetAttribute("InRun") == true then
+			setSniperStatus("BLOCKED · IN RUN")
+			return false
+		end
+		mods.Net.fireServer("BuyItem", { defId = defId, count = 1 })
+		ShopSniper.LastBoughtAt = os.clock()
+		return true
+	end
+
+	local function runSniper(silent)
+		if ShopSniper.Busy or not State.Alive then
+			return 0
+		end
+		if LocalPlayer:GetAttribute("InRun") == true then
+			if not silent then
+				setSniperStatus("CLOSED WHILE IN RUN")
+			end
+			return 0
+		end
+		ShopSniper.Busy = true
+		local bought = 0
+		pcall(function()
+			local mods, profile, stock = fetchStockAndProfile(true)
+			if not mods or not profile or not stock then
+				if not silent then
+					setSniperStatus("ERR · NO STOCK/PROFILE")
+				end
+				return
+			end
+			local goldLeft = tonumber(profile.gold) or 0
+			local gemsLeft = tonumber(profile.metaCurrency) or 0
+			local analyzed = analyzeEntries(mods, profile, stock)
+			for _, rec in ipairs(analyzed) do
+				if not State.Alive or LocalPlayer:GetAttribute("InRun") == true then
+					break
+				end
+				local e = rec.entry
+				local rem = tonumber(e.remaining) or 0
+				local price = tonumber(e.price) or 0
+				local cur = e.currency or "Gold"
+				local affordable = (cur == "Gems") and (gemsLeft >= price) or (goldLeft >= price)
+				if rem > 0
+					and price > 0
+					and (not ShopSniper.SkipOwned or not rec.owned)
+					and matchesShopSelection(e, ShopSniper.ShopsFilter)
+					and matchesCurrencyMode(e, ShopSniper.BudgetMode)
+					and matchesSnipeRule(rec, ShopSniper.SnipeRule)
+					and affordable
+				then
+					if buyEntry(mods, e.defId) then
+						bought += 1
+						if cur == "Gems" then
+							gemsLeft -= price
+						else
+							goldLeft -= price
+						end
+						if AutoLock.Enabled and AutoLock.Run then
+							task.delay(0.35, function()
+								if State.Alive and AutoLock.Enabled then
+									pcall(AutoLock.Run, true, setGearStatus)
+								end
+							end)
+						end
+						task.wait(0.08)
+					end
+				end
+			end
+			if bought > 0 then
+				task.wait(0.18)
+				fetchStockAndProfile(true)
+			end
+			if bought > 0 or not silent then
+				setSniperStatus(bought > 0 and ("SNIPED · " .. tostring(bought) .. " ITEMS") or "NO NEW MATCHES")
+			end
+		end)
+		ShopSniper.Busy = false
+		if renderFeed then
+			task.spawn(renderFeed, false)
+		end
+		return bought
+	end
+
+	ShopTab:AddToggle({
+		Title = "Auto Snipe Matching Items",
+		Description = "Auto-buys matching items on shop restock when in Lobby",
+		Default = ShopSniper.Enabled,
+		Callback = function(enabled)
+			ShopSniper.Enabled = enabled
+			Config.Set("ShopSniper_Enabled", enabled)
+			if enabled then
+				task.spawn(runSniper, false)
+			end
+		end,
+	})
+
+	ShopTab:AddDropdown({
+		Title = "Snipe Shops",
+		Options = {
+			"All (Blacksmith+Acc+Pet)",
+			"Blacksmith (Weapons/Shields)",
+			"Accessory (Armor/Cosmetics)",
+			"Pet Shop (Pets/Mounts/Eggs)",
+		},
+		Default = ShopSniper.ShopsFilter,
+		Callback = function(choice)
+			ShopSniper.ShopsFilter = choice
+			Config.Set("ShopSniper_Shops", choice)
+		end,
+	})
+
+	ShopTab:AddDropdown({
+		Title = "Snipe Filter",
+		Options = {
+			"Upgrades + Rare+",
+			"Stat Upgrades Only",
+			"Cosmetics (Looks/Mounts/Pets)",
+			"Rare+",
+			"Epic+",
+			"Legendary+",
+			"Good Pets & Mounts",
+		},
+		Default = ShopSniper.SnipeRule,
+		Callback = function(choice)
+			ShopSniper.SnipeRule = choice
+			Config.Set("ShopSniper_Rule", choice)
+		end,
+	})
+
+	ShopTab:AddDropdown({
+		Title = "Budget Mode",
+		Options = { "Gold Only (Save Gems)", "Gold + Gems (All)", "Gems Only" },
+		Default = ShopSniper.BudgetMode,
+		Callback = function(choice)
+			ShopSniper.BudgetMode = choice
+			Config.Set("ShopSniper_Budget", choice)
+		end,
+	})
+
+	ShopTab:AddToggle({
+		Title = "Skip Already Owned",
+		Description = "Avoid buying duplicate cosmetics, pets or gear",
+		Default = ShopSniper.SkipOwned,
+		Callback = function(enabled)
+			ShopSniper.SkipOwned = enabled
+			Config.Set("ShopSniper_SkipOwned", enabled)
+		end,
+	})
+
+	ShopTab:AddButton({
+		Title = "Run Sniper Check Now",
+		Callback = function()
+			task.spawn(runSniper, false)
+		end,
+	})
+
+	ShopTab:AddSection("Live Shop Feed")
+
+	ShopTab:AddDropdown({
+		Title = "Feed View",
+		Options = {
+			"Best Picks",
+			"Blacksmith (Weapons/Shields)",
+			"Accessory (Armor/Cosmetics)",
+			"Cosmetics (Looks/Mounts/Pets)",
+			"Pet Shop (Pets/Mounts/Eggs)",
+			"Stat Upgrades Only",
+			"Epic+ Featured",
+			"All For Sale",
+		},
+		Default = ShopSniper.FeedView,
+		Callback = function(choice)
+			ShopSniper.FeedView = choice
+			Config.Set("ShopFeed_View", choice)
+			if renderFeed then
+				task.spawn(renderFeed, false)
+			end
+		end,
+	})
+
+	ShopTab:AddDropdown({
+		Title = "Feed Currency",
+		Options = { "All (Gold + Gems)", "Gold Only", "Gems Only" },
+		Default = ShopSniper.FeedCurrency,
+		Callback = function(choice)
+			ShopSniper.FeedCurrency = choice
+			Config.Set("ShopFeed_Currency", choice)
+			if renderFeed then
+				task.spawn(renderFeed, false)
+			end
+		end,
+	})
+
+	ShopTab:AddButton({
+		Title = "Refresh Live Shop Feed",
+		Callback = function()
+			if renderFeed then
+				task.spawn(renderFeed, true)
+			end
+		end,
+	})
+
+	feedContainer = create("ScrollingFrame", {
+		Size = UDim2.new(1, 0, 0, 255),
+		BackgroundColor3 = Theme.Surface,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 2,
+		ScrollBarImageColor3 = Theme.Border,
+		CanvasSize = UDim2.fromOffset(0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		Parent = ShopTab.Page,
+	}, {
+		create("UICorner", { CornerRadius = UDim.new(0, 9) }),
+		create("UIStroke", { Color = Theme.BorderSoft, Thickness = 1 }),
+		create("UIListLayout", {
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Padding = UDim.new(0, 5),
+		}),
+		create("UIPadding", {
+			PaddingLeft = UDim.new(0, 6),
+			PaddingRight = UDim.new(0, 6),
+			PaddingTop = UDim.new(0, 6),
+			PaddingBottom = UDim.new(0, 6),
+		}),
+	})
+
+	local function matchesFeedView(rec, view)
+		local e = rec.entry
+		if view == "Best Picks" then
+			return e.category ~= "Materials" and e.kind ~= "Snacks"
+				and (rec.eval.isUpgrade or rec.rarityRank >= 3 or rec.isCosmetic)
+		elseif view == "Blacksmith (Weapons/Shields)" then
+			return e.kind == "Weapon" and e.category ~= "Materials"
+		elseif view == "Accessory (Armor/Cosmetics)" then
+			return e.kind == "Accessory"
+		elseif view == "Cosmetics (Looks/Mounts/Pets)" then
+			return rec.isCosmetic
+		elseif view == "Pet Shop (Pets/Mounts/Eggs)" then
+			return e.kind == "Pet"
+		elseif view == "Stat Upgrades Only" then
+			return rec.eval.isUpgrade == true
+		elseif view == "Epic+ Featured" then
+			return rec.rarityRank >= 4 and e.kind ~= "Snacks"
+		end
+		return true
+	end
+
+	renderFeed = function(forceFetch)
+		if not State.Alive or not feedContainer or not feedContainer.Parent then
+			return
+		end
+		local mods, profile, stock = fetchStockAndProfile(forceFetch)
+		for _, child in ipairs(feedContainer:GetChildren()) do
+			if child:IsA("GuiObject") then
+				child:Destroy()
+			end
+		end
+		if not mods or not stock then
+			create("TextLabel", {
+				Size = UDim2.new(1, 0, 0, 32),
+				BackgroundTransparency = 1,
+				Text = "Waiting for shop data...",
+				Font = Enum.Font.RobotoMono,
+				TextSize = 11,
+				TextColor3 = Theme.TextSecondary,
+				Parent = feedContainer,
+			})
+			return
+		end
+
+		local analyzed = analyzeEntries(mods, profile, stock)
+		local filtered = {}
+		for _, rec in ipairs(analyzed) do
+			if matchesFeedView(rec, ShopSniper.FeedView) and matchesCurrencyMode(rec.entry, ShopSniper.FeedCurrency) then
+				table.insert(filtered, rec)
+			end
+		end
+
+		if #filtered == 0 then
+			create("TextLabel", {
+				Size = UDim2.new(1, 0, 0, 36),
+				BackgroundTransparency = 1,
+				Text = "No items match this filter in current rotation.",
+				Font = Enum.Font.Gotham,
+				TextSize = 11,
+				TextColor3 = Theme.TextSecondary,
+				Parent = feedContainer,
+			})
+			return
+		end
+
+		local goldBal = profile and (tonumber(profile.gold) or 0) or 0
+		local gemsBal = profile and (tonumber(profile.metaCurrency) or 0) or 0
+		local inRun = LocalPlayer:GetAttribute("InRun") == true
+		local maxShow = math.min(40, #filtered)
+		for idx = 1, maxShow do
+			local rec = filtered[idx]
+			local e = rec.entry
+			local row = create("Frame", {
+				Size = UDim2.new(1, 0, 0, 48),
+				BackgroundColor3 = Theme.Elevated,
+				BorderSizePixel = 0,
+				LayoutOrder = idx,
+				Parent = feedContainer,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(0, 7) }),
+				create("UIStroke", { Color = Theme.BorderSoft, Thickness = 1 }),
+			})
+
+			create("Frame", {
+				Size = UDim2.new(0, 3, 1, -10),
+				Position = UDim2.fromOffset(5, 5),
+				BackgroundColor3 = rec.rarityColor,
+				BorderSizePixel = 0,
+				Parent = row,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(0, 2) }),
+			})
+
+			local tags = {}
+			if rec.eval.isUpgrade then
+				table.insert(tags, "UPGRADE")
+			elseif rec.isCosmetic then
+				table.insert(tags, "LOOK")
+			end
+			if rec.owned then
+				table.insert(tags, "OWNED")
+			elseif not rec.eval.canWear and rec.def and rec.def.minLevel and profile and (profile.level or 1) < rec.def.minLevel then
+				table.insert(tags, "LV" .. tostring(rec.def.minLevel))
+			end
+			local shopBadge = SHOP_SHORT[e.kind] or "SHP"
+			local tagText = #tags > 0 and (" · " .. table.concat(tags, "/")) or ""
+
+			create("TextLabel", {
+				Size = UDim2.new(1, -104, 0, 18),
+				Position = UDim2.fromOffset(14, 5),
+				BackgroundTransparency = 1,
+				Text = string.format("[%s] %s · %s%s", shopBadge, tostring(e.name or e.defId), rec.rarityName, tagText),
+				Font = Enum.Font.GothamMedium,
+				TextSize = 11,
+				TextColor3 = Theme.TextPrimary,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Parent = row,
+			})
+
+			local subText = (rec.eval.summary ~= "") and (tostring(e.category or "") .. " · " .. rec.eval.summary)
+				or string.format("%s · Stock %d/%d", tostring(e.category or e.kind or "Item"), tonumber(e.remaining) or 0, tonumber(e.stock) or 1)
+			create("TextLabel", {
+				Size = UDim2.new(1, -104, 0, 16),
+				Position = UDim2.fromOffset(14, 24),
+				BackgroundTransparency = 1,
+				Text = subText,
+				Font = Enum.Font.RobotoMono,
+				TextSize = 10,
+				TextColor3 = rec.eval.isUpgrade and Theme.Accent or Theme.TextSecondary,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Parent = row,
+			})
+
+			local rem = tonumber(e.remaining) or 0
+			local price = tonumber(e.price) or 0
+			local isGems = (e.currency == "Gems")
+			local canAfford = isGems and (gemsBal >= price) or (goldBal >= price)
+			local priceLabel = rem <= 0 and "SOLD"
+				or (isGems and (tostring(price) .. " Gems") or (formatGold(price) .. "g"))
+			local canBuy = (rem > 0) and canAfford and (not inRun)
+
+			local buyBtn = create("TextButton", {
+				Size = UDim2.fromOffset(78, 28),
+				Position = UDim2.new(1, -84, 0.5, -14),
+				BackgroundColor3 = canBuy and Theme.Accent or Theme.Surface,
+				Text = priceLabel,
+				Font = Enum.Font.RobotoMono,
+				TextSize = 10,
+				TextColor3 = canBuy and Theme.AccentText or Theme.TextMuted,
+				AutoButtonColor = false,
+				Parent = row,
+			}, {
+				create("UICorner", { CornerRadius = UDim.new(0, 6) }),
+				create("UIStroke", { Color = Theme.Border, Thickness = 1 }),
+			})
+
+			trackConnection(buyBtn.MouseButton1Click:Connect(function()
+				if rem <= 0 then
+					setSniperStatus("ITEM SOLD OUT")
+					return
+				end
+				if LocalPlayer:GetAttribute("InRun") == true then
+					setSniperStatus("EXIT RUN TO BUY")
+					return
+				end
+				if not canAfford then
+					setSniperStatus(isGems and "NOT ENOUGH GEMS" or "NOT ENOUGH GOLD")
+					return
+				end
+				if buyEntry(mods, e.defId) then
+					setSniperStatus("BOUGHT · " .. tostring(e.name or e.defId))
+					if AutoLock.Enabled and AutoLock.Run then
+						task.delay(0.35, function()
+							if State.Alive and AutoLock.Enabled then
+								pcall(AutoLock.Run, true, setGearStatus)
+							end
+						end)
+					end
+					task.delay(0.25, function()
+						if State.Alive then
+							renderFeed(true)
+						end
+					end)
+				end
+			end))
+		end
+	end
+
+	task.spawn(function()
+		task.wait(0.6)
+		if not State.Alive then
+			return
+		end
+		local mods = getGameMods()
+		if mods and mods.Net then
+			trackConnection(mods.Net.onClientEvent("ShopStock", function(newStock)
+				if type(newStock) == "table" and type(newStock.entries) == "table" then
+					ShopSniper.Stock = newStock
+				end
+				if ShopSniper.Enabled then
+					task.spawn(runSniper, true)
+				else
+					task.spawn(renderFeed, false)
+				end
+			end))
+			local profTimerPending = false
+			trackConnection(mods.Net.onClientEvent("ProfileChanged", function()
+				if profTimerPending or not State.Alive then
+					return
+				end
+				profTimerPending = true
+				task.delay(0.35, function()
+					profTimerPending = false
+					if State.Alive then
+						renderFeed(false)
+					end
+				end)
+			end))
+		end
+		renderFeed(true)
+		if ShopSniper.Enabled then
+			runSniper(true)
+		end
+	end)
+
+	trackThread(function()
+		local lastRestockFetch = 0
+		while State.Alive do
+			task.wait(1)
+			local mods = getGameMods()
+			if mods and mods.Net then
+				local okP, prof = pcall(mods.Net.getProfile)
+				updateHeaderBanner(mods, okP and prof or nil)
+				local rAt = ShopSniper.Stock and ShopSniper.Stock.restockAt
+				if type(rAt) == "number" and rAt < math.huge and os.time() >= rAt and (os.clock() - lastRestockFetch) > 8 then
+					lastRestockFetch = os.clock()
+					if ShopSniper.Enabled then
+						task.spawn(runSniper, true)
+					else
+						task.spawn(renderFeed, true)
+					end
+				end
+			end
+		end
+	end)
+end
 
 --// =========================================================================
 --// TAB 6: SETTINGS
