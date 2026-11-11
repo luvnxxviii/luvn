@@ -1627,6 +1627,7 @@ local function getGameMods(forceReload)
 			Enums = require(Campaign.Shared.Enums),
 			Abilities = Abilities,
 			Statuses = Statuses,
+			Enemies = Enemies or {},
 			Items = Items,
 			Encounters = Encounters,
 			Trivia = Trivia,
@@ -1652,6 +1653,8 @@ local function getGameMods(forceReload)
 			Talents = safeRequire(Campaign.Systems:FindFirstChild("Talents")),
 			TalentPaths = safeRequire(Campaign.Data:FindFirstChild("TalentPaths")),
 			TalentDefs = safeRequire(Campaign.Data:FindFirstChild("Talents")),
+			Trainers = safeRequire(Campaign.Data:FindFirstChild("Trainers")),
+			SeraphTrade = safeRequire(Campaign.Systems:FindFirstChild("SeraphTrade")),
 			Upgrade = safeRequire(Campaign.Systems:FindFirstChild("Upgrade")),
 			WeaponUpgrade = safeRequire(Campaign.Systems:FindFirstChild("WeaponUpgrade")),
 			Reforge = safeRequire(Campaign.Systems:FindFirstChild("Reforge")),
@@ -1997,6 +2000,421 @@ function CombatAuto.GetPathGrants(mods, me)
 	return {}
 end
 
+-- Assesses each enemy's real threat: impactful team healers > high DPS / AoE nukers & dangerous debuffers > weak healers / tanks
+function CombatAuto.AnnotateEnemyThreats(mods, state, me, enemies)
+	if type(enemies) ~= "table" or #enemies == 0 then
+		return enemies
+	end
+
+	local Abilities = mods and mods.Abilities or {}
+	local Statuses = mods and mods.Statuses or {}
+	local CombatSim = mods and mods.CombatSim
+	local myTeam = me and me.team
+
+	local partyCount = 0
+	if state and type(state.combatants) == "table" then
+		for _, c in pairs(state.combatants) do
+			if c.team == myTeam and not c.isPet and (not CombatSim or CombatSim.isAlive(c)) then
+				partyCount += 1
+			end
+		end
+	end
+	partyCount = math.max(1, partyCount)
+
+	local enemyCount = #enemies
+	local damagedEnemyCount = 0
+	local enemyTeamHasDebuffs = false
+	local killableCount = 0
+	local nonBossHpSum, nonBossCount = 0, 0
+	local allHpSum = 0
+
+	local function statusHasTag(st, tag)
+		if not st or type(st.tags) ~= "table" then
+			return false
+		end
+		for _, t in ipairs(st.tags) do
+			if t == tag then
+				return true
+			end
+		end
+		return false
+	end
+
+	for _, e in ipairs(enemies) do
+		local c = e.combatant or {}
+		local mHp = math.max(1, e.maxHp or (c.derived and c.derived.maxHp) or c.maxHp or e.hp or 100)
+		allHpSum += mHp
+		if not e.isBoss then
+			nonBossHpSum += mHp
+			nonBossCount += 1
+		end
+		if (e.hp or mHp) < mHp * 0.92 then
+			damagedEnemyCount += 1
+		end
+		if not (c.immortal == true or c.unkillable == true) then
+			killableCount += 1
+		end
+		for _, stEntry in ipairs(c.statuses or {}) do
+			local sid = (type(stEntry) == "table" and stEntry.id) or stEntry
+			local st = type(sid) == "string" and Statuses[sid]
+			if st and not st.cleanseProof and (st.isDot or st.turnsNext or st.missesNext or statusHasTag(st, "Debuff") or statusHasTag(st, "Curse") or statusHasTag(st, "Control") or statusHasTag(st, "DoT")) then
+				enemyTeamHasDebuffs = true
+				break
+			end
+		end
+	end
+
+	local refMobHp = math.max(45, (nonBossCount > 0) and (nonBossHpSum / nonBossCount) or (allHpSum / math.max(1, enemyCount)))
+
+	local function collectEnemyAbilities(c)
+		local seen = {}
+		local list = {}
+		local function push(aid, sourceKind, powerScale, procWeight)
+			if type(aid) == "string" and aid ~= "" then
+				if not seen[aid] then
+					local entry = {
+						id = aid,
+						sourceKind = sourceKind,
+						powerScale = powerScale or 1,
+						procWeight = procWeight or 1,
+					}
+					seen[aid] = entry
+					table.insert(list, entry)
+				elseif sourceKind == "deck" and seen[aid].sourceKind ~= "deck" then
+					-- Regular deck copy supersedes cinematic weighting
+					seen[aid].sourceKind = "deck"
+					seen[aid].powerScale = 1
+					seen[aid].procWeight = 1
+				end
+			end
+		end
+		for _, aid in ipairs(c.abilityIds or {}) do
+			push(aid, "deck", 1, 1)
+		end
+		for _, aid in ipairs(c.hand or {}) do
+			push(aid, "deck", 1, 1)
+		end
+		if type(c.deckCards) == "table" then
+			for aid, cnt in pairs(c.deckCards) do
+				if (tonumber(cnt) or 0) > 0 then
+					push(aid, "deck", 1, 1)
+				end
+			end
+		end
+		if type(c.cleanse) == "table" then
+			push(c.cleanse.abilityId, "deck", 1, 1)
+		end
+		if type(c.cinematics) == "table" then
+			local cinPow = tonumber(c.cinematics.power) or 1
+			local cinChance = math.clamp(tonumber(c.cinematics.chance) or 0.25, 0.08, 1.0)
+			local cinGap = math.max(0, math.min(6, tonumber(c.cinematics.gap) or 0))
+			local cinProc = cinChance / (1 + cinGap * 0.55)
+			for _, aid in ipairs(c.cinematics.abilityIds or {}) do
+				push(aid, "cinematic", cinPow, cinProc)
+			end
+		end
+		if type(c.cinematic) == "table" then
+			local cinChance = math.clamp(tonumber(c.cinematic.chance) or 1.0, 0.10, 1.0)
+			push(c.cinematic.abilityId, "cinematic", 1, 0.25 * cinChance)
+		end
+		if type(c.lastStand) == "table" then
+			push(c.lastStand.abilityId, "cinematic", 1, 0.20)
+		end
+		return list
+	end
+
+	local function scoreSingleEnemy(e)
+		local c = e.combatant or {}
+		local cMaxHp = math.max(1, e.maxHp or (c.derived and c.derived.maxHp) or c.maxHp or e.hp or 100)
+		local hp = math.max(0, e.hp or cMaxHp)
+		local hpRatio = hp / cMaxHp
+		local healScale = tonumber(c.healScale) or 1
+		local dmgMult = tonumber(c.damageMultiplier) or 1
+		local critChance = (c.derived and c.derived.scaling and tonumber(c.derived.scaling.CritChance)) or 0
+		local activeDmgBuff = 1.0
+		local isCurrentlyCtrl = false
+
+		for _, stEntry in ipairs(c.statuses or {}) do
+			local sid = (type(stEntry) == "table" and stEntry.id) or stEntry
+			local st = type(sid) == "string" and Statuses[sid]
+			if st then
+				if type(st.damageDealtMultiplier) == "number" then
+					if st.damageDealtMultiplier > 1 then
+						activeDmgBuff *= st.damageDealtMultiplier
+					elseif st.damageDealtMultiplier <= 0 then
+						isCurrentlyCtrl = true
+					end
+				end
+				if st.skipsTurn == true or sid == "Stunned" or sid == "Frozen" then
+					isCurrentlyCtrl = true
+				end
+			end
+		end
+		if c.enraged == true then
+			activeDmgBuff *= 1.25
+		end
+		local effDmgScale = dmgMult * activeDmgBuff * (1 + math.clamp(critChance, 0, 0.75) * 0.5)
+		local pipReadiness = 1 + math.min(0.25, ((tonumber(c.energy) or 0) + (tonumber(c.powerPips) or 0)) * 0.04)
+
+		local peakAllyHealImpact = 0
+		local peakAllyHealScore = 0
+		local extraAllyHealSum = 0
+		local peakSelfHealScore = 0
+		local peakDpsScore = 0
+		local extraDpsSum = 0
+		local peakCtrlScore = 0
+		local extraCtrlSum = 0
+		local cleanUtil = 0
+
+		for _, abEntry in ipairs(collectEnemyAbilities(c)) do
+			local aid = abEntry.id
+			local ab = Abilities[aid]
+			if type(ab) == "table" then
+				local usedOnce = ab.oncePerFight and type(c.usedOnce) == "table" and c.usedOnce[aid] == true
+				if not usedOnce then
+					local cinPower = abEntry.powerScale or 1
+					local cd = tonumber(ab.cooldown) or 0
+					local cadence = (1 / (1 + cd * 0.55)) * (abEntry.procWeight or 1)
+					if ab.oncePerFight then
+						cadence *= 0.50
+					end
+					if type(ab.whenHurt) == "number" then
+						cadence *= (hpRatio < ab.whenHurt) and 1.15 or 0.40
+					end
+					if CombatSim and type(CombatSim.cooling) == "function" then
+						local okCd, isCooling = pcall(CombatSim.cooling, c, ab)
+						if okCd and isCooling == true then
+							cadence *= 0.50
+						end
+					end
+					local cost = math.max(0, tonumber(ab.energyCost) or 0)
+					local costFactor = 1 / (0.80 + cost * 0.25)
+					if abEntry.sourceKind == "deck" and (tonumber(c.energy) or 0) >= cost then
+						costFactor *= 1.10
+					end
+
+					local tk = ab.targetKind or "SingleEnemy"
+					local abAllyHealImpact = 0
+					local abAllyHealScore = 0
+					local abSelfHealScore = 0
+					local abDpsScore = 0
+					local abCtrlScore = 0
+
+					for _, eff in ipairs(ab.effects or {}) do
+						local kind = eff.kind
+						if kind == "Heal" or kind == "HealPercent" or kind == "Revive" then
+							local rawH = 0
+							if tonumber(eff.base) then
+								rawH = eff.base * cinPower * healScale
+							elseif tonumber(eff.share) then
+								rawH = eff.share * cMaxHp
+							elseif tonumber(eff.percent) then
+								rawH = eff.percent * refMobHp
+							elseif kind == "Revive" then
+								rawH = refMobHp * 0.65
+							end
+							local isSelfOnly = (tk == "SelfOnly" or eff.target == "Self")
+							if isSelfOnly then
+								abSelfHealScore += rawH * cadence * costFactor * 0.30
+							else
+								local allyReach = (tk == "AllAllies") and math.max(1, enemyCount) or 1
+								local rawImpact = rawH * allyReach * ((cd >= 3 or ab.oncePerFight) and 0.60 or 1.0) * (abEntry.sourceKind == "cinematic" and (abEntry.procWeight or 0.25) or 1)
+								if enemyCount >= 2 then
+									local teamMult = (tk == "AllAllies") and (enemyCount * 0.85) or 1.05
+									local hurtBoost = (damagedEnemyCount > 0) and 1.25 or 1.0
+									abAllyHealImpact = math.max(abAllyHealImpact, rawImpact)
+									abAllyHealScore += rawH * teamMult * cadence * costFactor * hurtBoost
+								else
+									-- Last enemy standing: team heals only sustain itself
+									abSelfHealScore += rawH * cadence * costFactor * 0.35
+								end
+							end
+						elseif kind == "Cleanse" then
+							if enemyCount >= 2 or enemyTeamHasDebuffs then
+								cleanUtil = math.max(cleanUtil, enemyTeamHasDebuffs and 45 or 25)
+							end
+						elseif kind == "Damage" then
+							local dBase = (tonumber(eff.base) or 0) * cinPower * math.max(1, tonumber(eff.hits) or 1)
+							local reach = (tk == "AllEnemies") and math.max(1, partyCount * 0.85) or 1
+							abDpsScore += dBase * effDmgScale * reach * cadence * costFactor * pipReadiness
+						elseif kind == "ApplyStatus" and type(eff.statusId) == "string" then
+							local sid = eff.statusId
+							local st = Statuses[sid]
+							local stacks = math.max(1, tonumber(eff.stacks) or 1)
+							local isAoe = (tk == "AllEnemies" or tk == "AllAllies")
+							local enemyReach = (tk == "AllEnemies") and math.max(1, partyCount * 0.85) or 1
+							if st and (st.isHot == true or statusHasTag(st, "HoT")) then
+								local hotH = (tonumber(st.healPerStack) or tonumber(st.base) or 14) * stacks * cinPower * healScale
+								local isSelfOnly = (tk == "SelfOnly" or eff.target == "Self")
+								if isSelfOnly or enemyCount <= 1 then
+									abSelfHealScore += hotH * cadence * costFactor * 0.25
+								else
+									local allyReach = (tk == "AllAllies") and math.max(1, enemyCount) or 1
+									local cinW = (abEntry.sourceKind == "cinematic") and (abEntry.procWeight or 0.25) or 1
+									abAllyHealImpact = math.max(abAllyHealImpact, hotH * allyReach * 0.70 * cinW)
+									abAllyHealScore += hotH * (tk == "AllAllies" and (enemyCount * 0.65) or 0.80) * cadence * costFactor
+								end
+							elseif st and (st.isDot == true or statusHasTag(st, "DoT")) then
+								local dotD = (tonumber(st.damagePerStack) or tonumber(st.base) or 12) * stacks * dmgMult
+								abDpsScore += dotD * enemyReach * cadence * costFactor * 0.80
+							elseif sid == "Beguiled" or (st and st.turnsNext == true) then
+								abCtrlScore += 85 * enemyReach * cadence * costFactor
+							elseif sid == "Stunned" or sid == "Frozen" or (st and st.skipsTurn == true) then
+								abCtrlScore += 65 * enemyReach * cadence * costFactor
+							elseif sid == "Blinded" or (st and st.missesNext == true) then
+								abCtrlScore += 42 * enemyReach * cadence * costFactor
+							elseif sid == "MortalWound" or sid == "Vulnerable" or sid == "Hexed" or sid == "Chilled" or sid == "Nailed" or (st and (statusHasTag(st, "Debuff") or statusHasTag(st, "Curse"))) then
+								abCtrlScore += 24 * enemyReach * cadence * costFactor
+							elseif isAoe and tk == "AllAllies" then
+								cleanUtil = math.max(cleanUtil, 20)
+							end
+						elseif kind == "Summon" then
+							abCtrlScore += (enemyCount <= 2 and 60 or 40) * cadence
+						end
+					end
+
+					if abAllyHealImpact > peakAllyHealImpact then
+						peakAllyHealImpact = abAllyHealImpact
+					end
+					if abAllyHealScore > 0 then
+						if abAllyHealScore > peakAllyHealScore then
+							extraAllyHealSum += peakAllyHealScore
+							peakAllyHealScore = abAllyHealScore
+						else
+							extraAllyHealSum += abAllyHealScore
+						end
+					end
+					if abSelfHealScore > peakSelfHealScore then
+						peakSelfHealScore = abSelfHealScore
+					end
+					if abDpsScore > 0 then
+						if abDpsScore > peakDpsScore then
+							extraDpsSum += peakDpsScore
+							peakDpsScore = abDpsScore
+						else
+							extraDpsSum += abDpsScore
+						end
+					end
+					if abCtrlScore > 0 then
+						if abCtrlScore > peakCtrlScore then
+							extraCtrlSum += peakCtrlScore
+							peakCtrlScore = abCtrlScore
+						else
+							extraCtrlSum += abCtrlScore
+						end
+					end
+				end
+			end
+		end
+
+		if type(c.summon) == "table" and not c.hasSummoned then
+			peakCtrlScore = math.max(peakCtrlScore, 45)
+		end
+		if type(c.cleanse) == "table" and (enemyCount >= 2 or enemyTeamHasDebuffs) then
+			cleanUtil = math.max(cleanUtil, enemyTeamHasDebuffs and 45 or 25)
+		end
+
+		local allyHealScore = peakAllyHealScore + extraAllyHealSum * 0.30
+		local dpsScore = peakDpsScore + extraDpsSum * 0.35
+		local ctrlScore = peakCtrlScore + extraCtrlSum * 0.30 + (cleanUtil * 0.45)
+
+		if isCurrentlyCtrl then
+			dpsScore *= 0.80
+			ctrlScore *= 0.80
+		end
+
+		return {
+			allyHealImpact = peakAllyHealImpact,
+			allyHealScore = allyHealScore,
+			selfHealScore = peakSelfHealScore,
+			dpsScore = dpsScore,
+			ctrlScore = ctrlScore,
+			cleanUtil = cleanUtil,
+			rawBase = allyHealScore + peakSelfHealScore + dpsScore + ctrlScore,
+		}
+	end
+
+	local maxPackDps = 0
+	local maxRawBase = 0
+	for _, e in ipairs(enemies) do
+		local metrics = scoreSingleEnemy(e)
+		e._threatMetrics = metrics
+		if metrics.dpsScore > maxPackDps then
+			maxPackDps = metrics.dpsScore
+		end
+		if metrics.rawBase > maxRawBase then
+			maxRawBase = metrics.rawBase
+		end
+	end
+
+	local hasMajorHealer = false
+	local maxEffectiveThreat = 0
+	for _, e in ipairs(enemies) do
+		local m = e._threatMetrics
+		local healVsRef = m.allyHealImpact / math.max(45, refMobHp)
+		local healVsDps = m.allyHealScore / math.max(25, maxPackDps)
+		-- Healer priority ONLY activates when enemy team has >=2 targets and healing is genuinely impactful
+		local isMajorHealer = (enemyCount >= 2)
+			and (m.allyHealScore >= math.max(24, refMobHp * 0.14))
+			and (healVsRef >= 0.20 or (m.allyHealImpact >= 45 and healVsDps >= 0.45))
+
+		local effectiveThreat = m.rawBase
+		if isMajorHealer then
+			effectiveThreat = math.max(m.rawBase, (maxRawBase * 1.35) + m.allyHealScore)
+			hasMajorHealer = true
+		end
+		local c = e.combatant or {}
+		local isImmortal = (c.immortal == true or c.unkillable == true) and killableCount > 0
+		if isImmortal then
+			effectiveThreat *= 0.15
+		end
+
+		local role
+		if isMajorHealer then
+			role = "Healer"
+		elseif m.ctrlScore >= m.dpsScore * 0.90 and m.ctrlScore >= 38 then
+			role = "Debuffer"
+		elseif m.dpsScore >= 30 then
+			role = "Damage"
+		else
+			role = "Support"
+		end
+
+		e.isMajorHealer = isMajorHealer
+		e.isImmortal = isImmortal
+		e.threatRole = role
+		e.allyHealScore = m.allyHealScore
+		e.dpsScore = m.dpsScore
+		e.ctrlScore = m.ctrlScore
+		e.threatScore = effectiveThreat
+		e._threatMetrics = nil
+		if effectiveThreat > maxEffectiveThreat then
+			maxEffectiveThreat = effectiveThreat
+		end
+	end
+
+	for _, e in ipairs(enemies) do
+		local ratio = (maxEffectiveThreat > 0) and (e.threatScore / maxEffectiveThreat) or 1
+		e.threatRatio = ratio
+		e.isTopThreat = (ratio >= 0.98)
+		local mult = 0.90 + ratio * 0.65
+		if e.isTopThreat then
+			mult = e.isMajorHealer and 1.95 or 1.75
+		elseif e.isMajorHealer then
+			mult = 1.80
+		end
+		if e.isBoss and not hasMajorHealer and not e.isImmortal then
+			mult += 0.15
+		end
+		if e.isImmortal then
+			mult = 0.25
+		end
+		e.threatFocusMult = mult
+	end
+
+	return enemies
+end
+
 CombatTab:AddSection("Combat Automation")
 
 local combatStatusCard
@@ -2070,6 +2488,879 @@ CombatTab:AddSegmented({
 		CombatAuto.HealThreshold = (tonumber(string.match(pct, "%d+")) or 50) / 100
 	end,
 })
+
+CombatAuto.Deck = {
+	Mode = Config.Get("SmartDeck_Mode", "Auto (Path & Element)"),
+	SizePreset = Config.Get("SmartDeck_Size", "20-24 (Ultra Lean)"),
+	AllowSacrifice = Config.Get("SmartDeck_Sacrifice", true),
+	TierMode = Config.Get("CardUpgrade_Mode", "Gold Only (Tier I-III)"),
+	AutoUpgradeLobby = Config.Get("CardUpgrade_AutoLobby", false),
+	Busy = false,
+	LastUpgradeAt = 0,
+}
+
+function CombatAuto.PlanSmartDeck(mods, profile)
+	if not mods or type(profile) ~= "table" then
+		return nil, "Profile or modules unavailable"
+	end
+	local Abilities = mods.Abilities or {}
+	local Statuses = mods.Statuses or {}
+	local Deck = mods.Deck
+	local CardTiers = mods.CardTiers
+	local LevelGate = mods.LevelGate
+	local Loadout = mods.Loadout
+	local Constants = mods.Constants
+	if not Deck or not CardTiers or not LevelGate then
+		return nil, "Deck/CardTiers modules missing"
+	end
+
+	local deckMin = (Constants and Constants.DECK and Constants.DECK.MIN) or 20
+	local deckMax = (Constants and Constants.DECK and Constants.DECK.MAX) or 64
+	local targetSize = 22
+	if CombatAuto.Deck.SizePreset == "24-30 (Balanced)" then
+		targetSize = 27
+	elseif CombatAuto.Deck.SizePreset == "30-36 (Extended)" then
+		targetSize = 33
+	end
+	targetSize = math.clamp(targetSize, deckMin, deckMax)
+
+	local mySchool = profile.primarySchool or "Storm"
+	local level = tonumber(profile.level) or 1
+	local derivedStats = profile.derived and profile.derived.stats or nil
+	local maxHp = math.max(100, tonumber(profile.derived and profile.derived.maxHp) or (300 + level * 15))
+	local gear = (Loadout and type(Loadout.gearFor) == "function") and Loadout.gearFor(profile.equipped, profile.inventory) or {}
+	local owned = type(profile.cardCopies) == "table" and profile.cardCopies or nil
+	local cardTiers = type(profile.cardTiers) == "table" and profile.cardTiers or {}
+
+	local pathId = nil
+	if mods.Talents and type(mods.Talents.pathOf) == "function" then
+		local okP, pid = pcall(mods.Talents.pathOf, profile)
+		if okP and type(pid) == "string" then
+			pathId = pid
+		end
+	end
+	local mode = CombatAuto.Deck.Mode
+	local isSupport = false
+	if mode == "Support / Heal Focus" then
+		isSupport = true
+	elseif mode == "Damage Focus" then
+		isSupport = false
+	else
+		isSupport = (pathId == "Sanctuary" or pathId == "Verdant" or pathId == "Glacier")
+	end
+
+	-- Origins immune check (matching CampDeck logic)
+	local originExempt = nil
+	if profile.originId and mods.Campaign then
+		local okO, Origins = pcall(require, mods.Campaign.Data:FindFirstChild("Origins"))
+		if okO and type(Origins) == "table" and type(Origins.list) == "table" and Origins.list[profile.originId] then
+			originExempt = Origins.list[profile.originId].abilityId
+		end
+	end
+
+	local function isSingleElementWardOnly(ab)
+		if not ab or type(ab.effects) ~= "table" or #ab.effects == 0 then
+			return false
+		end
+		local sawWard = false
+		for _, ef in ipairs(ab.effects) do
+			if ef.kind == "Damage" or ef.kind == "Heal" or ef.kind == "Shield" or ef.kind == "Cleanse" or ef.kind == "GainEnergy" then
+				return false
+			elseif ef.kind == "ApplyStatus" and ef.statusId then
+				local st = Statuses[ef.statusId]
+				if st and st.schoolTaken ~= nil and (ab.targetKind == "SelfOnly" or ef.target == "Self") then
+					sawWard = true
+				else
+					return false
+				end
+			else
+				return false
+			end
+		end
+		return sawWard
+	end
+
+	-- Collect all owned/learned choosable cards AND gear cards
+	local gearCards = Deck.gearCards(gear)
+	local learnedSet = {}
+	for _, aid in ipairs(profile.learnedAbilities or {}) do
+		if type(aid) == "string" then
+			learnedSet[aid] = true
+		end
+	end
+	for _, aid in ipairs(profile.knownAbilities or {}) do
+		if type(aid) == "string" then
+			learnedSet[aid] = true
+		end
+	end
+
+	local candidates = {}
+	local excludedGear = {}
+
+	local function scoreCardCandidate(aid, isFromGear)
+		local ab = Abilities[aid]
+		if not ab or ab.retired or ab.hidden then
+			return nil
+		end
+		if isSingleElementWardOnly(ab) then
+			if isFromGear then
+				excludedGear[aid] = 0
+			end
+			return nil
+		end
+
+		local maxAllowed
+		if isFromGear then
+			maxAllowed = gearCards[aid] or 0
+		else
+			if not Deck.choosable(aid) then
+				return nil
+			end
+			if not LevelGate.canDeck(level, aid) then
+				return nil
+			end
+			if aid ~= originExempt and not LevelGate.statsAllow(derivedStats, aid) then
+				return nil
+			end
+			maxAllowed = Deck.limit(aid, owned)
+			if Deck.otherSchool(aid, mySchool) then
+				local otherCap = (Constants and Constants.DECK and Constants.DECK.OTHER_SCHOOL_COPIES) or 1
+				maxAllowed = math.min(maxAllowed, otherCap)
+			end
+		end
+		if maxAllowed <= 0 then
+			return nil
+		end
+
+		local cost = math.max(0, tonumber(ab.energyCost) or 0)
+		local tk = ab.targetKind or "SingleEnemy"
+		local isAoeEnemy = (tk == "AllEnemies")
+		local isAoeAlly = (tk == "AllAllies")
+		local tier = isFromGear and (CardTiers.heldOf(aid, gear) or 1) or CardTiers.of(cardTiers, aid)
+		local abSchool = ab.school or ab.cardSchool
+		local sameSchool = (abSchool == mySchool) or ab.anySchool == true or ab.neutral == true
+
+		local dmgTotal = 0
+		local healTotal = 0
+		local shieldTotal = 0
+		local dotTotal = 0
+		local hotTotal = 0
+		local gainEnergy = 0
+		local payHpShare = 0
+		local hasCleanse = false
+		local hasShatter = false
+		local hasSchoolBuff = false
+		local buffSchoolMatch = false
+		local hasMitigation = false
+		local mitigationAoe = false
+		local hasStunOrFreeze = false
+		local hasBlind = false
+		local hasVuln = false
+		local hasBeguile = false
+
+		for _, ef in ipairs(ab.effects or {}) do
+			local kind = ef.kind
+			local pw = 1
+			local okPw, resPw = pcall(CardTiers.power, tier, ef, aid, level)
+			if okPw and type(resPw) == "number" then
+				pw = resPw
+			end
+			if isFromGear and CardTiers.isHeldCard(aid) and type(CardTiers.weaponPower) == "function" then
+				local wTier, wRar, wId = CardTiers.heldOf(aid, gear)
+				local okWp, wp = pcall(CardTiers.weaponPower, wRar or "Common", wTier or 1, ef, wId)
+				if okWp and type(wp) == "number" and wp > 0 then
+					pw = wp
+				end
+			end
+
+			if kind == "Damage" then
+				dmgTotal += (tonumber(ef.base) or 0) * math.max(1, tonumber(ef.hits) or 1) * pw
+			elseif kind == "Detonate" or kind == "ConsumeDot" then
+				dmgTotal += 38 * pw
+			elseif kind == "Heal" then
+				if tonumber(ef.base) then
+					healTotal += ef.base * pw
+				elseif tonumber(ef.share) then
+					healTotal += ef.share * maxHp
+				else
+					healTotal += 30 * pw
+				end
+			elseif kind == "Shield" then
+				-- Direct HP shields (e.g. Light's Dawnward, AegisOfDawn, Benediction) are neutral HP shields
+				shieldTotal += (tonumber(ef.base) or 28) * pw
+			elseif kind == "Cleanse" then
+				hasCleanse = true
+			elseif kind == "Shatter" then
+				hasShatter = true
+			elseif kind == "GainEnergy" then
+				gainEnergy += (tonumber(ef.amount) or 0)
+			elseif kind == "PayHealth" then
+				local pVal = tonumber(ef.share) or ((tonumber(ef.amount) or 0) / maxHp)
+				payHpShare += math.max(0, pVal)
+			elseif kind == "ApplyStatus" and ef.statusId then
+				local sid = ef.statusId
+				local st = Statuses[sid]
+				local stacks = math.max(1, tonumber(ef.stacks) or 1)
+				if st then
+					if st.isHot or (type(st.tags) == "table" and table.find(st.tags, "HoT")) then
+						hotTotal += (tonumber(st.healPerStack) or 14) * stacks * pw
+					elseif st.isDot or (type(st.tags) == "table" and table.find(st.tags, "DoT")) then
+						dotTotal += (tonumber(st.damagePerStack) or 10) * stacks * pw
+					elseif st.schoolDealt ~= nil or (type(st.damageDealtMultiplier) == "number" and st.damageDealtMultiplier > 1) then
+						hasSchoolBuff = true
+						if st.school == mySchool or ab.school == mySchool then
+							buffSchoolMatch = true
+						end
+					elseif type(st.damageTakenMultiplier) == "number" and st.damageTakenMultiplier < 1 and st.schoolTaken == nil then
+						hasMitigation = true
+						if isAoeAlly then
+							mitigationAoe = true
+						end
+					elseif st.preventsAction then
+						hasStunOrFreeze = true
+					elseif st.missesNext then
+						hasBlind = true
+					elseif st.turnsNext then
+						hasBeguile = true
+					elseif sid == "Vulnerable" or (type(st.damageTakenMultiplier) == "number" and st.damageTakenMultiplier > 1) then
+						hasVuln = true
+					end
+				end
+			end
+		end
+
+		local effDmg = dmgTotal * (isAoeEnemy and 2.25 or 1.0) + (dotTotal * 0.60 * (isAoeEnemy and 2.1 or 1.0))
+		local effHeal = healTotal * (isAoeAlly and 2.25 or 1.0) + (hotTotal * 0.70 * (isAoeAlly and 2.1 or 1.0))
+		local effShield = shieldTotal * (isAoeAlly and 2.25 or 1.0) + (hasMitigation and (mitigationAoe and 135 or 65) or 0)
+		local pipDenom = math.max(0.85, cost)
+		local dmgPerPip = effDmg / pipDenom
+		local supPerPip = (effHeal + effShield * 0.90) / pipDenom
+
+		-- Utility bonus from effects
+		local utilValue = 0
+		if hasVuln then
+			utilValue += isAoeEnemy and 150 or 70
+		end
+		if hasStunOrFreeze then
+			utilValue += isAoeEnemy and 130 or 60
+		end
+		if hasBlind then
+			utilValue += isAoeEnemy and 95 or 40
+		end
+		if hasBeguile then
+			utilValue += 55
+		end
+		if hasShatter then
+			utilValue += isAoeEnemy and 80 or 45
+		end
+		if hasCleanse then
+			utilValue += (isAoeAlly or tk == "SingleAny") and 85 or 45
+		end
+		if ab.spendAll then
+			utilValue -= 15
+		end
+
+		-- Assign archetype category & compute worth-it score
+		local roleBucket = "Filler"
+		local valueScore = 0
+		local recCap = maxAllowed
+
+		if isFromGear and aid ~= originExempt and not hasCleanse and effHeal == 0 and effDmg <= 45 and not hasVuln and not hasBlind and not hasStunOrFreeze then
+			-- Prune weak filler gear cards (Bolt/Shot/Strike/Cleave/Volley/Bash) to keep deck tight
+			excludedGear[aid] = 0
+			return nil
+		end
+
+		if aid == "Sacrifice" or (cost == 0 and gainEnergy > 0 and payHpShare > 0) then
+			if not CombatAuto.Deck.AllowSacrifice or maxHp < 320 then
+				return nil
+			end
+			roleBucket = isSupport and "SupportUtility" or "AttackUtility"
+			valueScore = 115
+			recCap = math.min(maxAllowed, 1)
+		elseif hasSchoolBuff then
+			if not buffSchoolMatch then
+				-- Skip off-school damage buffs
+				return nil
+			end
+			roleBucket = isSupport and "SupportUtility" or "AttackUtility"
+			valueScore = 165
+			recCap = math.min(maxAllowed, isSupport and 2 or 3)
+		elseif hasCleanse and dmgTotal == 0 and healTotal == 0 and shieldTotal == 0 then
+			-- Pure Cleanse (0 pips): keep 1-2 copies depending on role
+			roleBucket = isSupport and "SupportUtility" or "AttackUtility"
+			valueScore = isSupport and 175 or 130
+			recCap = math.min(maxAllowed, isSupport and 2 or 1)
+		elseif isSupport and (healTotal > 0 or hotTotal > 0) and dmgTotal == 0 then
+			if isAoeAlly then
+				roleBucket = "TeamHeal"
+			else
+				roleBucket = "FastHeal"
+			end
+			valueScore = supPerPip * (sameSchool and 1.25 or 0.90) + (utilValue * 0.55)
+			if cost <= 2 then
+				valueScore += 22
+			end
+			recCap = math.min(maxAllowed, cost >= 4 and 2 or (sameSchool and 4 or 1))
+		elseif isSupport and (shieldTotal > 0 or hasMitigation) and dmgTotal == 0 then
+			-- Support shields: Light's neutral HP shields (Dawnward, AegisOfDawn, Benediction) & Nature's EarthenWall/Oakhide
+			roleBucket = "NeutralShield"
+			valueScore = supPerPip * ((abSchool == "Light" or abSchool == mySchool) and 1.22 or 0.85) + (utilValue * 0.50)
+			if cost <= 2 then
+				valueScore += 18
+			end
+			recCap = math.min(maxAllowed, 2)
+		elseif dmgTotal > 0 then
+			if payHpShare >= 0.18 then
+				-- High-HP self-sacrifice nukes like SeraphsSiphon/Immolate: keep at most 1 (or skip if fragile)
+				valueScore = dmgPerPip * 0.65 - 50
+				recCap = math.min(maxAllowed, 1)
+			end
+			if isAoeEnemy then
+				roleBucket = isSupport and "SupportOffense" or "AoeClear"
+			elseif cost >= 3 then
+				roleBucket = isSupport and "SupportOffense" or "BigFinisher"
+			else
+				roleBucket = isSupport and "SupportOffense" or "CheapAttack"
+			end
+
+			local schoolMult = sameSchool and 1.32 or 0.72
+			local costSmooth = (cost <= 3 and 1.08 or (cost >= 6 and 0.72 or 0.94))
+			if isSupport then
+				-- Support mode prizes healing/blinding/debuff hybrids heavily
+				local hybridSupportBonus = (effHeal * 1.15) + (utilValue * 0.95)
+				valueScore = ((dmgPerPip * 0.75) + (hybridSupportBonus / pipDenom)) * schoolMult * costSmooth
+			else
+				valueScore = (dmgPerPip + (utilValue / pipDenom) + (effHeal * 0.45 / pipDenom)) * schoolMult * costSmooth
+			end
+
+			if cost >= 5 then
+				recCap = math.min(maxAllowed, cost >= 6 and 1 or 2)
+			elseif isFromGear then
+				recCap = math.min(maxAllowed, 1)
+			elseif not sameSchool and (aid ~= "Sunder") then
+				recCap = math.min(maxAllowed, 1)
+			else
+				-- Cap copies cleanly so deck doesn't flood on one card
+				recCap = math.min(maxAllowed, cost <= 1 and 4 or (cost <= 2 and 3 or 2))
+			end
+		elseif hasBlind or hasVuln or hasBeguile or hasStunOrFreeze then
+			roleBucket = isSupport and "SupportOffense" or "AttackUtility"
+			valueScore = (utilValue / pipDenom) * (sameSchool and 1.20 or 0.95)
+			recCap = math.min(maxAllowed, 1)
+		else
+			return nil
+		end
+
+		if valueScore <= 22 then
+			if isFromGear then
+				excludedGear[aid] = 0
+			end
+			return nil
+		end
+
+		-- If card comes from gear, only include in lean deck if it's genuinely high-tier/impactful
+		if isFromGear and valueScore < 72 then
+			excludedGear[aid] = 0
+			return nil
+		end
+
+		return {
+			id = aid,
+			name = ab.name or aid,
+			school = abSchool or "?",
+			cost = cost,
+			bucket = roleBucket,
+			score = valueScore,
+			dmgPerPip = dmgPerPip,
+			supPerPip = supPerPip,
+			maxCopies = recCap,
+			isFromGear = isFromGear,
+			tier = tier,
+		}
+	end
+
+	for aid in pairs(gearCards) do
+		local c = scoreCardCandidate(aid, true)
+		if c then
+			table.insert(candidates, c)
+		end
+	end
+	for aid in pairs(learnedSet) do
+		if not gearCards[aid] then
+			local c = scoreCardCandidate(aid, false)
+			if c then
+				table.insert(candidates, c)
+			end
+		end
+	end
+
+	table.sort(candidates, function(a, b)
+		if a.score ~= b.score then
+			return a.score > b.score
+		end
+		if a.cost ~= b.cost then
+			return a.cost < b.cost
+		end
+		return tostring(a.id) < tostring(b.id)
+	end)
+
+	-- Role quotas calibrated for lean targetSize (~22)
+	local scaleF = targetSize / 22
+	local quotas
+	if isSupport then
+		quotas = {
+			FastHeal = math.max(3, math.floor(5 * scaleF + 0.5)),
+			TeamHeal = math.max(3, math.floor(5 * scaleF + 0.5)),
+			NeutralShield = math.max(2, math.floor(3 * scaleF + 0.5)),
+			SupportUtility = math.max(2, math.floor(4 * scaleF + 0.5)),
+			SupportOffense = math.max(3, math.floor(5 * scaleF + 0.5)),
+		}
+	else
+		quotas = {
+			CheapAttack = math.max(4, math.floor(7 * scaleF + 0.5)),
+			AoeClear = math.max(4, math.floor(6 * scaleF + 0.5)),
+			BigFinisher = math.max(2, math.floor(4 * scaleF + 0.5)),
+			AttackUtility = math.max(2, math.floor(4 * scaleF + 0.5)),
+		}
+	end
+
+	local chosenCounts = {}
+	local totalSelected = 0
+	local highCostSelected = 0
+	local bucketCounts = {}
+	local byBucket = {}
+	for _, c in ipairs(candidates) do
+		byBucket[c.bucket] = byBucket[c.bucket] or {}
+		table.insert(byBucket[c.bucket], c)
+	end
+
+	local function tryAddCopy(c)
+		if totalSelected >= targetSize then
+			return false
+		end
+		local cur = chosenCounts[c.id] or 0
+		if cur >= c.maxCopies then
+			return false
+		end
+		if c.cost >= 5 and highCostSelected >= math.max(2, math.floor(targetSize * 0.22)) then
+			return false
+		end
+		chosenCounts[c.id] = cur + 1
+		totalSelected += 1
+		bucketCounts[c.bucket] = (bucketCounts[c.bucket] or 0) + 1
+		if c.cost >= 5 then
+			highCostSelected += 1
+		end
+		return true
+	end
+
+	-- Pass 1: Round-robin top cards inside each role quota so we get strong variety + low bricking
+	local progress = true
+	while totalSelected < targetSize and progress do
+		progress = false
+		for bName, qCap in pairs(quotas) do
+			if totalSelected >= targetSize then
+				break
+			end
+			if (bucketCounts[bName] or 0) < qCap then
+				local bList = byBucket[bName] or {}
+				for _, c in ipairs(bList) do
+					if tryAddCopy(c) then
+						progress = true
+						break
+					end
+				end
+			end
+		end
+	end
+
+	-- Pass 2: Fill up to deckMin (20) / targetSize with top value-per-pip cards (never leaving below legal minimum 20!)
+	for _, c in ipairs(candidates) do
+		if totalSelected >= targetSize then
+			break
+		end
+		while (chosenCounts[c.id] or 0) < c.maxCopies and totalSelected < targetSize do
+			if not tryAddCopy(c) then
+				break
+			end
+		end
+	end
+
+	-- Ensure every excluded gear card explicitly maps to 0 so Deck.cards disables weak filler gear cards
+	local finalMap = {}
+	for aid in pairs(gearCards) do
+		finalMap[aid] = chosenCounts[aid] or 0
+	end
+	for aid, cnt in pairs(chosenCounts) do
+		if cnt > 0 then
+			finalMap[aid] = cnt
+		end
+	end
+
+	-- Compute real expected totals with Deck.cards (fallback fill if account has very few learned cards)
+	if totalSelected < deckMin then
+		for aid in pairs(learnedSet) do
+			if totalSelected >= deckMin then
+				break
+			end
+			local cur = finalMap[aid] or 0
+			local lim = Deck.choosable(aid) and LevelGate.canDeck(level, aid) and Deck.limit(aid, owned) or 0
+			if Deck.otherSchool(aid, mySchool) then
+				lim = math.min(lim, 1)
+			end
+			if cur < lim then
+				local add = math.min(lim - cur, deckMin - totalSelected)
+				finalMap[aid] = cur + add
+				totalSelected += add
+			end
+		end
+	end
+
+	-- Collect chosen breakdown for readout/preview
+	local pickedSummary = {}
+	for _, c in ipairs(candidates) do
+		local cnt = finalMap[c.id] or 0
+		if cnt > 0 then
+			table.insert(pickedSummary, string.format("%s x%d (%dp, %.0f)", c.name, cnt, c.cost, c.score))
+		end
+	end
+
+	return {
+		school = mySchool,
+		path = pathId or "?",
+		role = isSupport and "Support" or "Damage",
+		total = totalSelected,
+		plan = finalMap,
+		gearCards = gearCards,
+		summary = pickedSummary,
+	}, nil
+end
+
+function CombatAuto.ApplySmartDeck(mods, silent)
+	if CombatAuto.Deck.Busy then
+		return false, "Deck builder busy"
+	end
+	if LocalPlayer:GetAttribute("InRun") == true then
+		return false, "Only usable in Lobby"
+	end
+	if not mods or not mods.Net or not mods.Deck then
+		return false, "Game modules unavailable"
+	end
+	CombatAuto.Deck.Busy = true
+	local okRun, appliedOk, msg = pcall(function()
+		local okP, profile = pcall(mods.Net.getProfile)
+		if not okP or type(profile) ~= "table" then
+			return false, "Failed to read profile"
+		end
+		local result, planErr = CombatAuto.PlanSmartDeck(mods, profile)
+		if not result then
+			return false, planErr or "Deck plan failed"
+		end
+
+		local Deck = mods.Deck
+		local activeIdx = tonumber(profile.activeDeck) or 1
+		local rawCur = (type(profile.decks) == "table" and type(profile.decks[activeIdx]) == "table" and profile.decks[activeIdx].cards)
+			or profile.deck or {}
+		local gear = (mods.Loadout and type(mods.Loadout.gearFor) == "function")
+			and mods.Loadout.gearFor(profile.equipped, profile.inventory) or {}
+
+		-- Build exact current state as seen by Deck.cards (includes active gear defaults)
+		local curEffective = Deck.cards(rawCur, gear)
+		local seq = (tonumber(profile.deckSeq) or 0) + 1
+		local deckMin = (mods.Constants and mods.Constants.DECK and mods.Constants.DECK.MIN) or 20
+		local deckMax = (mods.Constants and mods.Constants.DECK and mods.Constants.DECK.MAX) or 64
+
+		local allIds = {}
+		local seen = {}
+		for k in pairs(curEffective) do
+			if not seen[k] then
+				seen[k] = true
+				table.insert(allIds, k)
+			end
+		end
+		for k in pairs(result.plan) do
+			if not seen[k] then
+				seen[k] = true
+				table.insert(allIds, k)
+			end
+		end
+		table.sort(allIds)
+
+		local curTotal = Deck.total(curEffective)
+		local changes = 0
+		-- Legal interleaved apply: add toward targets whenever curTotal < deckMax, remove excess whenever curTotal > deckMin
+		for _pass = 1, 20 do
+			local progressed = false
+			for _, aid in ipairs(allIds) do
+				local cVal = curEffective[aid] or 0
+				local tVal = result.plan[aid] or 0
+				if cVal < tVal and curTotal < deckMax then
+					local step = math.min(tVal - cVal, deckMax - curTotal)
+					local nextVal = cVal + step
+					mods.Net.fireServer("SetDeckCard", { abilityId = aid, count = nextVal, seq = seq, deck = activeIdx })
+					seq += 1
+					curEffective[aid] = nextVal
+					curTotal += step
+					changes += 1
+					progressed = true
+					task.wait(0.05)
+				end
+			end
+			for _, aid in ipairs(allIds) do
+				local cVal = curEffective[aid] or 0
+				local tVal = result.plan[aid] or 0
+				if cVal > tVal and curTotal > deckMin then
+					local step = math.min(cVal - tVal, curTotal - deckMin)
+					local nextVal = cVal - step
+					mods.Net.fireServer("SetDeckCard", { abilityId = aid, count = nextVal, seq = seq, deck = activeIdx })
+					seq += 1
+					curEffective[aid] = nextVal > 0 and nextVal or nil
+					curTotal -= step
+					changes += 1
+					progressed = true
+					task.wait(0.05)
+				end
+			end
+			if not progressed then
+				break
+			end
+		end
+
+		local summaryTxt = string.format("DECK %s (%s:%s) · %dc · %d edits", result.role, result.school, result.path, curTotal, changes)
+		return true, summaryTxt, result
+	end)
+	CombatAuto.Deck.Busy = false
+	if not okRun then
+		return false, tostring(appliedOk)
+	end
+	return appliedOk, msg
+end
+
+function CombatAuto.UpgradeOwnedCards(mods, silent)
+	if LocalPlayer:GetAttribute("InRun") == true then
+		return 0, "Only usable in Lobby"
+	end
+	if not mods or not mods.Net or not mods.CardTiers or not mods.Abilities then
+		return 0, "Modules missing"
+	end
+	local okP, profile = pcall(mods.Net.getProfile)
+	if not okP or type(profile) ~= "table" then
+		return 0, "Failed to read profile"
+	end
+
+	local CardTiers = mods.CardTiers
+	local Abilities = mods.Abilities
+	local SeraphTrade = mods.SeraphTrade
+	local allowGems = (CombatAuto.Deck.TierMode == "Include Gems (Up to Max)")
+	local gold = tonumber(profile.gold) or 0
+	local gems = tonumber(profile.metaCurrency) or 0
+	local lv = tonumber(profile.level) or 1
+	local school = profile.primarySchool or "Storm"
+	local cardTiers = type(profile.cardTiers) == "table" and table.clone(profile.cardTiers) or {}
+
+	-- Build trainer map per ability from Loadout.lessons + ability school fallback
+	local lessonTrainer = {}
+	if mods.Loadout and type(mods.Loadout.lessons) == "function" then
+		local okL, list = pcall(mods.Loadout.lessons)
+		if okL and type(list) == "table" then
+			for _, entry in ipairs(list) do
+				if type(entry) == "table" and type(entry.abilityId) == "string" and type(entry.trainerId) == "string" then
+					lessonTrainer[entry.abilityId] = entry.trainerId
+				end
+			end
+		end
+	end
+
+	local activeIdx = tonumber(profile.activeDeck) or 1
+	local rawDeck = (type(profile.decks) == "table" and type(profile.decks[activeIdx]) == "table" and profile.decks[activeIdx].cards)
+		or profile.deck or {}
+
+	-- Gather owned active cards ONLY (in deck + learnedAbilities + talent skills), prioritized by deck membership
+	local targetIds = {}
+	local seen = {}
+	for aid, cnt in pairs(rawDeck) do
+		if type(aid) == "string" and (tonumber(cnt) or 0) > 0 and not seen[aid] then
+			seen[aid] = true
+			table.insert(targetIds, { id = aid, inDeck = true })
+		end
+	end
+	for _, aid in ipairs(profile.learnedAbilities or {}) do
+		if type(aid) == "string" and not seen[aid] then
+			seen[aid] = true
+			table.insert(targetIds, { id = aid, inDeck = false })
+		end
+	end
+	if mods.Talents and type(mods.Talents.skillsOf) == "function" then
+		local okS, sks = pcall(mods.Talents.skillsOf, profile)
+		if okS and type(sks) == "table" then
+			for _, aid in ipairs(sks) do
+				if type(aid) == "string" and not seen[aid] then
+					seen[aid] = true
+					table.insert(targetIds, { id = aid, inDeck = true })
+				end
+			end
+		end
+	end
+
+	local upgrades = 0
+	for _, item in ipairs(targetIds) do
+		if LocalPlayer:GetAttribute("InRun") == true or not State.Alive then
+			break
+		end
+		local aid = item.id
+		local ab = Abilities[aid]
+		local isSeraphCard = SeraphTrade and type(SeraphTrade.teaches) == "function" and SeraphTrade.teaches(aid)
+		if ab and not CardTiers.isHeldCard(aid) and not isSeraphCard and CardTiers.tierable(aid) then
+			local trainerId = lessonTrainer[aid] or ab.school
+			if type(trainerId) == "string" and trainerId ~= "" then
+				for _step = 1, 6 do
+					local curTier = CardTiers.of(cardTiers, aid)
+					local can, _ = CardTiers.canRaise(aid, curTier, lv, gold, gems, school)
+					if not can then
+						break
+					end
+					local price = CardTiers.price(curTier, aid)
+					local gCost = (price and tonumber(price.gold)) or 0
+					local mCost = (price and tonumber(price.gems)) or 0
+					if mCost > 0 and not allowGems then
+						break
+					end
+					if gold < gCost or gems < mCost then
+						break
+					end
+					mods.Net.fireServer("UpgradeCard", { abilityId = aid, trainerId = trainerId, tier = curTier })
+					gold -= gCost
+					gems -= mCost
+					cardTiers[aid] = curTier + 1
+					upgrades += 1
+					task.wait(0.16)
+				end
+			end
+		end
+	end
+	CombatAuto.Deck.LastUpgradeAt = os.clock()
+	return upgrades, (upgrades > 0 and ("UPGRADED · " .. tostring(upgrades) .. " CARD TIERS") or "NO AFFORDABLE CARD UPGRADES")
+end
+
+CombatTab:AddSection("Smart Deck & Card Upgrades")
+
+CombatTab:AddDropdown({
+	Title = "Smart Deck Mode",
+	Options = { "Auto (Path & Element)", "Damage Focus", "Support / Heal Focus" },
+	Default = CombatAuto.Deck.Mode,
+	Callback = function(choice)
+		CombatAuto.Deck.Mode = choice
+		Config.Set("SmartDeck_Mode", choice)
+	end,
+})
+
+CombatTab:AddDropdown({
+	Title = "Target Deck Size",
+	Options = { "20-24 (Ultra Lean)", "24-30 (Balanced)", "30-36 (Extended)" },
+	Default = CombatAuto.Deck.SizePreset,
+	Callback = function(choice)
+		CombatAuto.Deck.SizePreset = choice
+		Config.Set("SmartDeck_Size", choice)
+	end,
+})
+
+CombatTab:AddToggle({
+	Title = "Include Sacrifice (0-Pip +2 Pips)",
+	Description = "Keeps 1 Sacrifice copy when unlocked & safe HP (>=320)",
+	Default = CombatAuto.Deck.AllowSacrifice,
+	Callback = function(enabled)
+		CombatAuto.Deck.AllowSacrifice = enabled
+		Config.Set("SmartDeck_Sacrifice", enabled)
+	end,
+})
+
+CombatTab:AddButton({
+	Title = "Build & Apply Smart Deck",
+	Callback = function()
+		task.spawn(function()
+			local mods = getGameMods()
+			if not mods then
+				setCombatStatus("DECK · GAME MODS NOT READY")
+				return
+			end
+			setCombatStatus("BUILDING SMART DECK...")
+			local ok, msg = CombatAuto.ApplySmartDeck(mods, false)
+			setCombatStatus(ok and msg or ("DECK · " .. tostring(msg)))
+		end)
+	end,
+})
+
+CombatTab:AddDropdown({
+	Title = "Card Tier Upgrade Budget",
+	Options = { "Gold Only (Tier I-III)", "Include Gems (Up to Max)" },
+	Default = CombatAuto.Deck.TierMode,
+	Callback = function(choice)
+		CombatAuto.Deck.TierMode = choice
+		Config.Set("CardUpgrade_Mode", choice)
+	end,
+})
+
+CombatTab:AddButton({
+	Title = "Upgrade Owned Card Tiers Now",
+	Callback = function()
+		task.spawn(function()
+			local mods = getGameMods()
+			if not mods then
+				return
+			end
+			local _, msg = CombatAuto.UpgradeOwnedCards(mods, false)
+			setCombatStatus(msg)
+		end)
+	end,
+})
+
+CombatTab:AddToggle({
+	Title = "Auto Upgrade Cards in Lobby",
+	Description = "Automatically upgrades deck/learned card tiers in Lobby",
+	Default = CombatAuto.Deck.AutoUpgradeLobby,
+	Callback = function(enabled)
+		CombatAuto.Deck.AutoUpgradeLobby = enabled
+		Config.Set("CardUpgrade_AutoLobby", enabled)
+		if enabled then
+			task.spawn(function()
+				local mods = getGameMods()
+				if mods then
+					local cnt, msg = CombatAuto.UpgradeOwnedCards(mods, true)
+					if cnt > 0 then
+						setCombatStatus(msg)
+					end
+				end
+			end)
+		end
+	end,
+})
+
+task.spawn(function()
+	task.wait(2.5)
+	local mods = getGameMods()
+	if mods and mods.Net and State.Alive then
+		if CombatAuto.Deck.AutoUpgradeLobby and LocalPlayer:GetAttribute("InRun") ~= true then
+			local cnt, msg = CombatAuto.UpgradeOwnedCards(mods, true)
+			if cnt > 0 then
+				setCombatStatus(msg)
+			end
+		end
+		trackConnection(mods.Net.onClientEvent("ProfileChanged", function()
+			if CombatAuto.Deck.AutoUpgradeLobby and State.Alive and (os.clock() - CombatAuto.Deck.LastUpgradeAt) >= 6.0 and LocalPlayer:GetAttribute("InRun") ~= true then
+				CombatAuto.Deck.LastUpgradeAt = os.clock()
+				task.delay(0.9, function()
+					if CombatAuto.Deck.AutoUpgradeLobby and State.Alive then
+						local cnt, msg = CombatAuto.UpgradeOwnedCards(mods, true)
+						if cnt > 0 then
+							setCombatStatus(msg)
+						end
+					end
+				end)
+			end
+		end))
+	end
+end)
 
 CombatTab:AddSection("OP Combat Helpers")
 
@@ -2430,9 +3721,11 @@ local function analyzeAbility(mods, ability, energy, me, cardTiersFallback)
 	local revivesAlly = false
 	local preventsAction = false
 	local appliesControl = false
+	local appliesHardControl = false
 	local appliesVulnerable = false
 	local appliesBlind = false
 	local appliesWeaken = false
+	local hasShatter = false
 	local abId = ability.id or ""
 	local tiers = cardTiersFallback or DeckStrategy.CardTiers
 
@@ -2467,6 +3760,8 @@ local function analyzeAbility(mods, ability, energy, me, cardTiersFallback)
 			if type(ef.statuses) == "table" and #ef.statuses > 0 then
 				cleanseStatuses = ef.statuses
 			end
+		elseif kind == "Shatter" then
+			hasShatter = true
 		elseif kind == "GainEnergy" then
 			hasEnergyGain = true
 			gainEnergyAmount += (ef.amount or 1)
@@ -2492,6 +3787,9 @@ local function analyzeAbility(mods, ability, energy, me, cardTiersFallback)
 				if targetsEnemies then
 					appliesEnemyDebuff = true
 					table.insert(enemyStatusIds, { id = ef.statusId, st = st })
+					if st.preventsAction == true or st.turnsNext == true or ef.statusId == "Stunned" or ef.statusId == "Frozen" or ef.statusId == "Beguiled" then
+						appliesHardControl = true
+					end
 					if (type(st.damageTakenMultiplier) == "number" and st.damageTakenMultiplier > 1) or ef.statusId == "Vulnerable" then
 						appliesVulnerable = true
 					end
@@ -2579,9 +3877,11 @@ local function analyzeAbility(mods, ability, energy, me, cardTiersFallback)
 		revivesAlly = revivesAlly,
 		preventsAction = preventsAction,
 		appliesControl = appliesControl,
+		appliesHardControl = appliesHardControl,
 		appliesVulnerable = appliesVulnerable,
 		appliesBlind = appliesBlind,
 		appliesWeaken = appliesWeaken,
+		hasShatter = hasShatter,
 		appliesEnemyDebuff = appliesEnemyDebuff,
 	}
 end
@@ -2943,7 +4243,7 @@ local function getAttackerStatusMult(mods, attackSchool, me)
 	return math.max(0.05, (1 + addBonus) * mulFactor)
 end
 
-local function getElementMultiplier(mods, attackSchool, defender, me, directAlreadyScaled)
+local function getElementMultiplier(mods, attackSchool, defender, me, directAlreadyScaled, ignoreShatterBuffs)
 	if not defender then
 		return 1
 	end
@@ -3000,7 +4300,9 @@ local function getElementMultiplier(mods, attackSchool, defender, me, directAlre
 			if st.evadesNext then
 				evades = true
 			elseif type(st.damageTakenMultiplier) == "number" then
-				defWardFactor *= st.damageTakenMultiplier
+				if not (ignoreShatterBuffs and st.damageTakenMultiplier < 1 and not st.cleanseProof) then
+					defWardFactor *= st.damageTakenMultiplier
+				end
 			elseif atkSchool and st.school == atkSchool and type(st.schoolTaken) == "number" then
 				defWardFactor *= math.max(0.1, 1 - st.schoolTaken)
 			elseif sid == "Vulnerable" then
@@ -3026,6 +4328,8 @@ local function getAliveEnemies(mods, state, me)
 			local evades = false
 			local isVulnerable = false
 			local isBlinded = false
+			local hasDefenseMitigation = false
+			local isControlLocked = false
 			local reprisal = 0
 			for _, stEntry in ipairs(c.statuses or {}) do
 				local sid = (type(stEntry) == "table" and stEntry.id) or stEntry
@@ -3036,9 +4340,14 @@ local function getAliveEnemies(mods, state, me)
 					end
 					if (type(stDef.damageTakenMultiplier) == "number" and stDef.damageTakenMultiplier > 1) or sid == "Vulnerable" then
 						isVulnerable = true
+					elseif type(stDef.damageTakenMultiplier) == "number" and stDef.damageTakenMultiplier < 1 and not stDef.cleanseProof then
+						hasDefenseMitigation = true
 					end
 					if stDef.missesNext == true then
 						isBlinded = true
+					end
+					if stDef.preventsAction == true or stDef.turnsNext == true or sid == "Stunned" or sid == "Frozen" or sid == "Beguiled" or sid == "StunImmune" then
+						isControlLocked = true
 					end
 					if type(stDef.reprisal) == "number" then
 						reprisal += stDef.reprisal * ((type(stEntry) == "table" and tonumber(stEntry.power)) or 1)
@@ -3058,11 +4367,13 @@ local function getAliveEnemies(mods, state, me)
 				evades = evades,
 				isVulnerable = isVulnerable,
 				isBlinded = isBlinded,
+				hasDefenseMitigation = hasDefenseMitigation,
+				isControlLocked = isControlLocked,
 				reprisal = math.min(reprisal, repCap),
 			})
 		end
 	end
-	return enemies
+	return CombatAuto.AnnotateEnemyThreats(mods, state, me, enemies)
 end
 
 local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
@@ -3075,6 +4386,8 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 			killCount = 0,
 			wipesAll = false,
 			killsBoss = false,
+			killsMajorHealer = false,
+			killsTopThreat = false,
 			bestEnemy = nil,
 			bestEnemyDamage = 0,
 			bestMult = 1,
@@ -3116,36 +4429,51 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 		local bossDamage = 0
 		local killCount = 0
 		local killsBoss = false
+		local killsMajorHealer = false
+		local killsTopThreat = false
 		local overkill = 0
+		local isSmart = (CombatAuto.TargetPriority == "Smart Effective")
 		for _, e in ipairs(aliveEnemies) do
-			local mult = getElementMultiplier(mods, atkSchool, e.combatant, me, directScaled)
+			local mult = getElementMultiplier(mods, atkSchool, e.combatant, me, directScaled, entry.info.hasShatter)
 			local dmg, canKill = projectEnemyDmgAndKill(e, mult)
 			local eff = math.min(dmg, e.effectiveHp)
 			local okAmt = math.max(0, dmg - e.effectiveHp)
+			local threatMult = isSmart and math.max(0.85, (e.threatFocusMult or 1) * 0.85) or (e.isBoss and bossFocusMult or 1)
 			totalDmg += eff
 			overkill += okAmt
 			if e.isBoss and eff > bossDamage then
 				bossDamage = eff
 			end
-			tactical += eff * (e.isBoss and bossFocusMult or 1)
+			tactical += eff * threatMult
 			if canKill then
 				killCount += 1
-				tactical += (e.isBoss and 400 or 120) + (killPips * 55)
+				local killThreatBonus = isSmart and (e.isMajorHealer and 320 or math.floor((e.threatRatio or 0) * 160)) or 0
+				tactical += (e.isBoss and 380 or 120) + killThreatBonus + (killPips * 55)
 				if e.isBoss then
 					killsBoss = true
 				end
+				if e.isMajorHealer then
+					killsMajorHealer = true
+				end
+				if e.isTopThreat then
+					killsTopThreat = true
+				end
 			else
-				if entry.info.appliesControl and not e.evades then
-					tactical += 90
+				local highThreat = e.isBoss or e.isMajorHealer or e.isTopThreat
+				if entry.info.hasShatter and e.hasDefenseMitigation then
+					tactical += (highThreat and 240 or 140)
+				end
+				if entry.info.appliesControl and not e.evades and not e.isControlLocked then
+					tactical += highThreat and 130 or 85
 				end
 				if not e.evades then
 					if entry.info.appliesVulnerable and not e.isVulnerable and dmg < e.effectiveHp then
-						tactical += (e.isBoss and 220 or 85)
+						tactical += (highThreat and 220 or 85)
 					end
-					if entry.info.appliesBlind and not e.isBlinded then
-						tactical += (e.isBoss and 140 or 65)
+					if entry.info.appliesBlind and not e.isBlinded and not e.isControlLocked then
+						tactical += (highThreat and 140 or 65)
 					elseif entry.info.appliesWeaken then
-						tactical += (e.isBoss and 90 or 35)
+						tactical += (highThreat and 90 or 35)
 					end
 				end
 			end
@@ -3162,6 +4490,8 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 			killCount = killCount,
 			wipesAll = (totalEnemies > 0 and killCount >= totalEnemies),
 			killsBoss = killsBoss,
+			killsMajorHealer = killsMajorHealer,
+			killsTopThreat = killsTopThreat,
 			bestEnemy = aliveEnemies[1],
 			bestEnemyDamage = totalDmg,
 			bestMult = 1,
@@ -3176,11 +4506,15 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 	local bossDamage = 0
 	local anyKill = false
 	local killsBoss = false
+	local killsMajorHealer = false
+	local killsTopThreat = false
+	local isSmart = (CombatAuto.TargetPriority == "Smart Effective")
 
 	for _, e in ipairs(aliveEnemies) do
-		local mult = getElementMultiplier(mods, atkSchool, e.combatant, me, directScaled)
+		local mult = getElementMultiplier(mods, atkSchool, e.combatant, me, directScaled, entry.info.hasShatter)
 		local dmg, canKill = projectEnemyDmgAndKill(e, mult)
 		local eff = math.min(dmg, e.effectiveHp)
+		local focusMult = isSmart and (e.threatFocusMult or (e.isBoss and bossFocusMult or 1)) or (e.isBoss and bossFocusMult or 1)
 		if e.isBoss and eff > bossDamage then
 			bossDamage = eff
 		end
@@ -3189,24 +4523,35 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 			if e.isBoss then
 				killsBoss = true
 			end
+			if e.isMajorHealer then
+				killsMajorHealer = true
+			end
+			if e.isTopThreat then
+				killsTopThreat = true
+			end
 		end
 
 		local overkill = math.max(0, dmg - e.effectiveHp)
-		local s = (eff * (e.isBoss and bossFocusMult or 1)) - (overkill * 0.65) - (eff * (e.reprisal or 0) * 0.85)
+		local s = (eff * focusMult) - (overkill * 0.65) - (eff * (e.reprisal or 0) * 0.85)
+		local highThreat = e.isBoss or e.isMajorHealer or e.isTopThreat
 		if canKill then
-			s += (e.isBoss and 500 or 140) + (killPips * 55)
+			local killThreatBonus = isSmart and (e.isMajorHealer and 360 or math.floor((e.threatRatio or 0) * 180)) or 0
+			s += (e.isBoss and 420 or 120) + killThreatBonus + (killPips * 55)
 		else
-			if entry.info.appliesControl and not e.evades then
-				s += 90
+			if entry.info.hasShatter and e.hasDefenseMitigation then
+				s += (highThreat and 260 or 150)
+			end
+			if entry.info.appliesControl and not e.evades and not e.isControlLocked then
+				s += highThreat and 130 or 85
 			end
 			if not e.evades then
 				if entry.info.appliesVulnerable and not e.isVulnerable and dmg < e.effectiveHp then
-					s += (e.isBoss and 240 or 90)
+					s += (highThreat and 240 or 90)
 				end
-				if entry.info.appliesBlind and not e.isBlinded then
-					s += (e.isBoss and 140 or 65)
+				if entry.info.appliesBlind and not e.isBlinded and not e.isControlLocked then
+					s += (highThreat and 140 or 65)
 				elseif entry.info.appliesWeaken then
-					s += (e.isBoss and 90 or 35)
+					s += (highThreat and 90 or 35)
 				end
 			end
 		end
@@ -3228,6 +4573,8 @@ local function evaluateAttackEntry(mods, state, me, entry, aliveEnemies)
 		killCount = anyKill and 1 or 0,
 		wipesAll = (totalEnemies == 1 and anyKill),
 		killsBoss = killsBoss,
+		killsMajorHealer = killsMajorHealer,
+		killsTopThreat = killsTopThreat,
 		bestEnemy = bestEnemy,
 		bestEnemyDamage = bestDmg,
 		bestMult = bestMult,
@@ -3452,15 +4799,17 @@ local function pickAttackEntry(mods, state, me, usableEntries, deckRem)
 		end
 	end
 
-	-- 1. Lethal Finish Override: immediately cast any playable card that kills (including 1-2 pip kills!)
+	-- 1. Lethal Finish Override: immediately cast any playable card that kills (prioritizing wipes > boss/major healer/top threat)
 	local bossAlive = hasAliveBoss(mods, state, me)
 	if #damagers > 0 then
-		local wipes, bossKills, singleKills = {}, {}, {}
+		local wipes, bossKills, healerKills, singleKills = {}, {}, {}, {}
 		for _, d in ipairs(damagers) do
 			if d._eval.wipesAll then
 				table.insert(wipes, { entry = d, eval = d._eval })
 			elseif d._eval.killsBoss then
 				table.insert(bossKills, { entry = d, eval = d._eval })
+			elseif d._eval.killsMajorHealer or d._eval.killsTopThreat then
+				table.insert(healerKills, { entry = d, eval = d._eval })
 			elseif d._eval.killCount > 0 then
 				table.insert(singleKills, { entry = d, eval = d._eval })
 			end
@@ -3470,6 +4819,9 @@ local function pickAttackEntry(mods, state, me, usableEntries, deckRem)
 		end
 		if #bossKills > 0 then
 			return pickCheapestLethal(bossKills), nil
+		end
+		if #healerKills > 0 then
+			return pickCheapestLethal(healerKills), nil
 		end
 		if #singleKills > 0 then
 			return pickCheapestLethal(singleKills), nil
@@ -3481,7 +4833,11 @@ local function pickAttackEntry(mods, state, me, usableEntries, deckRem)
 		if not ev then
 			return e.info.directDamage or 0
 		end
-		local lethalBonus = ev.wipesAll and 5000 or (ev.killsBoss and 4000 or (ev.killCount > 0 and 1500 or 0))
+		local lethalBonus = ev.wipesAll and 5000
+			or (ev.killsBoss and 4000
+			or (ev.killsMajorHealer and 2600
+			or (ev.killsTopThreat and 1900
+			or (ev.killCount > 0 and 1500 or 0))))
 		return ((ev.bossDamage or 0) * 0.35) + (ev.tacticalScore or e.info.directDamage) + lethalBonus
 	end
 
@@ -3828,7 +5184,7 @@ local function findImmediateLethalEntry(mods, state, me, entries)
 		return nil
 	end
 
-	local wipes, bossKills, singleKills = {}, {}, {}
+	local wipes, bossKills, healerKills, singleKills = {}, {}, {}, {}
 	local bossAlive = hasAliveBoss(mods, state, me)
 	for _, entry in ipairs(entries) do
 		if entry.info.directDamage > 0 and not entry.info.preventsAction then
@@ -3838,8 +5194,12 @@ local function findImmediateLethalEntry(mods, state, me, entries)
 				table.insert(wipes, { entry = entry, eval = ev })
 			elseif ev.killsBoss and healthInfo.lowestRatio > 0.15 then
 				table.insert(bossKills, { entry = entry, eval = ev })
-			elseif ev.killCount > 0 and not bossAlive and healthInfo.lowestRatio > 0.25 then
-				table.insert(singleKills, { entry = entry, eval = ev })
+			elseif (ev.killsMajorHealer or (ev.killCount > 0 and (not bossAlive or ev.killsTopThreat))) and healthInfo.lowestRatio > 0.25 then
+				if ev.killsMajorHealer or ev.killsTopThreat then
+					table.insert(healerKills, { entry = entry, eval = ev })
+				else
+					table.insert(singleKills, { entry = entry, eval = ev })
+				end
 			end
 		end
 	end
@@ -3848,6 +5208,9 @@ local function findImmediateLethalEntry(mods, state, me, entries)
 	end
 	if #bossKills > 0 then
 		return pickCheapestLethal(bossKills)
+	end
+	if #healerKills > 0 then
+		return pickCheapestLethal(healerKills)
 	end
 	if #singleKills > 0 then
 		return pickCheapestLethal(singleKills)
@@ -3998,15 +5361,19 @@ local function pickSupportEntry(mods, state, me, entries, deckRem)
 		for _, e in ipairs(aliveEnemies) do
 			local anyMissing = false
 			for _, ds in ipairs(enemyStList) do
-				local maxSt = (ds.st and tonumber(ds.st.maxStacks)) or 1
-				if getStatusStackCount(e.combatant, ds.id) < maxSt then
-					anyMissing = true
-					break
+				local isCtrlSt = (ds.st and (ds.st.preventsAction == true or ds.st.turnsNext == true))
+					or ds.id == "Stunned" or ds.id == "Frozen" or ds.id == "Beguiled"
+				if not (isCtrlSt and e.isControlLocked) then
+					local maxSt = (ds.st and tonumber(ds.st.maxStacks)) or 1
+					if getStatusStackCount(e.combatant, ds.id) < maxSt then
+						anyMissing = true
+						break
+					end
 				end
 			end
 			if anyMissing then
 				missingTotal += 1
-				if e.isBoss then
+				if e.isBoss or e.isMajorHealer or e.isTopThreat then
 					missingOnBoss = true
 				end
 			end
@@ -4173,8 +5540,14 @@ local function pickTargetId(mods, state, me, ability, info, preferMode, evalResu
 					name = be.name or c.name or be.id,
 					mult = evalResult.bestMult or 1,
 					isKill = (evalResult.killCount or 0) > 0,
+					threatRole = be.threatRole,
 				}
 			end
+		end
+
+		local aliveMap = {}
+		for _, ae in ipairs(getAliveEnemies(mods, state, me)) do
+			aliveMap[ae.id] = ae
 		end
 
 		local bestEnemy = nil
@@ -4192,7 +5565,8 @@ local function pickTargetId(mods, state, me, ability, info, preferMode, evalResu
 				local ehp = math.max(1, hp + shield)
 				local maxHp = math.max(1, (c.derived and c.derived.maxHp) or c.maxHp or hp)
 				local isBoss = isBossCombatant(mods, c, id)
-				local mult = getElementMultiplier(mods, atkSchool, c, me, directScaled)
+				local eInfo = aliveMap[id]
+				local mult = getElementMultiplier(mods, atkSchool, c, me, directScaled, info and info.hasShatter)
 				if tExecBonus > 0 and (hp / maxHp) < 0.50 then
 					mult *= (1 + tExecBonus)
 				end
@@ -4201,19 +5575,28 @@ local function pickTargetId(mods, state, me, ability, info, preferMode, evalResu
 				local canKill = (directDmg > 0) and ((projDmg >= ehp * 0.99) or autoExec)
 				local score
 				if directDmg <= 0 then
-					-- Non-damage support debuff (Hex, Beguile, Lantern Flash, etc.): pick un-debuffed Boss / highest-threat enemy
+					-- Non-damage support debuff (Hex, Beguile, Blind, Stun, MortalWound): prioritize top-threat enemy missing it & not StunImmune/CC-locked
 					local alreadyDebuffed = true
+					local appliesMortalWound = false
+					local ccBlocked = (info and (info.appliesHardControl or info.appliesControl) and eInfo and eInfo.isControlLocked == true) or false
 					if info and info.enemyStatusIds and #info.enemyStatusIds > 0 then
 						for _, ds in ipairs(info.enemyStatusIds) do
+							if ds.id == "MortalWound" then
+								appliesMortalWound = true
+							end
 							if getStatusStackCount(c, ds.id) < ((ds.st and tonumber(ds.st.maxStacks)) or 1) then
 								alreadyDebuffed = false
-								break
 							end
 						end
 					else
 						alreadyDebuffed = false
 					end
-					score = (alreadyDebuffed and 1000000 or 0) - (isBoss and 500000 or 0) - ehp
+					if ccBlocked then
+						alreadyDebuffed = true
+					end
+					local threatWeight = ((eInfo and eInfo.threatScore) or 0) * 1500
+						+ ((appliesMortalWound and eInfo and eInfo.isMajorHealer) and 400000 or 0)
+					score = (alreadyDebuffed and 10000000 or 0) - threatWeight - (isBoss and 150000 or 0) - ehp
 				elseif CombatAuto.TargetPriority == "Highest HP" then
 					score = -ehp / math.max(0.05, mult)
 				elseif CombatAuto.TargetPriority == "Boss First" then
@@ -4221,10 +5604,12 @@ local function pickTargetId(mods, state, me, ability, info, preferMode, evalResu
 				elseif CombatAuto.TargetPriority == "Lowest HP" then
 					score = ehp
 				else
-					-- Smart Effective: maximize real damage & clean kills, focusing Boss when non-lethal
+					-- Smart Effective: threat-weighted damage & lethal kills (Major Healer > Top DPS/Debuffer > Tank/Weak)
 					local eff = math.min(projDmg, ehp)
 					local okAmt = math.max(0, projDmg - ehp)
-					score = -(eff * (isBoss and 1.25 or 1.0)) + (okAmt * 0.65) - (canKill and (isBoss and 500000 or 100000) or 0)
+					local fMult = (eInfo and eInfo.threatFocusMult) or (isBoss and 1.25 or 1.0)
+					local killThreatBonus = (eInfo and eInfo.isMajorHealer and 350000) or ((eInfo and eInfo.isTopThreat) and 220000) or 0
+					score = -(eff * fMult) + (okAmt * 0.65) - (canKill and ((isBoss and 500000 or 100000) + killThreatBonus) or 0)
 				end
 				if not bestScore or score < bestScore then
 					bestScore = score
@@ -4233,6 +5618,7 @@ local function pickTargetId(mods, state, me, ability, info, preferMode, evalResu
 						name = c.name or c.enemyId or id,
 						mult = mult,
 						isKill = canKill,
+						threatRole = eInfo and eInfo.threatRole,
 					}
 				end
 			end
@@ -4717,11 +6103,12 @@ local function runCombatStep()
 				setCombatStatus(string.format("%s%s (x%d)", tag, cardName, cnt))
 			elseif targetMeta and targetMeta.name then
 				local tag = targetMeta.isKill and "KILL · " or "CAST · "
+				local roleNote = targetMeta.threatRole and (" [" .. tostring(targetMeta.threatRole) .. "]") or ""
 				local multNote = ""
 				if targetMeta.mult and math.abs(targetMeta.mult - 1) >= 0.05 then
 					multNote = string.format(" (%.2fx)", targetMeta.mult)
 				end
-				setCombatStatus(tag .. cardName .. " -> " .. tostring(targetMeta.name) .. multNote)
+				setCombatStatus(tag .. cardName .. " -> " .. tostring(targetMeta.name) .. roleNote .. multNote)
 			else
 				setCombatStatus("CAST · " .. cardName)
 			end
