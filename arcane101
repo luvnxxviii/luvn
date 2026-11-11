@@ -1,6 +1,6 @@
 -- Arcane 101 · Monochrome Minimalist Hub
 -- Modular Luau Script | Theme: Monochrome Minimalist Sleek
-local SCRIPT_VERSION = "V1.1"
+local SCRIPT_VERSION = "V1.2"
 
 local env = (typeof(getgenv) == "function" and getgenv()) or _G
 if type(env.__MonochromeCleanup) == "function" then
@@ -1567,9 +1567,63 @@ local function getGameMods(forceReload)
 		local Trivia = safeRequire(Campaign.Data:FindFirstChild("Trivia")) or {}
 		local NewLandsSpots = safeRequire(Campaign.Data:FindFirstChild("NewLandsSpots")) or {}
 
+		local rawNet = require(Campaign.Shared.Net)
+		-- Game's Net.getProfile() leaves its in-flight waiter lock wedged forever if a caller thread is cancelled (e.g. Unload).
+		-- Replace it in mods.Net with a detached InvokeServer wrapper + timeout + ProfileChanged cache.
+		local profCache, profCacheAt = nil, -math.huge
+		local profInFlight = nil
+		trackConnection(rawNet.onClientEvent("ProfileChanged", function(p)
+			if type(p) == "table" and (p.equipped ~= nil or p.inventory ~= nil or p.decks ~= nil) then
+				profCache = p
+				profCacheAt = os.clock()
+			end
+		end))
+		local function fetchProfileSafe()
+			if profCache ~= nil and (os.clock() - profCacheAt) < 0.5 then
+				return profCache
+			end
+			if not profInFlight then
+				local job = { done = false, ok = false, res = nil }
+				profInFlight = job
+				task.spawn(function()
+					local okP, resP = pcall(function()
+						return rawNet.func("GetProfile"):InvokeServer()
+					end)
+					job.ok = okP and type(resP) == "table"
+					job.res = job.ok and resP or nil
+					if job.ok then
+						profCache = resP
+						profCacheAt = os.clock()
+					end
+					job.done = true
+					if profInFlight == job then
+						profInFlight = nil
+					end
+				end)
+			end
+			local job = profInFlight
+			local t0 = os.clock()
+			while job and not job.done and (os.clock() - t0) < 3.0 do
+				task.wait(0.05)
+			end
+			if job and job.ok then
+				return job.res
+			end
+			return profCache
+		end
+		local safeNet = setmetatable({
+			getProfile = fetchProfileSafe,
+			peekProfile = function()
+				if not profCache and not profInFlight then
+					task.spawn(fetchProfileSafe)
+				end
+				return profCache
+			end,
+		}, { __index = rawNet })
+
 		return {
 			Campaign = Campaign,
-			Net = require(Campaign.Shared.Net),
+			Net = safeNet,
 			Enums = require(Campaign.Shared.Enums),
 			Abilities = Abilities,
 			Statuses = Statuses,
@@ -2493,20 +2547,50 @@ local function normalizeDeckCardMap(tbl)
 	return out
 end
 
-local function readLiveDeckCards(mods, forceProfile, me)
+local function readLiveDeckCards(mods, forceProfile, me, nonBlocking)
 	if me and type(me.deckCards) == "table" and next(me.deckCards) ~= nil then
 		if type(me.cardTiers) == "table" then
 			DeckStrategy.CardTiers = me.cardTiers
 		end
 		return normalizeDeckCardMap(me.deckCards)
 	end
-	if not forceProfile and next(DeckStrategy.RawCards) ~= nil and (os.clock() - DeckStrategy.LastFetchAt) < 4.0 then
+	if not forceProfile and next(DeckStrategy.RawCards) ~= nil and (os.clock() - DeckStrategy.LastFetchAt) < 8.0 then
 		return DeckStrategy.RawCards
 	end
-	DeckStrategy.LastFetchAt = os.clock()
-	local ok, prof = pcall(mods.Net.getProfile)
-	if not ok or type(prof) ~= "table" then
-		return DeckStrategy.RawCards
+	local ok, prof = false, nil
+	if nonBlocking then
+		-- Never block runCombatStep() on a RemoteFunction call; use cached profile or trigger async fetch
+		if type(mods.Net.peekProfile) == "function" then
+			prof = mods.Net.peekProfile()
+			ok = type(prof) == "table"
+		end
+		if not ok then
+			if next(DeckStrategy.RawCards) ~= nil then
+				return DeckStrategy.RawCards
+			end
+			if me then
+				local fb = {}
+				for _, id in ipairs(me.abilityIds or {}) do
+					if type(id) == "string" then
+						fb[id] = math.max(1, fb[id] or 0)
+					end
+				end
+				for _, id in ipairs(me.hand or {}) do
+					if type(id) == "string" then
+						fb[id] = math.max(1, (fb[id] or 0))
+					end
+				end
+				return fb
+			end
+			return DeckStrategy.RawCards
+		end
+		DeckStrategy.LastFetchAt = os.clock()
+	else
+		DeckStrategy.LastFetchAt = os.clock()
+		ok, prof = pcall(mods.Net.getProfile)
+		if not ok or type(prof) ~= "table" then
+			return DeckStrategy.RawCards
+		end
 	end
 	if type(prof.cardTiers) == "table" then
 		DeckStrategy.CardTiers = prof.cardTiers
@@ -2531,11 +2615,11 @@ local function readLiveDeckCards(mods, forceProfile, me)
 	return normalizeDeckCardMap(deckSrc)
 end
 
-local function refreshDeckStrategy(mods, forceProfile, me)
+local function refreshDeckStrategy(mods, forceProfile, me, nonBlocking)
 	if not mods or not mods.Abilities then
 		return DeckStrategy
 	end
-	local cards = readLiveDeckCards(mods, forceProfile, me)
+	local cards = readLiveDeckCards(mods, forceProfile, me, nonBlocking)
 	local keys = {}
 	for id, cnt in pairs(cards) do
 		if cnt > 0 then
@@ -2633,7 +2717,7 @@ local function refreshDeckStrategy(mods, forceProfile, me)
 end
 
 local function getDeckRemainingSummary(mods, state, me)
-	refreshDeckStrategy(mods, false, me)
+	refreshDeckStrategy(mods, false, me, true)
 	local handCounts = normalizeDeckCardMap(me and me.hand)
 	local drawCounts
 	if me and type(me.drawPile) == "table" and (#me.drawPile > 0 or #(me.discardPile or {}) > 0) then
@@ -4622,7 +4706,7 @@ task.spawn(function()
 			LiveCombat.State = data.state
 			LiveCombat.MyId = findMyCombatantId(data.state)
 			local me = LiveCombat.MyId and data.state.combatants and data.state.combatants[LiveCombat.MyId]
-			refreshDeckStrategy(mods, true, me)
+			refreshDeckStrategy(mods, true, me, true)
 		end
 		if type(data.boss) == "table" then
 			if type(data.boss.id) == "string" then
@@ -4930,11 +5014,18 @@ local function runQuickSellTrash(silent, statusFn)
 	if LocalPlayer:GetAttribute("InCombat") == true then
 		return 0
 	end
+	if LocalPlayer:GetAttribute("InRun") == true then
+		if not silent and statusFn then
+			statusFn("SELL · EXIT RUN FOR SHOPS")
+		end
+		return 0
+	end
 	local mods = getGameMods()
 	if not mods then
 		return 0
 	end
 	quickSellBusy = true
+	DungeonAuto.LastQuickSellAt = os.clock()
 	local sold = 0
 	local okRun = pcall(function()
 		-- Lock matching high-rarity drops before sweeping unequipped gear
@@ -4956,16 +5047,18 @@ local function runQuickSellTrash(silent, statusFn)
 		end
 
 		local maxRank = QUICKSELL_TIER_MAX_RANK[sellRarityMode] or 1
-		local targets = {}
-		local targetUids = {}
+		local byKind = { Weapon = {}, Accessory = {} }
+		local attemptedUids = {}
+		local totalTargets = 0
+
 		for _, item in ipairs(profile.inventory or {}) do
-			if not State.Alive or LocalPlayer:GetAttribute("InCombat") == true then
+			if not State.Alive or LocalPlayer:GetAttribute("InCombat") == true or LocalPlayer:GetAttribute("InRun") == true then
 				break
 			end
 			if type(item) == "table" and item.defId and item.uid then
 				local def = mods.Items[item.defId]
 				local rank = def and AutoLock.GetRarityRank(mods, def) or 99
-				local sellUnit = (mods.Shop and mods.Shop.sellPrice) and mods.Shop.sellPrice(item.defId) or 1
+				local sellUnit = (mods.Shop and mods.Shop.sellPrice) and mods.Shop.sellPrice(item.defId) or 0
 				local inVanity = mods.Inventory and mods.Inventory.vanitySlotOf and mods.Inventory.vanitySlotOf(profile, item.uid) ~= nil
 				local isLocked = (mods.Inventory and mods.Inventory.isLocked and mods.Inventory.isLocked(item)) or item.locked == true or AutoLock.LockedCache[item.uid] == true
 				if def
@@ -4980,82 +5073,212 @@ local function runQuickSellTrash(silent, statusFn)
 					and def.slot ~= "Mount"
 					and rank <= maxRank
 				then
-					table.insert(targets, item)
-					targetUids[item.uid] = true
+					local shopKind = (mods.Shop and mods.Shop.kindOf) and mods.Shop.kindOf(item.defId) or nil
+					if shopKind ~= "Weapon" and shopKind ~= "Accessory" then
+						shopKind = (def.slot == "Weapon" or def.slot == "Offhand") and "Weapon" or "Accessory"
+					end
+					table.insert(byKind[shopKind], item)
+					totalTargets += 1
 				end
 			end
 		end
 
-		if #targets == 0 then
+		if totalTargets == 0 then
 			if not silent and statusFn then
 				statusFn("SELL · NONE MATCHING")
 			end
 			return
 		end
 
-		local lastErr = nil
-		-- In Lobby/Town, ShopController uses SellMany in batches; fall back to QuickSell if needed or during a run
-		if LocalPlayer:GetAttribute("InRun") ~= true then
-			for i = 1, #targets, 25 do
-				if not State.Alive or LocalPlayer:GetAttribute("InCombat") == true then
-					break
-				end
-				local batch = {}
-				for j = i, math.min(#targets, i + 24) do
-					local it = targets[j]
-					table.insert(batch, { defId = it.defId, count = it.count or 1, uid = it.uid })
-				end
-				pcall(function()
-					mods.Net.fireServer("SellMany", { items = batch })
-				end)
-				task.wait(0.14)
-			end
+		local SHOP_CFG = {
+			Weapon = { attr = "Blacksmith", doorObj = "Blacksmith" },
+			Accessory = { attr = "MerchantShop", doorObj = "Accessory Shop" },
+		}
+		local INDOORS_DOOR_OBJ = {
+			Blacksmith = "Blacksmith",
+			MerchantShop = "Accessory Shop",
+			SpellShop = "Bank",
+			PetShop = "Pet Shop",
+		}
 
-			task.wait(0.25)
-			local okAfter, profAfter = pcall(mods.Net.func("GetProfile").InvokeServer, mods.Net.func("GetProfile"))
-			if okAfter and type(profAfter) == "table" and type(profAfter.inventory) == "table" then
-				local stillThere = {}
-				for _, it in ipairs(profAfter.inventory) do
-					if it.uid and targetUids[it.uid] then
-						stillThere[it.uid] = it
+		local function findLobbyPrompt(actionText, objectText)
+			local roots = {}
+			local camp = workspace:FindFirstChild("CampaignLobby")
+			local inter = workspace:FindFirstChild("LobbyInteriors")
+			if actionText == "Enter" and camp then
+				table.insert(roots, camp)
+			elseif actionText == "Leave" and inter then
+				table.insert(roots, inter)
+			end
+			table.insert(roots, workspace)
+			for _, root in ipairs(roots) do
+				for _, d in ipairs(root:GetDescendants()) do
+					if d:IsA("ProximityPrompt") and d.ActionText == actionText then
+						if not objectText or d.ObjectText == objectText then
+							return d
+						end
 					end
 				end
-				for uid in pairs(targetUids) do
-					if not stillThere[uid] then
-						sold += 1
+			end
+			return nil
+		end
+
+		local function triggerDoorPrompt(prompt)
+			if not prompt or not prompt.Parent then
+				return false
+			end
+			local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+			if not hrp then
+				return false
+			end
+			local p = prompt.Parent
+			local cf = nil
+			if p:IsA("BasePart") then
+				cf = p.CFrame
+			elseif p:IsA("Attachment") then
+				cf = p.WorldCFrame
+			end
+			if not cf then
+				return false
+			end
+			hrp.CFrame = cf + Vector3.new(0, 3, 0)
+			task.wait(0.15)
+			if type(fireproximityprompt) == "function" then
+				pcall(fireproximityprompt, prompt)
+			else
+				pcall(function()
+					prompt:InputHoldBegin()
+					task.wait((prompt.HoldDuration or 0) + 0.1)
+					prompt:InputHoldEnd()
+				end)
+			end
+			return true
+		end
+
+		local startIndoors = LocalPlayer:GetAttribute("Indoors")
+		local hrp0 = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+		local savedCF = (not startIndoors and hrp0) and hrp0.CFrame or nil
+		local movedPlayer = false
+
+		-- If player is already standing inside Blacksmith or MerchantShop, clear that shop first
+		local kindOrder = (startIndoors == "MerchantShop") and { "Accessory", "Weapon" } or { "Weapon", "Accessory" }
+		local shopEntered = false
+
+		for _, kind in ipairs(kindOrder) do
+			local itemsForKind = byKind[kind]
+			local cfg = SHOP_CFG[kind]
+			if #itemsForKind > 0 and cfg and State.Alive and LocalPlayer:GetAttribute("InCombat") ~= true and LocalPlayer:GetAttribute("InRun") ~= true then
+				if LocalPlayer:GetAttribute("Indoors") ~= cfg.attr then
+					local curInd = LocalPlayer:GetAttribute("Indoors")
+					if curInd then
+						local exitObj = INDOORS_DOOR_OBJ[curInd]
+						local exitPrompt = findLobbyPrompt("Leave", exitObj) or findLobbyPrompt("Leave", nil)
+						if exitPrompt and triggerDoorPrompt(exitPrompt) then
+							movedPlayer = true
+							for _ = 1, 25 do
+								if not LocalPlayer:GetAttribute("Indoors") or not State.Alive then
+									break
+								end
+								task.wait(0.08)
+							end
+							task.wait(0.1)
+						end
+					end
+					if not LocalPlayer:GetAttribute("Indoors") then
+						if not savedCF then
+							local hrpOut = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+							savedCF = hrpOut and hrpOut.CFrame or nil
+						end
+						local enterPrompt = findLobbyPrompt("Enter", cfg.doorObj)
+						if enterPrompt and triggerDoorPrompt(enterPrompt) then
+							movedPlayer = true
+							for _ = 1, 25 do
+								if LocalPlayer:GetAttribute("Indoors") == cfg.attr or not State.Alive then
+									break
+								end
+								task.wait(0.08)
+							end
+						end
 					end
 				end
-				-- Rebuild targets list from any remaining items in case SellMany didn't process all
-				local rem = {}
-				for _, it in ipairs(targets) do
-					if stillThere[it.uid] then
-						table.insert(rem, it)
+
+				if LocalPlayer:GetAttribute("Indoors") == cfg.attr then
+					shopEntered = true
+					for i = 1, #itemsForKind, 25 do
+						if not State.Alive or LocalPlayer:GetAttribute("InCombat") == true or LocalPlayer:GetAttribute("InRun") == true then
+							break
+						end
+						local batch = {}
+						for j = i, math.min(#itemsForKind, i + 24) do
+							local it = itemsForKind[j]
+							attemptedUids[it.uid] = true
+							table.insert(batch, { defId = it.defId, count = it.count or 1, uid = it.uid })
+						end
+						pcall(function()
+							mods.Net.fireServer("SellMany", { items = batch })
+						end)
+						task.wait(0.16)
 					end
 				end
-				targets = rem
 			end
 		end
 
-		for _, item in ipairs(targets) do
-			if not State.Alive or LocalPlayer:GetAttribute("InCombat") == true then
-				break
+		if movedPlayer then
+			local curInd = LocalPlayer:GetAttribute("Indoors")
+			if curInd then
+				local exitPrompt = findLobbyPrompt("Leave", INDOORS_DOOR_OBJ[curInd]) or findLobbyPrompt("Leave", nil)
+				if exitPrompt and triggerDoorPrompt(exitPrompt) then
+					for _ = 1, 25 do
+						if not LocalPlayer:GetAttribute("Indoors") or not State.Alive then
+							break
+						end
+						task.wait(0.08)
+					end
+				end
 			end
-			local okSell, res, errMsg = pcall(function()
-				return mods.Net.func("QuickSell"):InvokeServer({ defId = item.defId, uid = item.uid })
-			end)
-			if okSell and (res == true or (type(res) == "table" and res.ok == true)) then
-				sold += 1
-			else
-				lastErr = (type(errMsg) == "string" and errMsg) or (type(res) == "table" and res.reason) or lastErr
+			if savedCF then
+				task.wait(0.12)
+				local hrpEnd = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				if hrpEnd then
+					hrpEnd.CFrame = savedCF
+				end
 			end
-			task.wait(0.06)
+		end
+
+		local attemptedCount = 0
+		for _ in pairs(attemptedUids) do
+			attemptedCount += 1
+		end
+
+		if attemptedCount > 0 then
+			for _ = 1, 5 do
+				task.wait(0.15)
+				local okAfter, profAfter = pcall(mods.Net.getProfile)
+				if okAfter and type(profAfter) == "table" and type(profAfter.inventory) == "table" then
+					local stillThere = {}
+					for _, it in ipairs(profAfter.inventory) do
+						if it.uid and attemptedUids[it.uid] then
+							stillThere[it.uid] = true
+						end
+					end
+					sold = 0
+					for uid in pairs(attemptedUids) do
+						if not stillThere[uid] then
+							sold += 1
+						end
+					end
+					if sold >= attemptedCount then
+						break
+					end
+				end
+			end
 		end
 
 		if statusFn and (sold > 0 or not silent) then
 			if sold > 0 then
 				statusFn("SOLD · " .. tostring(sold) .. " items")
-			elseif lastErr then
-				statusFn("SELL · " .. tostring(lastErr))
+			elseif not shopEntered then
+				statusFn("SELL · SHOP DOOR NOT FOUND")
 			else
 				statusFn("SOLD · 0 items")
 			end
@@ -8334,6 +8557,9 @@ do
 		end
 	end
 
+	local feedDirty = false
+	local sniperDirty = false
+
 	task.spawn(function()
 		task.wait(0.6)
 		if not State.Alive then
@@ -8345,24 +8571,17 @@ do
 				if type(newStock) == "table" and type(newStock.entries) == "table" then
 					ShopSniper.Stock = newStock
 				end
+				-- Flag Identity-8 thread to refresh CoreGui/buy safely (Net callbacks run on game Identity 2)
 				if ShopSniper.Enabled then
-					task.spawn(runSniper, true)
+					sniperDirty = true
 				else
-					task.spawn(renderFeed, false)
+					feedDirty = true
 				end
 			end))
-			local profTimerPending = false
 			trackConnection(mods.Net.onClientEvent("ProfileChanged", function()
-				if profTimerPending or not State.Alive then
-					return
+				if State.Alive then
+					feedDirty = true
 				end
-				profTimerPending = true
-				task.delay(0.35, function()
-					profTimerPending = false
-					if State.Alive then
-						renderFeed(false)
-					end
-				end)
 			end))
 		end
 		renderFeed(true)
@@ -8373,10 +8592,23 @@ do
 
 	trackThread(function()
 		local lastRestockFetch = 0
+		local bannerCounter = 0
 		while State.Alive do
-			task.wait(1)
+			task.wait(0.35)
+			if not State.Alive then
+				break
+			end
 			local mods = getGameMods()
-			if mods and mods.Net then
+			if sniperDirty then
+				sniperDirty = false
+				task.spawn(runSniper, true)
+			elseif feedDirty then
+				feedDirty = false
+				task.spawn(renderFeed, false)
+			end
+			bannerCounter += 1
+			if bannerCounter >= 3 and mods and mods.Net then
+				bannerCounter = 0
 				local okP, prof = pcall(mods.Net.getProfile)
 				updateHeaderBanner(mods, okP and prof or nil)
 				local rAt = ShopSniper.Stock and ShopSniper.Stock.restockAt
