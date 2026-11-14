@@ -1557,7 +1557,7 @@ local function getGameMods(forceReload)
 		end
 		if type(Enemies) == "table" then
 			for id, e in pairs(Enemies) do
-				if type(e) == "table" and (e.isBoss == true or e.boss == true or e.kind == "Boss" or e.tier == "Boss") then
+				if type(e) == "table" and (e.isBoss == true or e.boss == true or e.kind == "Boss" or e.tier == "Boss" or e.pairBoss == true) then
 					bossEnemyIds[id] = true
 				end
 			end
@@ -1909,6 +1909,14 @@ GeneralTab:AddButton({
 	end,
 })
 
+
+trackConnection(LocalPlayer:WaitForChild("PlayerGui").ChildAdded:Connect(function(child)
+	if child.Name == "RejoinPrompt" and DungeonAuto.AutoRejoinRun then
+		task.wait(0.3)
+		handleRejoinPromptIfPresent()
+	end
+end))
+
 trackThread(function()
 	local lastPulse = os.clock()
 	while State.Alive do
@@ -2174,7 +2182,8 @@ function CombatAuto.AnnotateEnemyThreats(mods, state, me, enemies)
 		local hp = math.max(0, e.hp or cMaxHp)
 		local hpRatio = hp / cMaxHp
 		local healScale = tonumber(c.healScale) or 1
-		local dmgMult = tonumber(c.damageMultiplier) or 1
+		local statAllDmg = (c.stats and tonumber(c.stats.AllDamage)) or (c.derived and c.derived.scaling and tonumber(c.derived.scaling.AllDamage)) or 0
+		local dmgMult = (tonumber(c.damageMultiplier) or 1) * (1 + statAllDmg)
 		local critChance = (c.derived and c.derived.scaling and tonumber(c.derived.scaling.CritChance)) or 0
 		local activeDmgBuff = 1.0
 		local isCurrentlyCtrl = false
@@ -2422,6 +2431,8 @@ function CombatAuto.AnnotateEnemyThreats(mods, state, me, enemies)
 		local role
 		if isImmortal and isBoundProtected then
 			role = "Bound"
+		elseif (c.enemyId == "BlackQueen" or c.id == "BlackQueen") then
+			role = "Queen (Priority)"
 		elseif hasActiveBinder and e.isAbyssFist then
 			role = "Fist (Priority)"
 		elseif isMajorHealer then
@@ -2456,6 +2467,9 @@ function CombatAuto.AnnotateEnemyThreats(mods, state, me, enemies)
 		local mult = 0.90 + ratio * 0.65
 		if e.isImmortal then
 			mult = e.isBoundProtected and 0.02 or 0.25
+		elseif (c and (c.enemyId == "BlackQueen" or c.id == "BlackQueen")) then
+			mult = 2.85
+			e.isTopThreat = true
 		elseif hasActiveBinder and e.isAbyssFist then
 			local hpRatio = math.clamp((e.hp or 1) / math.max(1, e.maxHp or 1), 0, 1)
 			mult = 2.60 + (1 - hpRatio) * 0.40
@@ -4237,7 +4251,7 @@ local function isBossCombatant(mods, c, combatantId)
 	if not c then
 		return false
 	end
-	if c.isBoss == true or c.boss == true then
+	if c.isBoss == true or c.boss == true or c.pairBoss == true then
 		return true
 	end
 	if combatantId and LiveCombat.BossCombatantId and combatantId == LiveCombat.BossCombatantId then
@@ -5710,6 +5724,7 @@ local function pickTargetId(mods, state, me, ability, info, preferMode, evalResu
 				local autoExec = (not isBoss) and tExecThresh > 0 and ((hp - math.max(0, projDmg - shield)) <= maxHp * tExecThresh)
 				local canKill = (directDmg > 0) and ((projDmg >= ehp * 0.99) or autoExec)
 				local isBoundProtected = (eInfo and eInfo.isBoundProtected == true) or false
+				local isQueen = (c and (c.enemyId == "BlackQueen" or c.id == "BlackQueen"))
 				local isAbyssFist = (eInfo and eInfo.isAbyssFist == true) or (c.binds == true) or (c.enemyId == "WardenLeftHand" or c.enemyId == "WardenRightHand")
 				local score
 				if directDmg <= 0 then
@@ -5748,7 +5763,7 @@ local function pickTargetId(mods, state, me, ability, info, preferMode, evalResu
 					local fMult = (eInfo and eInfo.threatFocusMult) or (isBoss and 1.25 or 1.0)
 					local killThreatBonus = (eInfo and eInfo.isMajorHealer and 350000) or ((eInfo and eInfo.isTopThreat) and 220000) or 0
 					local trapPenalty = (CombatAuto.TrapConservation and not canKill and (mode == "Support" or directDmg < 1000) and hasDamageAmplificationStatus(mods.Statuses, c)) and 3500000 or 0
-					score = (isBoundProtected and 50000000 or 0) - (isAbyssFist and (2000000 - ehp * 0.5) or 0) - (eff * fMult) + (okAmt * 0.65) - (canKill and ((isBoss and 500000 or 100000) + killThreatBonus) or 0) + trapPenalty
+					score = (isBoundProtected and 50000000 or 0) - (isQueen and 3000000 or 0) - (isAbyssFist and (2000000 - ehp * 0.5) or 0) - (eff * fMult) + (okAmt * 0.65) - (canKill and ((isBoss and 500000 or 100000) + killThreatBonus) or 0) + trapPenalty
 				end
 				if not bestScore or score < bestScore then
 					bestScore = score
@@ -6544,6 +6559,7 @@ local DungeonAuto = {
 	AutoChests = Config.Get("Dungeon_AutoChests", false),
 	AutoQuickSell = Config.Get("Dungeon_AutoQuickSell", false),
 	ReserveUpgradeFuel = Config.Get("Dungeon_ReserveFuel", true),
+	AutoRejoinRun = Config.Get("Dungeon_AutoRejoinRun", true),
 	AutoRequeue = Config.Get("Dungeon_AutoRequeue", false),
 	RequeueMode = Config.Get("Dungeon_RequeueMode", "Auto (Last Party)"),
 	ReParty = Config.Get("Dungeon_ReParty", false),
@@ -7354,6 +7370,43 @@ local function isMyNameInVotes(votes)
 	return false
 end
 
+local function handleRejoinPromptIfPresent()
+	if not DungeonAuto.AutoRejoinRun or not State.Alive then
+		return false
+	end
+	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	local prompt = pg and pg:FindFirstChild("RejoinPrompt")
+	if prompt and prompt.Enabled ~= false then
+		setDungeonStatus("REJOIN PROMPT DETECTED · Reconnecting...")
+		local m = getGameMods()
+		if m and m.Net then
+			pcall(function()
+				m.Net.fireServer("RejoinRun", { accept = true })
+			end)
+		else
+			local rem = ReplicatedStorage:FindFirstChild("Campaign")
+			rem = rem and rem:FindFirstChild("Remotes")
+			local rj = rem and rem:FindFirstChild("RejoinRun")
+			if rj then
+				pcall(function()
+					rj:FireServer({ accept = true })
+				end)
+			end
+		end
+		for _, btn in ipairs(prompt:GetDescendants()) do
+			if btn:IsA("TextButton") and string.find(string.lower(btn.Text), "rejoin") then
+				pcall(function()
+					VirtualUser:CaptureController()
+					VirtualUser:ClickButton1(Vector2.new(btn.AbsolutePosition.X + btn.AbsoluteSize.X / 2, btn.AbsolutePosition.Y + btn.AbsoluteSize.Y / 2))
+				end)
+				break
+			end
+		end
+		return true
+	end
+	return false
+end
+
 local function tryVoteReplay(forceFire, ignoreDelay)
 	if not State.Alive or not DungeonAuto.AutoReplay then
 		return
@@ -7589,6 +7642,16 @@ table.insert(quickSellTierDropdowns, DungeonTab:AddDropdown({
 	Default = sellRarityMode,
 	Callback = setQuickSellTier,
 }))
+
+DungeonTab:AddToggle({
+	Title = "Auto Rejoin Party Dungeon",
+	Description = "Automatically reconnects you to your party's ongoing dungeon if you failed to connect on first load",
+	Default = DungeonAuto.AutoRejoinRun,
+	Callback = function(enabled)
+		DungeonAuto.AutoRejoinRun = enabled
+		Config.Set("Dungeon_AutoRejoinRun", enabled)
+	end,
+})
 
 DungeonTab:AddToggle({
 	Title = "Auto Re-Queue (Lobby)",
@@ -8411,16 +8474,21 @@ trackThread(function()
 					end)
 				end
 			else
-				if DungeonAuto.AutoRequeue and (os.clock() - (DungeonAuto.LastRejoinCheckAt or 0)) >= 10.0 then
-					DungeonAuto.LastRejoinCheckAt = os.clock()
-					local m = getGameMods()
-					if m and m.Net then
-						local okR, canRejoin = pcall(function()
-							return m.Net.func("RejoinCheck"):InvokeServer()
-						end)
-						if okR and canRejoin == true then
-							setDungeonStatus("SAFEOVERRIDE · REJOINING RUN")
-							pcall(m.Net.fireServer, "RejoinRun")
+				if DungeonAuto.AutoRejoinRun then
+					handleRejoinPromptIfPresent()
+					if (os.clock() - (DungeonAuto.LastRejoinCheckAt or 0)) >= 5.0 then
+						DungeonAuto.LastRejoinCheckAt = os.clock()
+						local m = getGameMods()
+						if m and m.Net then
+							local okR, canRejoin = pcall(function()
+								return m.Net.func("RejoinCheck"):InvokeServer()
+							end)
+							if okR and (canRejoin == true or (type(canRejoin) == "table" and canRejoin.areaId ~= nil)) then
+								setDungeonStatus("AUTO-REJOIN · Reconnecting to party dungeon...")
+								pcall(function()
+									m.Net.fireServer("RejoinRun", { accept = true })
+								end)
+							end
 						end
 					end
 				end
