@@ -1910,6 +1910,7 @@ GeneralTab:AddButton({
 })
 
 
+local handleRejoinPromptIfPresent = nil
 trackConnection(LocalPlayer:WaitForChild("PlayerGui").ChildAdded:Connect(function(child)
 	if child.Name == "RejoinPrompt" and DungeonAuto.AutoRejoinRun then
 		task.wait(0.3)
@@ -2421,8 +2422,23 @@ function CombatAuto.AnnotateEnemyThreats(mods, state, me, enemies)
 		local isBoundProtected = (e._hasBoundStatus == true) and killableCount > 0
 		local isDownedPhase = (type(c.immortal) == "number" and (e.hp / math.max(1, e.maxHp or 1)) <= (c.immortal + 0.01))
 		local isImmortal = (c.immortal == true or c.unkillable == true or isBoundProtected or isDownedPhase) and killableCount > 0
+		local eid = tostring(c.enemyId or c.id or "")
+		local isHydraVenom = (eid == "HydraHeadVenom")
+		local isHydraFlame = (eid == "HydraHeadFlame")
+		local isHydraFrost = (eid == "HydraHeadFrost")
+		local isHydraHead = isHydraVenom or isHydraFlame or isHydraFrost or (type(c.head) == "table")
+		e.isHydraVenom = isHydraVenom
+		e.isHydraFlame = isHydraFlame
+		e.isHydraFrost = isHydraFrost
+		e.isHydraHead = isHydraHead
 		if isImmortal then
 			effectiveThreat *= (isBoundProtected and 0.02 or (isDownedPhase and 0.05 or 0.15))
+		elseif isHydraVenom then
+			effectiveThreat = math.max(effectiveThreat, maxRawBase * 1.65) + 350
+		elseif isHydraFlame then
+			effectiveThreat = math.max(effectiveThreat, maxRawBase * 1.30) + 180
+		elseif isHydraFrost then
+			effectiveThreat = math.max(effectiveThreat, maxRawBase * 1.15) + 100
 		elseif hasActiveBinder and e.isAbyssFist then
 			local hpRatio = math.clamp((e.hp or 1) / math.max(1, e.maxHp or 1), 0, 1)
 			effectiveThreat = math.max(effectiveThreat, maxRawBase * 1.45) + (1 - hpRatio) * 180
@@ -2433,6 +2449,12 @@ function CombatAuto.AnnotateEnemyThreats(mods, state, me, enemies)
 			role = "Bound"
 		elseif (c.enemyId == "BlackQueen" or c.id == "BlackQueen") then
 			role = "Queen (Priority)"
+		elseif isHydraVenom then
+			role = "Venom Head (Ninefold Timer)"
+		elseif isHydraFlame then
+			role = "Flame Head (AoE Burn)"
+		elseif isHydraFrost then
+			role = "Frost Head (AoE Chill)"
 		elseif hasActiveBinder and e.isAbyssFist then
 			role = "Fist (Priority)"
 		elseif isMajorHealer then
@@ -2470,6 +2492,13 @@ function CombatAuto.AnnotateEnemyThreats(mods, state, me, enemies)
 		elseif (c and (c.enemyId == "BlackQueen" or c.id == "BlackQueen")) then
 			mult = 2.85
 			e.isTopThreat = true
+		elseif e.isHydraVenom then
+			mult = 2.95
+			e.isTopThreat = true
+		elseif e.isHydraFlame then
+			mult = 2.20
+		elseif e.isHydraFrost then
+			mult = 1.95
 		elseif hasActiveBinder and e.isAbyssFist then
 			local hpRatio = math.clamp((e.hp or 1) / math.max(1, e.maxHp or 1), 0, 1)
 			mult = 2.60 + (1 - hpRatio) * 0.40
@@ -2876,7 +2905,7 @@ function CombatAuto.PlanSmartDeck(mods, profile)
 				return nil
 			end
 			roleBucket = isSupport and "SupportUtility" or "AttackUtility"
-			valueScore = 165
+			valueScore = 210 -- Always draft your school blades & damage amplifiers!
 			recCap = math.min(maxAllowed, isSupport and 2 or 3)
 		elseif hasCleanse and dmgTotal == 0 and healTotal == 0 and shieldTotal == 0 then
 			-- Pure Cleanse (0 pips): keep 1-2 copies depending on role
@@ -2910,20 +2939,57 @@ function CombatAuto.PlanSmartDeck(mods, profile)
 			end
 			if isAoeEnemy then
 				roleBucket = isSupport and "SupportOffense" or "AoeClear"
-			elseif cost >= 3 then
+			elseif cost >= 4 then
 				roleBucket = isSupport and "SupportOffense" or "BigFinisher"
 			else
 				roleBucket = isSupport and "SupportOffense" or "CheapAttack"
 			end
 
 			local schoolMult = sameSchool and 1.32 or 0.72
-			local costSmooth = (cost <= 3 and 1.08 or (cost >= 6 and 0.72 or 0.94))
+			local costSmooth = (cost <= 2 and 1.15 or (cost <= 3 and 1.08 or (cost >= 6 and 0.65 or 0.92)))
 			if isSupport then
 				-- Support mode prizes healing/blinding/debuff hybrids heavily
 				local hybridSupportBonus = (effHeal * 1.15) + (utilValue * 0.95)
 				valueScore = ((dmgPerPip * 0.75) + (hybridSupportBonus / pipDenom)) * schoolMult * costSmooth
 			else
 				valueScore = (dmgPerPip + (utilValue / pipDenom) + (effHeal * 0.45 / pipDenom)) * schoolMult * costSmooth
+			end
+
+			-- Path-specific archetype synergies
+			if pathId == "Cataclysm" then
+				-- Cataclysm: 40% splash on single-target hits + Meteor every 3 damage cards!
+				if not isAoeEnemy then
+					valueScore += (dmgTotal * 0.40 / pipDenom) * 1.30
+				end
+				if cost <= 2 then
+					valueScore += 26 -- Fast cycle toward Step 8 Meteor!
+				end
+			elseif pathId == "Wildfire" then
+				-- Wildfire: burns tick up to 70% hotter + Funeral Pyre explosions
+				if dotTotal > 0 then
+					valueScore += (dotTotal * 1.50 / pipDenom) * 1.35
+				end
+			elseif pathId == "Tempest" then
+				-- Tempest: Energy on crit + bolt jumps on crit
+				if ab.critChance or ab.critBonus or (hasVuln and cost <= 3) then
+					valueScore += 38
+				end
+			elseif pathId == "Flurry" then
+				-- Flurry: damage ramps on multi-hit + pip back on >=3 hits
+				local hits = tonumber(ab.hits) or 1
+				for _, ef in ipairs(ab.effects or {}) do
+					if tonumber(ef.hits) and tonumber(ef.hits) > hits then
+						hits = tonumber(ef.hits)
+					end
+				end
+				if hits >= 3 then
+					valueScore += 45
+				end
+			end
+
+			-- Card Tier investment multiplier: boost upgraded cards so your highest-invested abilities are drafted first
+			if tier and tier > 1 then
+				valueScore *= (1 + (tier - 1) * 0.12)
 			end
 
 			if cost >= 5 then
@@ -3010,10 +3076,10 @@ function CombatAuto.PlanSmartDeck(mods, profile)
 		}
 	else
 		quotas = {
-			CheapAttack = math.max(4, math.floor(7 * scaleF + 0.5)),
-			AoeClear = math.max(4, math.floor(6 * scaleF + 0.5)),
-			BigFinisher = math.max(2, math.floor(4 * scaleF + 0.5)),
-			AttackUtility = math.max(2, math.floor(4 * scaleF + 0.5)),
+			CheapAttack = math.max(6, math.floor(9 * scaleF + 0.5)), -- Anti-brick core: guaranteed 0-2 pip openers!
+			AoeClear = math.max(4, math.floor(5 * scaleF + 0.5)),
+			BigFinisher = math.max(2, math.floor(3 * scaleF + 0.5)), -- Cap expensive cards
+			AttackUtility = math.max(3, math.floor(5 * scaleF + 0.5)),
 		}
 	end
 
@@ -3035,7 +3101,7 @@ function CombatAuto.PlanSmartDeck(mods, profile)
 		if cur >= c.maxCopies then
 			return false
 		end
-		if c.cost >= 5 and highCostSelected >= math.max(2, math.floor(targetSize * 0.22)) then
+		if c.cost >= 5 and highCostSelected >= math.max(2, math.floor(targetSize * 0.16)) then
 			return false
 		end
 		chosenCounts[c.id] = cur + 1
@@ -5726,6 +5792,39 @@ local function pickTargetId(mods, state, me, ability, info, preferMode, evalResu
 				local isBoundProtected = (eInfo and eInfo.isBoundProtected == true) or false
 				local isQueen = (c and (c.enemyId == "BlackQueen" or c.id == "BlackQueen"))
 				local isAbyssFist = (eInfo and eInfo.isAbyssFist == true) or (c.binds == true) or (c.enemyId == "WardenLeftHand" or c.enemyId == "WardenRightHand")
+				local isHydraHead = (eInfo and eInfo.isHydraHead == true) or (c and (c.enemyId == "HydraHeadVenom" or c.enemyId == "HydraHeadFlame" or c.enemyId == "HydraHeadFrost" or c.head ~= nil))
+				local isHydraVenom = (eInfo and eInfo.isHydraVenom == true) or (c and (c.enemyId == "HydraHeadVenom" or c.id == "HydraHeadVenom"))
+				local isHydraFlame = (eInfo and eInfo.isHydraFlame == true) or (c and (c.enemyId == "HydraHeadFlame" or c.id == "HydraHeadFlame"))
+
+				local isHeadSealed = false
+				if isHydraHead then
+					if getStatusStackCount(c, "MortalWound") > 0 then
+						isHeadSealed = true
+					else
+						for _, sid in ipairs({ "Burn", "Bleed", "Withered", "Poison", "Frostbite" }) do
+							if getStatusStackCount(c, sid) > 0 then
+								isHeadSealed = true
+								break
+							end
+						end
+					end
+				end
+
+				local abilityAppliesDotOrMortal = false
+				if info and info.enemyStatusIds then
+					for _, ds in ipairs(info.enemyStatusIds) do
+						local sid = ds.id
+						if sid == "MortalWound" or sid == "Burn" or sid == "Bleed" or sid == "Withered" or sid == "Poison" then
+							abilityAppliesDotOrMortal = true
+							break
+						end
+						local st = ds.st or (mods.Statuses and mods.Statuses[sid])
+						if st and st.isDot then
+							abilityAppliesDotOrMortal = true
+							break
+						end
+					end
+				end
 				local score
 				if directDmg <= 0 then
 					-- Non-damage support debuff (Hex, Beguile, Blind, Stun, MortalWound): prioritize top-threat enemy missing it & not StunImmune/CC-locked
@@ -5763,7 +5862,23 @@ local function pickTargetId(mods, state, me, ability, info, preferMode, evalResu
 					local fMult = (eInfo and eInfo.threatFocusMult) or (isBoss and 1.25 or 1.0)
 					local killThreatBonus = (eInfo and eInfo.isMajorHealer and 350000) or ((eInfo and eInfo.isTopThreat) and 220000) or 0
 					local trapPenalty = (CombatAuto.TrapConservation and not canKill and (mode == "Support" or directDmg < 1000) and hasDamageAmplificationStatus(mods.Statuses, c)) and 3500000 or 0
-					score = (isBoundProtected and 50000000 or 0) - (isQueen and 3000000 or 0) - (isAbyssFist and (2000000 - ehp * 0.5) or 0) - (eff * fMult) + (okAmt * 0.65) - (canKill and ((isBoss and 500000 or 100000) + killThreatBonus) or 0) + trapPenalty
+					local hydraPenalty = 0
+					local hydraBonus = 0
+					if isHydraHead then
+						if not isHeadSealed then
+							if canKill and not abilityAppliesDotOrMortal then
+								hydraPenalty += 6000000 -- Do NOT direct-kill an unsealed head (spawns 2 new heads!)
+							elseif abilityAppliesDotOrMortal then
+								hydraBonus += 3500000 -- Cauterize with Burn/DoT/MortalWound first!
+							end
+						end
+						if isHydraVenom then
+							hydraBonus += 3200000 -- Burn down Venom Head before Ninefold Strike timer!
+						elseif isHydraFlame then
+							hydraBonus += 1200000
+						end
+					end
+					score = (isBoundProtected and 50000000 or 0) - (isQueen and 3000000 or 0) - (isAbyssFist and (2000000 - ehp * 0.5) or 0) - hydraBonus + hydraPenalty - (eff * fMult) + (okAmt * 0.65) - (canKill and ((isBoss and 500000 or 100000) + killThreatBonus) or 0) + trapPenalty
 				end
 				if not bestScore or score < bestScore then
 					bestScore = score
@@ -7345,9 +7460,14 @@ local function findSummaryButton(summaryGui, btnName)
 	if not summaryGui then
 		return nil
 	end
+	local targetLower = string.lower(btnName)
 	for _, d in ipairs(summaryGui:GetDescendants()) do
-		if d:IsA("TextButton") and d.Name == btnName then
-			return d
+		if d:IsA("GuiButton") or d:IsA("TextButton") then
+			local nameLower = string.lower(d.Name or "")
+			local textLower = string.lower(d.Text or "")
+			if nameLower == targetLower or string.find(nameLower, targetLower) or string.find(textLower, targetLower) then
+				return d
+			end
 		end
 	end
 	return nil
@@ -7370,7 +7490,688 @@ local function isMyNameInVotes(votes)
 	return false
 end
 
-local function handleRejoinPromptIfPresent()
+local function runQuickSellTrash(silent, statusFn)
+	if quickSellBusy or not State.Alive then
+		return 0
+	end
+	if LocalPlayer:GetAttribute("InCombat") == true then
+		return 0
+	end
+	if LocalPlayer:GetAttribute("InRun") == true then
+		if not silent and statusFn then
+			statusFn("SELL · EXIT RUN FOR SHOPS")
+		end
+		return 0
+	end
+	local mods = getGameMods()
+	if not mods then
+		return 0
+	end
+	quickSellBusy = true
+	DungeonAuto.LastQuickSellAt = os.clock()
+	local sold = 0
+	local okRun = pcall(function()
+		-- Lock matching high-rarity drops before sweeping unequipped gear
+		if AutoLock.Enabled then
+			pcall(AutoLock.Run, true, nil)
+		end
+
+		local ok, profile = pcall(mods.Net.getProfile)
+		if not ok or type(profile) ~= "table" then
+			if not silent and statusFn then
+				statusFn("ERR · NO PROFILE")
+			end
+			return
+		end
+
+		local equippedUids = {}
+		for _, uid in pairs(profile.equipped or {}) do
+			equippedUids[uid] = true
+		end
+
+		local maxRank = QUICKSELL_TIER_MAX_RANK[sellRarityMode] or 1
+		local reserveFuelUids = {}
+		if DungeonAuto.ReserveUpgradeFuel and mods.Upgrade and mods.Upgrade.tierOf and mods.Upgrade.fuelCost then
+			-- Keep enough unlocked fuel items for any non-maxed equipped armor/offhand/charm/pet upgrade
+			local neededFuel = 0
+			for _, eqUid in pairs(profile.equipped or {}) do
+				local eqIt = mods.Inventory.find(profile, eqUid)
+				local eqDef = eqIt and mods.Items[eqIt.defId]
+				if eqIt and eqDef and eqDef.slot ~= "Weapon" and not eqDef.exotic then
+					local curT = mods.Upgrade.tierOf(eqIt)
+					local maxT = (mods.Constants and mods.Constants.UPGRADE and mods.Constants.UPGRADE.MAX_TIER) or 5
+					if curT < maxT then
+						neededFuel += mods.Upgrade.fuelCost(curT)
+					end
+				end
+			end
+			if neededFuel > 0 and mods.Upgrade.isValidFuel then
+				local fuelCands = {}
+				for _, fIt in ipairs(profile.inventory or {}) do
+					if type(fIt) == "table" and fIt.uid and fIt.defId and (fIt.tier or 0) == 0 and mods.Upgrade.isValidFuel(profile, fIt, "") then
+						local fDef = mods.Items[fIt.defId]
+						local fRank = fDef and AutoLock.GetRarityRank(mods, fDef) or 1
+						if fRank <= 2 and fDef.slot ~= "Pet" and fDef.slot ~= "Mount" then
+							table.insert(fuelCands, { item = fIt, rank = fRank, sell = (mods.Shop and mods.Shop.sellPrice and mods.Shop.sellPrice(fIt.defId)) or 0 })
+						end
+					end
+				end
+				table.sort(fuelCands, function(a, b)
+					if a.rank ~= b.rank then
+						return a.rank < b.rank
+					end
+					return a.sell < b.sell
+				end)
+				local held = 0
+				for _, fc in ipairs(fuelCands) do
+					if held >= neededFuel then
+						break
+					end
+					reserveFuelUids[fc.item.uid] = true
+					held += (mods.Upgrade.fuelValue and mods.Upgrade.fuelValue(fc.item)) or 1
+				end
+			end
+		end
+
+		local byKind = { Weapon = {}, Accessory = {} }
+		local attemptedUids = {}
+		local totalTargets = 0
+
+		for _, item in ipairs(profile.inventory or {}) do
+			if not State.Alive or LocalPlayer:GetAttribute("InCombat") == true or LocalPlayer:GetAttribute("InRun") == true then
+				break
+			end
+			if type(item) == "table" and item.defId and item.uid then
+				local def = mods.Items[item.defId]
+				local rank = def and AutoLock.GetRarityRank(mods, def) or 99
+				local sellUnit = (mods.Shop and mods.Shop.sellPrice) and mods.Shop.sellPrice(item.defId) or 0
+				local inVanity = mods.Inventory and mods.Inventory.vanitySlotOf and mods.Inventory.vanitySlotOf(profile, item.uid) ~= nil
+				local isLocked = (mods.Inventory and mods.Inventory.isLocked and mods.Inventory.isLocked(item)) or item.locked == true or AutoLock.LockedCache[item.uid] == true
+				if def
+					and sellUnit > 0
+					and not equippedUids[item.uid]
+					and not inVanity
+					and not isLocked
+					and not reserveFuelUids[item.uid]
+					and not item.expiresAt
+					and (item.tier or 0) == 0
+					and def.slot
+					and def.slot ~= "Pet"
+					and def.slot ~= "Mount"
+					and rank <= maxRank
+				then
+					local shopKind = (mods.Shop and mods.Shop.kindOf) and mods.Shop.kindOf(item.defId) or nil
+					if shopKind ~= "Weapon" and shopKind ~= "Accessory" then
+						shopKind = (def.slot == "Weapon" or def.slot == "Offhand") and "Weapon" or "Accessory"
+					end
+					table.insert(byKind[shopKind], item)
+					totalTargets += 1
+				end
+			end
+		end
+
+		if totalTargets == 0 then
+			if not silent and statusFn then
+				statusFn("SELL · NONE MATCHING")
+			end
+			return
+		end
+
+		local SHOP_CFG = {
+			Weapon = { attr = "Blacksmith", doorObj = "Blacksmith" },
+			Accessory = { attr = "MerchantShop", doorObj = "Accessory Shop" },
+		}
+		local INDOORS_DOOR_OBJ = {
+			Blacksmith = "Blacksmith",
+			MerchantShop = "Accessory Shop",
+			SpellShop = "Bank",
+			PetShop = "Pet Shop",
+		}
+
+		local function findLobbyPrompt(actionText, objectText)
+			local roots = {}
+			local camp = workspace:FindFirstChild("CampaignLobby")
+			local inter = workspace:FindFirstChild("LobbyInteriors")
+			if actionText == "Enter" and camp then
+				table.insert(roots, camp)
+			elseif actionText == "Leave" and inter then
+				table.insert(roots, inter)
+			end
+			table.insert(roots, workspace)
+			for _, root in ipairs(roots) do
+				for _, d in ipairs(root:GetDescendants()) do
+					if d:IsA("ProximityPrompt") and d.ActionText == actionText then
+						if not objectText or d.ObjectText == objectText then
+							return d
+						end
+					end
+				end
+			end
+			return nil
+		end
+
+		local function triggerDoorPrompt(prompt)
+			if not prompt or not prompt.Parent then
+				return false
+			end
+			local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+			if not hrp then
+				return false
+			end
+			local p = prompt.Parent
+			local cf = nil
+			if p:IsA("BasePart") then
+				cf = p.CFrame
+			elseif p:IsA("Attachment") then
+				cf = p.WorldCFrame
+			end
+			if not cf then
+				return false
+			end
+			hrp.CFrame = cf + Vector3.new(0, 3, 0)
+			task.wait(0.15)
+			if type(fireproximityprompt) == "function" then
+				pcall(fireproximityprompt, prompt)
+			else
+				pcall(function()
+					prompt:InputHoldBegin()
+					task.wait((prompt.HoldDuration or 0) + 0.1)
+					prompt:InputHoldEnd()
+				end)
+			end
+			return true
+		end
+
+		local startIndoors = LocalPlayer:GetAttribute("Indoors")
+		local hrp0 = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+		local savedCF = (not startIndoors and hrp0) and hrp0.CFrame or nil
+		local movedPlayer = false
+
+		-- If player is already standing inside Blacksmith or MerchantShop, clear that shop first
+		local kindOrder = (startIndoors == "MerchantShop") and { "Accessory", "Weapon" } or { "Weapon", "Accessory" }
+		local shopEntered = false
+
+		for _, kind in ipairs(kindOrder) do
+			local itemsForKind = byKind[kind]
+			local cfg = SHOP_CFG[kind]
+			if #itemsForKind > 0 and cfg and State.Alive and LocalPlayer:GetAttribute("InCombat") ~= true and LocalPlayer:GetAttribute("InRun") ~= true then
+				if LocalPlayer:GetAttribute("Indoors") ~= cfg.attr then
+					local curInd = LocalPlayer:GetAttribute("Indoors")
+					if curInd then
+						local exitObj = INDOORS_DOOR_OBJ[curInd]
+						local exitPrompt = findLobbyPrompt("Leave", exitObj) or findLobbyPrompt("Leave", nil)
+						if exitPrompt and triggerDoorPrompt(exitPrompt) then
+							movedPlayer = true
+							for _ = 1, 25 do
+								if not LocalPlayer:GetAttribute("Indoors") or not State.Alive then
+									break
+								end
+								task.wait(0.08)
+							end
+							task.wait(0.1)
+						end
+					end
+					if not LocalPlayer:GetAttribute("Indoors") then
+						if not savedCF then
+							local hrpOut = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+							savedCF = hrpOut and hrpOut.CFrame or nil
+						end
+						local enterPrompt = findLobbyPrompt("Enter", cfg.doorObj)
+						if enterPrompt and triggerDoorPrompt(enterPrompt) then
+							movedPlayer = true
+							for _ = 1, 25 do
+								if LocalPlayer:GetAttribute("Indoors") == cfg.attr or not State.Alive then
+									break
+								end
+								task.wait(0.08)
+							end
+						end
+					end
+				end
+
+				if LocalPlayer:GetAttribute("Indoors") == cfg.attr then
+					shopEntered = true
+					for i = 1, #itemsForKind, 25 do
+						if not State.Alive or LocalPlayer:GetAttribute("InCombat") == true or LocalPlayer:GetAttribute("InRun") == true then
+							break
+						end
+						local batch = {}
+						for j = i, math.min(#itemsForKind, i + 24) do
+							local it = itemsForKind[j]
+							attemptedUids[it.uid] = true
+							table.insert(batch, { defId = it.defId, count = it.count or 1, uid = it.uid })
+						end
+						pcall(function()
+							mods.Net.fireServer("SellMany", { items = batch })
+						end)
+						task.wait(0.16)
+					end
+				end
+			end
+		end
+
+		if movedPlayer then
+			local curInd = LocalPlayer:GetAttribute("Indoors")
+			if curInd then
+				local exitPrompt = findLobbyPrompt("Leave", INDOORS_DOOR_OBJ[curInd]) or findLobbyPrompt("Leave", nil)
+				if exitPrompt and triggerDoorPrompt(exitPrompt) then
+					for _ = 1, 25 do
+						if not LocalPlayer:GetAttribute("Indoors") or not State.Alive then
+							break
+						end
+						task.wait(0.08)
+					end
+				end
+			end
+			if savedCF then
+				task.wait(0.12)
+				local hrpEnd = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				if hrpEnd then
+					hrpEnd.CFrame = savedCF
+				end
+			end
+		end
+
+		local attemptedCount = 0
+		for _ in pairs(attemptedUids) do
+			attemptedCount += 1
+		end
+
+		if attemptedCount > 0 then
+			for _ = 1, 5 do
+				task.wait(0.15)
+				local okAfter, profAfter = pcall(mods.Net.getProfile)
+				if okAfter and type(profAfter) == "table" and type(profAfter.inventory) == "table" then
+					local stillThere = {}
+					for _, it in ipairs(profAfter.inventory) do
+						if it.uid and attemptedUids[it.uid] then
+							stillThere[it.uid] = true
+						end
+					end
+					sold = 0
+					for uid in pairs(attemptedUids) do
+						if not stillThere[uid] then
+							sold += 1
+						end
+					end
+					if sold >= attemptedCount then
+						break
+					end
+				end
+			end
+		end
+
+		if statusFn and (sold > 0 or not silent) then
+			if sold > 0 then
+				statusFn("SOLD · " .. tostring(sold) .. " items")
+			elseif not shopEntered then
+				statusFn("SELL · SHOP DOOR NOT FOUND")
+			else
+				statusFn("SOLD · 0 items")
+			end
+		end
+	end)
+	DungeonAuto.LastQuickSellAt = os.clock()
+	quickSellBusy = false
+	if not okRun and not silent and statusFn then
+		statusFn("QUICK-SELL ERR")
+	end
+	return sold
+end
+
+function DungeonAuto.SetAutoQuickSell(enabled, statusFn)
+	DungeonAuto.AutoQuickSell = enabled == true
+	Config.Set("Dungeon_AutoQuickSell", DungeonAuto.AutoQuickSell)
+	for _, tg in ipairs(DungeonAuto.QuickSellToggles) do
+		if tg:Get() ~= DungeonAuto.AutoQuickSell then
+			tg:Set(DungeonAuto.AutoQuickSell, true)
+		end
+	end
+	if DungeonAuto.AutoQuickSell and LocalPlayer:GetAttribute("InCombat") ~= true and State.Alive then
+		task.spawn(runQuickSellTrash, true, statusFn or setDungeonStatus)
+	end
+end
+
+DungeonTab:AddSection("Run Automation")
+
+DungeonTab:AddToggle({
+	Title = "Auto Ready",
+	Description = "Auto-readies in party & run loading screens",
+	Default = DungeonAuto.AutoReady,
+	Callback = function(enabled)
+		DungeonAuto.AutoReady = enabled
+		Config.Set("Dungeon_AutoReady", enabled)
+		if enabled then
+			local mods = getGameMods()
+			if mods then
+				pcall(function()
+					mods.Net.fireServer("SetReady", { ready = true })
+					mods.Net.fireServer("SetRunReady", { ready = true })
+				end)
+			end
+		end
+	end,
+})
+
+local function priorityOptionMatches(opt, kind, hpRatio)
+	if opt == "Heal (Always)" then
+		return kind == "ShortRest"
+	elseif opt == "Heal (Below HP%)" then
+		return kind == "ShortRest" and hpRatio <= DungeonAuto.RestThreshold
+	elseif opt == "Loot" then
+		return kind == "Scavenge"
+	elseif opt == "Fight" then
+		return kind == "Fight"
+	elseif opt == "Events" then
+		return kind == "Dialogue" or kind == "StatCheck" or kind == "Quest"
+	elseif opt == "Shop" then
+		return kind == "Shop" or kind == "Merchant"
+	elseif opt == "Continue" then
+		return kind == "Continue"
+	end
+	return false
+end
+
+local function scoreEncounterKind(kind, hpRatio)
+	local rankWeights = {
+		{ DungeonAuto.Priority1, 1000 },
+		{ DungeonAuto.Priority2, 700 },
+		{ DungeonAuto.Priority3, 450 },
+	}
+	for _, rw in ipairs(rankWeights) do
+		if priorityOptionMatches(rw[1], kind, hpRatio) then
+			return rw[2]
+		end
+	end
+	local fallback = { Quest = 350, Scavenge = 300, Fight = 250, Continue = 200, Dialogue = 150, StatCheck = 150, ShortRest = 90, Shop = 40, Merchant = 40 }
+	return fallback[kind] or 10
+end
+
+local function scoreOutcomeList(outcomes, hpRatio)
+	if type(outcomes) ~= "table" then
+		return 0
+	end
+	local s = 0
+	local needHeal = (hpRatio or 1) <= DungeonAuto.RestThreshold
+	for _, out in ipairs(outcomes) do
+		if type(out) == "table" then
+			local k = out.kind
+			if k == "Gems" then
+				s += 260 * (tonumber(out.amount) or 1)
+			elseif k == "Item" or k == "Scavenge" or k == "Card" then
+				s += 160 * (tonumber(out.count) or 1)
+			elseif k == "Heal" then
+				local frac = tonumber(out.fraction) or 0.2
+				s += (needHeal and 450 or 90) * frac
+			elseif k == "Gold" then
+				s += 4 * (tonumber(out.amount) or 10)
+			elseif k == "StartEnergy" then
+				s += 75 * (tonumber(out.amount) or 1)
+			elseif k == "Damage" then
+				local frac = tonumber(out.fraction) or 0.15
+				s -= (needHeal and 500 or 180) * frac
+			elseif k == "Fight" then
+				s -= 20
+			elseif k == "NextFight" then
+				s -= 15
+			end
+		end
+	end
+	return s
+end
+
+local ENCOUNTER_DELAY_SECONDS = 2.0
+
+local function fireGuiButton(btn)
+	if not btn then
+		return false
+	end
+	if typeof(firesignal) == "function" then
+		local ok = pcall(firesignal, btn.Activated)
+		if ok then
+			return true
+		end
+		local okClick = pcall(firesignal, btn.MouseButton1Click)
+		if okClick then
+			return true
+		end
+	end
+	if typeof(getconnections) == "function" then
+		local okC, conns = pcall(getconnections, btn.Activated)
+		if okC and type(conns) == "table" and #conns > 0 then
+			for _, conn in ipairs(conns) do
+				pcall(function() conn:Fire() end)
+			end
+			return true
+		end
+	end
+	return false
+end
+
+local function findRunUiChoiceButton(offerIdx, choiceIdx)
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	local runUi = pg and pg:FindFirstChild("RunUI")
+	if not runUi then
+		return nil
+	end
+	for _, d in ipairs(runUi:GetDescendants()) do
+		if d:IsA("TextButton")
+			and d:GetAttribute("OfferIndex") == offerIdx
+			and d:GetAttribute("ChoiceIndex") == choiceIdx
+		then
+			return d
+		end
+	end
+	return nil
+end
+
+local function isRunUiChoiceLocked(offerIdx, choiceIdx)
+	local btn = findRunUiChoiceButton(offerIdx, choiceIdx)
+	return btn ~= nil and btn:GetAttribute("Locked") == true
+end
+
+local function pickBestChoiceForOffer(offer, def, runState, hpRatio, offerIdx)
+	local choices = (type(offer) == "table" and type(offer.choices) == "table" and offer.choices)
+		or (type(def) == "table" and type(def.choices) == "table" and def.choices)
+	if not choices or #choices == 0 then
+		return 1
+	end
+
+	local bestStats = (type(runState) == "table" and type(runState.bestStats) == "table" and runState.bestStats) or {}
+	local bestChoiceIdx, bestChoiceScore = nil, -math.huge
+
+	for idx, ch in ipairs(choices) do
+		if type(ch) == "table" and not ch.locked and not ch.disabled and not isRunUiChoiceLocked(offerIdx, idx) then
+			local score = 10 - (idx * 0.1)
+			if ch.outcomes then
+				score += scoreOutcomeList(ch.outcomes, hpRatio)
+			end
+			if ch.success or ch.failure then
+				local p = tonumber(ch.chance) or 0.5
+				if type(ch.stat) == "string" and tonumber(bestStats[ch.stat]) then
+					p = math.clamp(p + tonumber(bestStats[ch.stat]) * 0.1, 0.1, 0.95)
+				end
+				score += p * scoreOutcomeList(ch.success, hpRatio) + (1 - p) * scoreOutcomeList(ch.failure, hpRatio)
+			end
+			if type(ch.cost) == "table" and tonumber(ch.cost.gold) then
+				score -= tonumber(ch.cost.gold) * 2
+			end
+			if score > bestChoiceScore then
+				bestChoiceScore = score
+				bestChoiceIdx = idx
+			end
+		end
+	end
+	return bestChoiceIdx or 1
+end
+
+local function pickBestEncounterOffer(mods, offers, hpRatio)
+	if type(offers) ~= "table" or #offers == 0 then
+		return
+	end
+	local ratio = hpRatio or DungeonAuto.CurrentHpRatio or 1
+	local bestIdx, bestScore = 1, -math.huge
+	for idx, offer in ipairs(offers) do
+		if not offer.locked and not offer.disabled then
+			local def = mods.Encounters and mods.Encounters[offer.id]
+			local kind = offer.kind or (def and def.kind) or ""
+			local score = scoreEncounterKind(kind, ratio)
+			local oid = string.lower(tostring(offer.id or ""))
+			local oname = string.lower(tostring(offer.name or ""))
+			if DungeonAuto.PrioritizeQuests and (kind == "Quest" or offer.quest ~= nil or string.find(oid, "seraph", 1, true) ~= nil or string.find(oname, "fallen light", 1, true) ~= nil) then
+				score += 2000
+			end
+			if score > bestScore then
+				bestScore = score
+				bestIdx = idx
+			end
+		end
+	end
+	local picked = offers[bestIdx]
+	if picked then
+		local def = mods.Encounters and mods.Encounters[picked.id]
+		local choiceIdx = pickBestChoiceForOffer(picked, def, DungeonAuto.RunState, ratio, bestIdx)
+		local btn = findRunUiChoiceButton(bestIdx, choiceIdx)
+		local firedUi = btn and btn:GetAttribute("Locked") ~= true and fireGuiButton(btn)
+		if not firedUi then
+			pcall(function()
+				mods.Net.fireServer("PickEncounter", { offerIndex = bestIdx, choiceIndex = choiceIdx })
+			end)
+		end
+		DungeonAuto.PendingOffers = nil
+		setDungeonStatus(string.format("PICKED · %s (c%d)", tostring(picked.id or bestIdx), choiceIdx))
+	end
+end
+
+DungeonTab:AddToggle({
+	Title = "Auto Pick Encounter",
+	Description = "Auto-picks offers & best StatCheck/event choice",
+	Default = DungeonAuto.AutoEncounter,
+	Callback = function(enabled)
+		DungeonAuto.AutoEncounter = enabled
+		Config.Set("Dungeon_AutoEncounter", enabled)
+		setDungeonStatus(enabled and "WAITING OFFERS" or "IDLE")
+		if enabled and DungeonAuto.PendingOffers then
+			local mods = getGameMods()
+			if mods then
+				task.spawn(pickBestEncounterOffer, mods, DungeonAuto.PendingOffers, DungeonAuto.CurrentHpRatio)
+			end
+		end
+	end,
+})
+
+DungeonTab:AddToggle({
+	Title = "Prioritize Quest Encounters",
+	Description = "Always picks active story/Seraph quest offers (e.g. Sariel) first",
+	Default = DungeonAuto.PrioritizeQuests,
+	Callback = function(enabled)
+		DungeonAuto.PrioritizeQuests = enabled
+		Config.Set("Dungeon_PrioritizeQuests", enabled)
+	end,
+})
+
+DungeonTab:AddDropdown({
+	Title = "1st Priority",
+	Options = ENCOUNTER_PRIO_OPTIONS,
+	Default = DungeonAuto.Priority1,
+	Callback = function(choice)
+		DungeonAuto.Priority1 = choice
+		Config.Set("Dungeon_Prio1", choice)
+	end,
+})
+
+DungeonTab:AddDropdown({
+	Title = "2nd Priority",
+	Options = ENCOUNTER_PRIO_OPTIONS,
+	Default = DungeonAuto.Priority2,
+	Callback = function(choice)
+		DungeonAuto.Priority2 = choice
+		Config.Set("Dungeon_Prio2", choice)
+	end,
+})
+
+DungeonTab:AddDropdown({
+	Title = "3rd Priority",
+	Options = ENCOUNTER_PRIO_OPTIONS,
+	Default = DungeonAuto.Priority3,
+	Callback = function(choice)
+		DungeonAuto.Priority3 = choice
+		Config.Set("Dungeon_Prio3", choice)
+	end,
+})
+
+DungeonTab:AddSegmented({
+	Title = "Rest Below HP",
+	Options = { "35%", "50%", "65%" },
+	Default = Config.Get("Dungeon_RestBelow", "50%"),
+	Callback = function(pct)
+		Config.Set("Dungeon_RestBelow", pct)
+		DungeonAuto.RestThreshold = (tonumber(string.match(pct, "%d+")) or 50) / 100
+	end,
+})
+
+DungeonTab:AddToggle({
+	Title = "Auto Skip Merchant",
+	Description = "Automatically leaves Merchant stops during AFK runs",
+	Default = DungeonAuto.AutoSkipMerchant,
+	Callback = function(enabled)
+		DungeonAuto.AutoSkipMerchant = enabled
+		Config.Set("Dungeon_AutoSkipMerchant", enabled)
+	end,
+})
+
+local function findSummaryButton(summaryGui, btnName)
+	if not summaryGui then
+		return nil
+	end
+	local targetLower = string.lower(btnName)
+	for _, d in ipairs(summaryGui:GetDescendants()) do
+		if d:IsA("GuiButton") or d:IsA("TextButton") then
+			local nameLower = string.lower(d.Name or "")
+			local textLower = string.lower(d.Text or "")
+			if nameLower == targetLower or string.find(nameLower, targetLower) or string.find(textLower, targetLower) then
+				return d
+			end
+		end
+	end
+	return nil
+end
+
+local REPLAY_DELAY_SECONDS = 2.5
+
+local function isMyNameInVotes(votes)
+	if type(votes) ~= "table" or type(votes.names) ~= "table" then
+		return false
+	end
+	local n1 = string.lower(LocalPlayer.Name or "")
+	local n2 = string.lower(LocalPlayer.DisplayName or "")
+	for _, nm in ipairs(votes.names) do
+		local s = string.lower(tostring(nm))
+		if (n1 ~= "" and s == n1) or (n2 ~= "" and s == n2) then
+			return true
+		end
+	end
+	return false
+end
+
+local function findSummaryButton(summaryGui, btnName)
+	if not summaryGui then
+		return nil
+	end
+	local lowerTarget = string.lower(btnName)
+	for _, d in ipairs(summaryGui:GetDescendants()) do
+		if d:IsA("GuiButton") or d:IsA("TextButton") then
+			local n = string.lower(d.Name or "")
+			local t = string.lower(d.Text or "")
+			if n == lowerTarget or t == lowerTarget or string.find(n, lowerTarget, 1, true) or string.find(t, lowerTarget, 1, true) then
+				return d
+			end
+		end
+	end
+	return nil
+end
+
+handleRejoinPromptIfPresent = function()
 	if not DungeonAuto.AutoRejoinRun or not State.Alive then
 		return false
 	end
@@ -7420,81 +8221,85 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 	if not summaryGui then
 		if DungeonAuto.SeenSummaryGui ~= nil then
 			DungeonAuto.VotedSummaryGui = nil
+			DungeonAuto.VotedCurrentSummary = false
+			DungeonAuto.ServerConfirmedReplayVote = false
 			DungeonAuto.SeenSummaryGui = nil
-			DungeonAuto.SeenSummaryAt = nil
-			pcall(function()
-				collectgarbage("step", 250)
-			end)
+			DungeonAuto.ReplayAttempts = 0
 		end
-		if forceFire and not DungeonAuto.VotedCurrentSummary then
-			DungeonAuto.VotedCurrentSummary = true
-			DungeonAuto.LastReplayAttemptAt = os.clock()
-			DungeonAuto.ReplayAttempts = (DungeonAuto.ReplayAttempts or 0) + 1
+		if forceFire then
 			pcall(function()
 				mods.Net.fireServer("RequestReplay")
 			end)
-			setDungeonStatus("REPLAY REQUESTED")
+			setDungeonStatus("REPLAY REQUESTED (FORCE)")
 		end
 		return
 	end
 
+	local now = os.clock()
 	if DungeonAuto.SeenSummaryGui ~= summaryGui then
 		DungeonAuto.SeenSummaryGui = summaryGui
-		DungeonAuto.SeenSummaryAt = os.clock()
+		DungeonAuto.SeenSummaryAt = now
+		DungeonAuto.VotedSummaryGui = nil
+		DungeonAuto.VotedCurrentSummary = false
+		DungeonAuto.ServerConfirmedReplayVote = false
+		DungeonAuto.ReplayAttempts = 0
 		if not ignoreDelay then
-			setDungeonStatus(string.format("REPLAY IN %.1fs", REPLAY_DELAY_SECONDS))
+			setDungeonStatus("SUMMARY SEEN · WAITING 2.5s")
+			return
 		end
 	end
 
-	if not ignoreDelay and DungeonAuto.SeenSummaryAt and (os.clock() - DungeonAuto.SeenSummaryAt) < REPLAY_DELAY_SECONDS then
+	if not ignoreDelay and (now - (DungeonAuto.SeenSummaryAt or now)) < REPLAY_VOTE_DELAY then
+		return
+	end
+
+	if DungeonAuto.VotedSummaryGui == summaryGui and DungeonAuto.VotedCurrentSummary then
 		return
 	end
 
 	local replayBtn = findSummaryButton(summaryGui, "Replay")
-	if not replayBtn then
-		if findSummaryButton(summaryGui, "Continue") then
-			DungeonAuto.VotedSummaryGui = summaryGui
-			setDungeonStatus("RUN ENDED (NO REPLAY)")
-		end
-		return
-	end
+	local continueBtn = findSummaryButton(summaryGui, "Continue") or findSummaryButton(summaryGui, "Return")
+	local waitDuration = (now - (DungeonAuto.SeenSummaryAt or now))
 
-	-- Initial vote on this RunSummary UI
-	if DungeonAuto.VotedSummaryGui ~= summaryGui then
-		DungeonAuto.VotedSummaryGui = summaryGui
-		DungeonAuto.LastReplayAttemptAt = os.clock()
-		DungeonAuto.ReplayAttempts = 1
-		if replayBtn.Text ~= "Replaying" then
-			fireGuiButton(replayBtn)
+	-- If Replay button exists and we haven't timed out (>8s without replay starting)
+	if replayBtn and waitDuration <= 8.0 then
+		local btnText = replayBtn.Text or ""
+		if btnText == "Replaying" or string.find(string.lower(btnText), "replaying") then
+			DungeonAuto.VotedSummaryGui = summaryGui
+			DungeonAuto.VotedCurrentSummary = true
+			setDungeonStatus("REPLAY VOTED")
+			return
 		end
-		if replayBtn.Text ~= "Replaying" and not DungeonAuto.VotedCurrentSummary then
+
+		if (now - (DungeonAuto.LastReplayAttemptAt or 0)) >= 2.5 and (DungeonAuto.ReplayAttempts or 0) < 3 then
+			DungeonAuto.LastReplayAttemptAt = now
+			DungeonAuto.ReplayAttempts = (DungeonAuto.ReplayAttempts or 0) + 1
+			fireGuiButton(replayBtn)
 			pcall(function()
 				mods.Net.fireServer("RequestReplay")
 			end)
+			return
 		end
-		DungeonAuto.VotedCurrentSummary = true
-		setDungeonStatus("REPLAY VOTED")
-		return
 	end
 
-	-- If UI says "Replaying" but server RunReplayVotes has NOT confirmed our vote yet, retry up to 3 times safely
-	if not DungeonAuto.ServerConfirmedReplayVote
-		and (DungeonAuto.ReplayAttempts or 0) < 3
-		and (os.clock() - (DungeonAuto.LastReplayAttemptAt or 0)) >= 2.0
-	then
-		DungeonAuto.LastReplayAttemptAt = os.clock()
-		DungeonAuto.ReplayAttempts = (DungeonAuto.ReplayAttempts or 0) + 1
-		pcall(function()
-			mods.Net.fireServer("RequestReplay")
-		end)
-		setDungeonStatus(string.format("REPLAY RETRY (%d/3)", DungeonAuto.ReplayAttempts))
+	-- If Replay is unavailable (Loss / Defeat screen) or timed out (> 8s):
+	-- Click Continue to return to Lobby so Auto-Requeue can launch the next run!
+	if continueBtn then
+		local lastCont = DungeonAuto.LastContinueAt or 0
+		if (now - lastCont) >= 2.0 then
+			DungeonAuto.LastContinueAt = now
+			DungeonAuto.VotedSummaryGui = summaryGui
+			setDungeonStatus("LOSS / END · RETURNING TO LOBBY")
+			fireGuiButton(continueBtn)
+			pcall(function()
+				mods.Net.fireServer("RequestReturnToLobby")
+			end)
+		end
 	end
 end
 
-local DEATH_CONTINUE_DELAY = 1.2
-
 local function tryContinueAfterDeath(ignoreDelay)
-	if not State.Alive or (not DungeonAuto.AutoReplay and not CombatAuto.Enabled) then
+	if not State.Alive or (not DungeonAuto.AutoReplay and not CombatAuto.Enabled and not DungeonAuto.AutoRequeue) then
 		return
 	end
 	local pg = LocalPlayer:FindFirstChild("PlayerGui")
@@ -7519,33 +8324,33 @@ local function tryContinueAfterDeath(ignoreDelay)
 		return
 	end
 
-	local attempts = DungeonAuto.DeclineAttempts or 0
 	local lastAt = DungeonAuto.LastDeclineReviveAt or 0
-	if attempts >= 3 or (now - lastAt) < 3.0 then
+	if (now - lastAt) < 2.0 then
 		return
 	end
 
 	DungeonAuto.LastDeclineReviveAt = now
-	DungeonAuto.DeclineAttempts = attempts + 1
+	DungeonAuto.DeclineAttempts = (DungeonAuto.DeclineAttempts or 0) + 1
 
 	local continueBtn = nil
 	for _, d in ipairs(fallen:GetDescendants()) do
-		if d:IsA("GuiButton") and d.Name == "Continue" then
+		if (d:IsA("GuiButton") or d:IsA("TextButton")) and (string.find(string.lower(d.Name), "continue") or string.find(string.lower(d.Text or ""), "continue")) then
 			continueBtn = d
 			break
 		end
 	end
 
-	local firedUi = continueBtn and fireGuiButton(continueBtn) or false
-	if fallen.Visible or not firedUi then
-		local mods = getGameMods()
-		if mods then
-			pcall(function()
-				mods.Net.fireServer("DeclineRevive")
-			end)
-		end
+	if continueBtn then
+		fireGuiButton(continueBtn)
 	end
-	setDungeonStatus("DEATH CONTINUE · WAIT REPLAY")
+
+	local mods = getGameMods()
+	if mods and mods.Net then
+		pcall(function()
+			mods.Net.fireServer("DeclineRevive")
+		end)
+	end
+	setDungeonStatus("FALLEN · DECLINED REVIVE")
 end
 
 DungeonTab:AddToggle({
