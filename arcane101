@@ -8154,23 +8154,6 @@ local function isMyNameInVotes(votes)
 	return false
 end
 
-local function findSummaryButton(summaryGui, btnName)
-	if not summaryGui then
-		return nil
-	end
-	local lowerTarget = string.lower(btnName)
-	for _, d in ipairs(summaryGui:GetDescendants()) do
-		if d:IsA("GuiButton") or d:IsA("TextButton") then
-			local n = string.lower(d.Name or "")
-			local t = string.lower(d.Text or "")
-			if n == lowerTarget or t == lowerTarget or string.find(n, lowerTarget, 1, true) or string.find(t, lowerTarget, 1, true) then
-				return d
-			end
-		end
-	end
-	return nil
-end
-
 handleRejoinPromptIfPresent = function()
 	if not DungeonAuto.AutoRejoinRun or not State.Alive then
 		return false
@@ -8209,7 +8192,7 @@ handleRejoinPromptIfPresent = function()
 end
 
 local function tryVoteReplay(forceFire, ignoreDelay)
-	if not State.Alive or not DungeonAuto.AutoReplay then
+	if not State.Alive or (not DungeonAuto.AutoReplay and not DungeonAuto.AutoRequeue) then
 		return
 	end
 	local mods = getGameMods()
@@ -8228,9 +8211,13 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 		end
 		if forceFire then
 			pcall(function()
-				mods.Net.fireServer("RequestReplay")
+				if DungeonAuto.LastSummaryReplayable == false then
+					mods.Net.fireServer("RequestReturnToLobby")
+				else
+					mods.Net.fireServer("RequestReplay")
+				end
 			end)
-			setDungeonStatus("REPLAY REQUESTED (FORCE)")
+			setDungeonStatus(DungeonAuto.LastSummaryReplayable == false and "RETURN TO LOBBY (FORCE)" or "REPLAY REQUESTED (FORCE)")
 		end
 		return
 	end
@@ -8257,12 +8244,12 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 		return
 	end
 
-	local replayBtn = findSummaryButton(summaryGui, "Replay")
+	local replayBtn = (DungeonAuto.AutoReplay and DungeonAuto.LastSummaryReplayable ~= false) and findSummaryButton(summaryGui, "Replay") or nil
 	local continueBtn = findSummaryButton(summaryGui, "Continue") or findSummaryButton(summaryGui, "Return")
 	local waitDuration = (now - (DungeonAuto.SeenSummaryAt or now))
 
 	-- If Replay button exists and we haven't timed out (>8s without replay starting)
-	if replayBtn and waitDuration <= 8.0 then
+	if replayBtn and waitDuration <= 8.0 and DungeonAuto.AutoReplay and DungeonAuto.LastSummaryReplayable ~= false then
 		local btnText = replayBtn.Text or ""
 		if btnText == "Replaying" or string.find(string.lower(btnText), "replaying") then
 			DungeonAuto.VotedSummaryGui = summaryGui
@@ -8282,19 +8269,20 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 		end
 	end
 
-	-- If Replay is unavailable (Loss / Defeat screen) or timed out (> 8s):
+	-- If Replay is unavailable (Loss / Defeat screen) or timed out (> 8s) or Replay is disabled:
 	-- Click Continue to return to Lobby so Auto-Requeue can launch the next run!
-	if continueBtn then
-		local lastCont = DungeonAuto.LastContinueAt or 0
-		if (now - lastCont) >= 2.0 then
-			DungeonAuto.LastContinueAt = now
-			DungeonAuto.VotedSummaryGui = summaryGui
-			setDungeonStatus("LOSS / END · RETURNING TO LOBBY")
+	local lastCont = DungeonAuto.LastContinueAt or 0
+	if (now - lastCont) >= 2.0 then
+		DungeonAuto.LastContinueAt = now
+		DungeonAuto.VotedSummaryGui = summaryGui
+		DungeonAuto.VotedCurrentSummary = true
+		setDungeonStatus("LOSS / END · RETURNING TO LOBBY")
+		if continueBtn then
 			fireGuiButton(continueBtn)
-			pcall(function()
-				mods.Net.fireServer("RequestReturnToLobby")
-			end)
 		end
+		pcall(function()
+			mods.Net.fireServer("RequestReturnToLobby")
+		end)
 	end
 end
 
@@ -9187,6 +9175,7 @@ task.spawn(function()
 			return
 		end
 		rememberLastDungeon(summary.areaId, summary.difficulty, nil, nil, nil, false)
+		DungeonAuto.LastSummaryReplayable = (summary.replay == true)
 		DungeonAuto.VotedSummaryGui = nil
 		DungeonAuto.VotedCurrentSummary = false
 		DungeonAuto.ServerConfirmedReplayVote = false
@@ -9214,9 +9203,19 @@ task.spawn(function()
 				end
 			end)
 		elseif summary.replay ~= true then
-			setDungeonStatus("RUN ENDED (NO REPLAY)")
+			setDungeonStatus("DEFEAT / END · RETURNING TO LOBBY IN 2s")
+			task.delay(2.0, function()
+				if State.Alive then
+					tryVoteReplay(true, true)
+				end
+			end)
 		else
-			setDungeonStatus("RUN ENDED")
+			setDungeonStatus("RUN ENDED · RETURNING TO LOBBY IN 2s")
+			task.delay(2.0, function()
+				if State.Alive then
+					tryVoteReplay(true, true)
+				end
+			end)
 		end
 	end))
 
@@ -9245,10 +9244,10 @@ trackThread(function()
 			break
 		end
 		pcall(function()
-			if DungeonAuto.AutoReplay or CombatAuto.Enabled then
+			if DungeonAuto.AutoReplay or CombatAuto.Enabled or DungeonAuto.AutoRequeue then
 				tryContinueAfterDeath(false)
 			end
-			if DungeonAuto.AutoReplay then
+			if DungeonAuto.AutoReplay or DungeonAuto.AutoRequeue then
 				tryVoteReplay(false, false)
 			end
 			chestTick += 1
