@@ -7513,11 +7513,21 @@ local function findSummaryButton(summaryGui, btnName)
 	end
 	local targetLower = string.lower(btnName)
 	for _, d in ipairs(summaryGui:GetDescendants()) do
-		if d:IsA("GuiButton") or d:IsA("TextButton") then
+		if d:IsA("GuiButton") then
 			local nameLower = string.lower(d.Name or "")
-			local textLower = string.lower(d.Text or "")
-			if nameLower == targetLower or string.find(nameLower, targetLower) or string.find(textLower, targetLower) then
+			local textLower = ""
+			pcall(function() textLower = string.lower(d.Text or "") end)
+			if nameLower == targetLower or string.find(nameLower, targetLower, 1, true) or (textLower ~= "" and string.find(textLower, targetLower, 1, true)) then
 				return d
+			end
+			for _, child in ipairs(d:GetDescendants()) do
+				if child:IsA("TextLabel") then
+					local cl = ""
+					pcall(function() cl = string.lower(child.Text or "") end)
+					if cl ~= "" and string.find(cl, targetLower, 1, true) then
+						return d
+					end
+				end
 			end
 		end
 	end
@@ -7632,13 +7642,14 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 	end
 
 	local replayBtn = (DungeonAuto.AutoReplay and DungeonAuto.LastSummaryReplayable ~= false) and findSummaryButton(summaryGui, "Replay") or nil
-	local continueBtn = findSummaryButton(summaryGui, "Continue") or findSummaryButton(summaryGui, "Return")
+	local continueBtn = findSummaryButton(summaryGui, "Continue") or findSummaryButton(summaryGui, "Return") or findSummaryButton(summaryGui, "Lobby") or findSummaryButton(summaryGui, "Leave") or findSummaryButton(summaryGui, "Done")
 	local waitDuration = (now - (DungeonAuto.SeenSummaryAt or now))
 
 	-- If Replay button exists and we haven't timed out (>8s without replay starting)
 	if replayBtn and waitDuration <= 8.0 and DungeonAuto.AutoReplay and DungeonAuto.LastSummaryReplayable ~= false then
-		local btnText = replayBtn.Text or ""
-		if btnText == "Replaying" or string.find(string.lower(btnText), "replaying") then
+		local btnText = ""
+		pcall(function() btnText = replayBtn.Text or "" end)
+		if btnText == "Replaying" or string.find(string.lower(btnText), "replaying", 1, true) then
 			DungeonAuto.VotedSummaryGui = summaryGui
 			DungeonAuto.VotedCurrentSummary = true
 			setDungeonStatus("REPLAY VOTED")
@@ -7659,7 +7670,7 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 	-- If Replay is unavailable (Loss / Defeat screen) or timed out (> 8s) or Replay is disabled:
 	-- Click Continue to return to Lobby so Auto-Requeue can launch the next run!
 	local lastCont = DungeonAuto.LastContinueAt or 0
-	if (now - lastCont) >= 2.0 then
+	if (now - lastCont) >= 1.5 then
 		DungeonAuto.LastContinueAt = now
 		DungeonAuto.VotedSummaryGui = summaryGui
 		DungeonAuto.VotedCurrentSummary = true
@@ -7673,62 +7684,85 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 	end
 end
 
-local function tryContinueAfterDeath(ignoreDelay)
-	if not State.Alive or (not DungeonAuto.AutoReplay and not CombatAuto.Enabled and not DungeonAuto.AutoRequeue) then
-		return
-	end
+local function findRevivePopupElements()
 	local pg = LocalPlayer:FindFirstChild("PlayerGui")
-	local combatGui = pg and pg:FindFirstChild("CombatUI")
+	if not pg then
+		return nil, nil, nil
+	end
+	local combatGui = pg:FindFirstChild("CombatUI")
 	local fallen = combatGui and combatGui:FindFirstChild("Fallen")
-	if not fallen or not fallen:IsA("GuiObject") or not fallen.Visible then
-		DungeonAuto.SeenFallenAt = nil
-		DungeonAuto.DeclineAttempts = 0
-		DungeonAuto.LastDeclineReviveAt = 0
-		return
-	end
+	local rc = fallen and fallen:FindFirstChild("ReviveCard")
+	local continueBtn = rc and rc:FindFirstChild("Continue")
+	local promiseLabel = rc and rc:FindFirstChild("Promise")
 
-	local now = os.clock()
-	if not DungeonAuto.SeenFallenAt then
-		DungeonAuto.SeenFallenAt = now
-		if not ignoreDelay then
-			setDungeonStatus("FALLEN · CONTINUE IN 1.2s")
-			return
+	-- Strict: the popup only counts when it is ACTUALLY on screen
+	-- (button + every ancestor Visible, and the ScreenGui Enabled).
+	-- ReviveCard/Promise stay Visible=true permanently inside a hidden
+	-- Fallen frame, so checking them alone causes constant false positives.
+	local function onScreen(gui)
+		local node = gui
+		while node and node ~= pg do
+			if node:IsA("GuiObject") and not node.Visible then
+				return false
+			end
+			if node:IsA("LayerCollector") and not node.Enabled then
+				return false
+			end
+			node = node.Parent
 		end
-	end
-	if not ignoreDelay and (now - DungeonAuto.SeenFallenAt) < 1.2 then
-		return
+		return node == pg
 	end
 
-	local lastAt = DungeonAuto.LastDeclineReviveAt or 0
-	if (now - lastAt) < 1.2 then
-		return
+	if continueBtn and continueBtn:IsA("GuiButton") and fallen and onScreen(continueBtn) then
+		return continueBtn, fallen, rc
 	end
 
-	DungeonAuto.LastDeclineReviveAt = now
-	DungeonAuto.DeclineAttempts = (DungeonAuto.DeclineAttempts or 0) + 1
+	return nil, nil, nil
+end
 
-	local continueBtn = (fallen:FindFirstChild("ReviveCard") and fallen.ReviveCard:FindFirstChild("Continue"))
+local function tryContinueAfterDeath(_force)
+	if not State.Alive then
+		return false
+	end
+
+	-- Never act unless the revive popup is genuinely on screen.
+	local continueBtn, fallen = findRevivePopupElements()
 	if not continueBtn then
-		for _, d in ipairs(fallen:GetDescendants()) do
-			if d:IsA("GuiButton") and (string.find(string.lower(d.Name), "continue") or (d:IsA("TextButton") and string.find(string.lower(d.Text or ""), "continue"))) then
-				continueBtn = d
-				break
+		return false
+	end
+
+	-- Throttle so overlapping triggers can't spam the game.
+	local now = os.clock()
+	if (now - (DungeonAuto.LastDeclineReviveAt or 0)) < 0.25 then
+		return false
+	end
+	DungeonAuto.LastDeclineReviveAt = now
+
+	-- 1. Call game's native UI controller onContinue handler
+	pcall(function()
+		local ps = LocalPlayer:FindFirstChild("PlayerScripts")
+		local cm = ps and ps:FindFirstChild("CampaignClient")
+		cm = cm and cm:FindFirstChild("UI")
+		cm = cm and cm:FindFirstChild("CombatUI")
+		if cm then
+			local m = require(cm)
+			if m and type(m.onContinue) == "function" then
+				m.onContinue()
 			end
 		end
-	end
+	end)
 
-	if continueBtn then
+	-- 2. Fire the Continue button's own Activated handler
+	pcall(function()
 		fireGuiButton(continueBtn)
-		pcall(function()
-			if typeof(getconnections) == "function" then
-				for _, c in ipairs(getconnections(continueBtn.Activated)) do
-					pcall(c.Fire, c)
-					pcall(c.Function)
-				end
-			end
-		end)
-	end
+	end)
+	pcall(function()
+		if typeof(firesignal) == "function" then
+			firesignal(continueBtn.Activated)
+		end
+	end)
 
+	-- 4. Server Remote DeclineRevive
 	local mods = getGameMods()
 	if mods and mods.Net then
 		pcall(function()
@@ -7745,13 +7779,82 @@ local function tryContinueAfterDeath(ignoreDelay)
 		end)
 	end
 
+	-- 4. Hide only the Fallen overlay (the game toggles this frame itself;
+	-- ReviveCard is left alone so future popups still render).
 	pcall(function()
-		fallen.Visible = false
+		if fallen and fallen:IsA("GuiObject") then
+			fallen.Visible = false
+		end
 	end)
 
-	setDungeonStatus("FALLEN · DECLINED REVIVE")
 	DungeonAuto.SeenFallenAt = nil
+	setDungeonStatus("FALLEN · CLICKED CONTINUE (SPECTATING)")
+	return true
 end
+
+-- Reactive listeners and fast watchdog for instantaneous dismissal
+local function hookFallenAutoContinue()
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	local combatGui = pg and pg:FindFirstChild("CombatUI")
+	if not combatGui then
+		return
+	end
+	local fallen = combatGui:FindFirstChild("Fallen")
+	if fallen then
+		-- Undo an older build that permanently hid ReviveCard
+		pcall(function()
+			local rc0 = fallen:FindFirstChild("ReviveCard")
+			if rc0 and rc0:IsA("GuiObject") and not rc0.Visible then
+				rc0.Visible = true
+			end
+		end)
+		trackConnection(fallen:GetPropertyChangedSignal("Visible"):Connect(function()
+			if fallen.Visible then
+				task.spawn(tryContinueAfterDeath, true)
+			end
+		end))
+		local rc = fallen:FindFirstChild("ReviveCard")
+		if rc then
+			trackConnection(rc:GetPropertyChangedSignal("Visible"):Connect(function()
+				if rc.Visible then
+					task.spawn(tryContinueAfterDeath, true)
+				end
+			end))
+		end
+		trackConnection(fallen.ChildAdded:Connect(function(child)
+			if child.Name == "ReviveCard" then
+				task.spawn(tryContinueAfterDeath, true)
+				trackConnection(child:GetPropertyChangedSignal("Visible"):Connect(function()
+					if child.Visible then
+						task.spawn(tryContinueAfterDeath, true)
+					end
+				end))
+			end
+		end))
+	end
+	trackConnection(combatGui.ChildAdded:Connect(function(child)
+		if child.Name == "Fallen" then
+			task.spawn(hookFallenAutoContinue)
+			task.spawn(tryContinueAfterDeath, true)
+		end
+	end))
+end
+
+task.spawn(hookFallenAutoContinue)
+
+-- Lightweight watchdog (0.25s): a few FindFirstChild calls, no descendant scans
+trackThread(function()
+	while State.Alive do
+		task.wait(0.25)
+		if not State.Alive then
+			break
+		end
+		local btn = findRevivePopupElements()
+		if btn then
+			tryContinueAfterDeath(true)
+		end
+	end
+end)
 
 DungeonTab:AddToggle({
 	Title = "Auto Replay Run",
@@ -8566,16 +8669,29 @@ task.spawn(function()
 		if not State.Alive then
 			return
 		end
-		if type(data) == "table" and data.open == true then
-			DungeonAuto.SeenFallenAt = os.clock()
-			DungeonAuto.DeclineAttempts = 0
-			DungeonAuto.LastDeclineReviveAt = 0
-			if DungeonAuto.AutoReplay or CombatAuto.Enabled or DungeonAuto.AutoRequeue then
-				setDungeonStatus("FALLEN · CONTINUE IN 1.2s")
-				task.delay(1.2, function()
-					tryContinueAfterDeath(true)
+		-- The game treats ANY non-nil payload as "revive window open" (nil = closed)
+		local isOpen = data ~= nil and data ~= false and not (type(data) == "table" and data.open == false)
+		if isOpen then
+			-- Decline on the server directly, independent of whether the popup renders
+			task.delay(0.1, function()
+				if not State.Alive then
+					return
+				end
+				pcall(function()
+					local m = getGameMods()
+					if m and m.Net then
+						m.Net.fireServer("DeclineRevive")
+					end
 				end)
-			end
+				setDungeonStatus("FALLEN · AUTO CONTINUE")
+			end)
+			task.spawn(tryContinueAfterDeath, true)
+			task.delay(0.05, function()
+				tryContinueAfterDeath(true)
+			end)
+			task.delay(0.15, function()
+				tryContinueAfterDeath(true)
+			end)
 		else
 			DungeonAuto.SeenFallenAt = nil
 			DungeonAuto.DeclineAttempts = 0
@@ -8656,9 +8772,7 @@ trackThread(function()
 			break
 		end
 		pcall(function()
-			if DungeonAuto.AutoReplay or CombatAuto.Enabled or DungeonAuto.AutoRequeue then
-				tryContinueAfterDeath(false)
-			end
+			tryContinueAfterDeath(false)
 			if DungeonAuto.AutoReplay or DungeonAuto.AutoRequeue then
 				tryVoteReplay(false, false)
 			end
@@ -9758,16 +9872,16 @@ local function deriveBuildTotals(mods, profile, invList, eqMap, targetSchool, fo
 end
 
 local ARCHETYPE_SYNERGY = {
-	StormCrit = { crit = 250, critDmg = 110, critPipBoost = 0.10, pierce = 40 },
-	CritExecute = { crit = 180, critDmg = 115, pierce = 130 },
-	LightCritHeal = { crit = 185, heal = 260, critDmg = 45 },
-	DoTDamage = { statusPow = 320, crit = 35 },
-	DrainBruiser = { hp = 0.45, allRes = 170, statusPow = 150 },
-	TankBruiser = { block = 350, blockStr = 130, hp = 0.35, allRes = 120 },
-	TankCounter = { block = 520, blockStr = 220, allRes = 240, hp = 0.50 },
-	CritTempo = { crit = 120, haste = 260 },
-	HasteTempo = { haste = 560, crit = 40 },
-	RawDamage = { dmg = 45, pierce = 35 },
+	StormCrit = { crit = 250, critDmg = 110, critPipBoost = 0.10, pierce = 40, dmg = 120 },
+	CritExecute = { crit = 180, critDmg = 115, pierce = 130, dmg = 140 },
+	LightCritHeal = { crit = 185, heal = 260, critDmg = 45, dmg = 160, pierce = 50 },
+	DoTDamage = { statusPow = 320, crit = 35, dmg = 140 },
+	DrainBruiser = { hp = 0.45, allRes = 170, statusPow = 150, dmg = 80 },
+	TankBruiser = { block = 350, blockStr = 130, hp = 0.35, allRes = 120, dmg = 70 },
+	TankCounter = { block = 520, blockStr = 220, allRes = 240, hp = 0.50, dmg = 60 },
+	CritTempo = { crit = 120, haste = 260, dmg = 110 },
+	HasteTempo = { haste = 560, crit = 40, dmg = 120 },
+	RawDamage = { dmg = 160, pierce = 60 },
 }
 
 local function scoreBuildStats(mods, stats, bonusHp, targetSchool, schoolDef, buildSpecOrMode, elementMatchCount, gearQualitySum, includesTotalHp)
@@ -9862,6 +9976,7 @@ local function scoreBuildStats(mods, stats, bonusHp, targetSchool, schoolDef, bu
 		end
 
 		score += (expectedHitMult * pipFactor * pierceMult) * 1000
+		score += schDmg * 1200
 		score += acc * 280
 		score += haste * 210
 		score += schoolSynergy
@@ -12124,10 +12239,15 @@ end)
 			if not data or type(data.rows) ~= "table" then return end
 			local equipped = prof.equipped or {}
 			for _, r in ipairs(data.rows) do
-				if r.ownedBest and r.ownedBest.uid and equipped[r.slot] ~= r.ownedBest.uid then
-					local needLv = r.needLv or 1
+				local toEquip = r.ownedBest
+				local needLv = r.needLv or 1
+				if (not toEquip or not toEquip.uid) and r.altOwnedBest and r.altOwnedBest.uid then
+					toEquip = r.altOwnedBest
+					needLv = r.altNeedLv or 1
+				end
+				if toEquip and toEquip.uid and equipped[r.slot] ~= toEquip.uid then
 					if (prof.level or 1) >= needLv then
-						mods.Net.fireServer("EquipItem", { slot = r.slot, uid = r.ownedBest.uid })
+						mods.Net.fireServer("EquipItem", { slot = r.slot, uid = toEquip.uid })
 						task.wait(0.06)
 					end
 				end
@@ -12676,17 +12796,38 @@ end)
 			local curRec = curBySlot[slot]
 			if bisDef then
 				local srcInfo = catalog.srcByItem[bisDef.id] or { labels = { "Boss Chest / Shop" }, zones = {} }
-				local altDef = nil
-				if srcInfo.isRareMythic then
+				local isMythic = (bisDef.rarity == "Mythic") or (srcInfo and srcInfo.isRareMythic)
+				local altDef, altItem = nil, nil
+				for _, cand in ipairs(slotCandidates[slot] or {}) do
+					local cDef = cand.def
+					if cDef.id ~= bisDef.id and not usedAltDefs[cDef.id] then
+						local cSrc = catalog.srcByItem[cDef.id]
+						local cIsMythic = (cDef.rarity == "Mythic") or (cSrc and cSrc.isRareMythic)
+						if isMythic and cIsMythic then
+							continue
+						end
+						altDef = cDef
+						altItem = cand.item
+						usedAltDefs[cDef.id] = true
+						break
+					end
+				end
+				if not altDef then
 					for _, cand in ipairs(slotCandidates[slot] or {}) do
-						local cSrc = catalog.srcByItem[cand.def.id]
-						if cand.def.id ~= bisDef.id and not usedAltDefs[cand.def.id] and (not cSrc or not cSrc.isRareMythic) then
+						if cand.def.id ~= bisDef.id then
 							altDef = cand.def
-							usedAltDefs[cand.def.id] = true
+							altItem = cand.item
 							break
 						end
 					end
 				end
+
+				local altOwnedBest = altDef and (ownedByDef[altDef.id] or (curRec and curRec.item.defId == altDef.id and curRec.item)) or nil
+				local altNeedLv = altDef and ((mods.LevelGate and type(mods.LevelGate.itemLevel) == "function" and select(2, pcall(mods.LevelGate.itemLevel, altDef.id))) or altDef.minLevel or 1) or 1
+				altNeedLv = tonumber(altNeedLv) or 1
+				local altSrcInfo = altDef and catalog.srcByItem[altDef.id]
+				local altSrcLabel = altSrcInfo and altSrcInfo.labels and altSrcInfo.labels[1] or "Boss Chest / Drop"
+				local altStatsText = altDef and summarizeItemStats(altDef, altItem, mods) or ""
 
 				local isSameEquipped = curRec and curRec.item.defId == bisDef.id
 				local ownedBest = isSameEquipped and curRec.item or ownedByDef[bisDef.id]
@@ -12707,12 +12848,15 @@ end)
 				elseif ownedBest then
 					status = (playerLevel < needLv) and ("IN BAG (LV " .. tostring(needLv) .. ")") or "IN BAG · EQUIP IT"
 					statusColor = C_BAG
+				elseif altOwnedBest and (not curRec or curRec.item.defId ~= altDef.id) then
+					status = isMythic and "MYTHIC CHASE · ALT IN BAG" or "MISSING · ALT IN BAG"
+					statusColor = C_BAG
 				elseif playerLevel < needLv then
 					status = "MISSING · LV " .. tostring(needLv)
-					statusColor = srcInfo.isRareMythic and C_MYTH or C_MISS
+					statusColor = isMythic and C_MYTH or C_MISS
 				else
-					status = srcInfo.isRareMythic and "MYTHIC CHASE" or "MISSING"
-					statusColor = srcInfo.isRareMythic and C_MYTH or C_MISS
+					status = isMythic and "MYTHIC CHASE" or "MISSING"
+					statusColor = isMythic and C_MYTH or C_MISS
 				end
 
 				table.insert(rows, {
@@ -12723,13 +12867,17 @@ end)
 					curRec = curRec,
 					ownedBest = ownedBest,
 					altDef = altDef,
-					altSrc = altDef and (catalog.srcByItem[altDef.id] and catalog.srcByItem[altDef.id].labels[1]),
+					altItem = altItem,
+					altOwnedBest = altOwnedBest,
+					altNeedLv = altNeedLv,
+					altSrc = altSrcLabel,
+					altStatsText = altStatsText,
 					sources = srcInfo.labels,
 					zones = srcInfo.zones,
 					status = status,
 					statusColor = statusColor,
 					isMaxed = (status == "MAXED"),
-					isMythicRare = srcInfo.isRareMythic,
+					isMythicRare = isMythic,
 					needLv = needLv,
 					maxTier = maxTier,
 					curTier = curTier,
@@ -13069,13 +13217,27 @@ end)
 				shown += 1
 				local curName = r.curRec and ((mods.Items[r.curRec.item.defId] and mods.Items[r.curRec.item.defId].name or r.curRec.item.defId) .. " [T" .. tostring(r.curRec.item.tier or 0) .. "]") or "Empty"
 				local header = string.format("[%s] %s", string.upper(r.slot), r.status)
-				local bisTitle = string.format("BiS: %s (%s)", r.bisDef.name or r.bisDef.id, r.bisDef.rarity or "?")
+				local bisTitle = string.format("BiS #1: %s (%s)", r.bisDef.name or r.bisDef.id, r.bisDef.rarity or "?")
 				local line1 = string.format("Now: %s\nStats: %s", curName, r.bisStatsText)
-				local srcText = r.isMaxed and "Equipped & Maxed!" or ("Get: " .. table.concat(r.sources, " | "))
-				if not r.isMaxed and r.altDef then
-					srcText = srcText .. string.format("\nAlt (Easier): %s — %s", r.altDef.name or r.altDef.id, tostring(r.altSrc or "Boss Chest"))
+				local srcText = r.isMaxed and "Equipped & Maxed!" or ("Get #1: " .. table.concat(r.sources, " | "))
+
+				local altLine = nil
+				if r.altDef then
+					local altTag = ""
+					if r.altOwnedBest then
+						local aCurT = tonumber(r.altOwnedBest.tier) or 0
+						altTag = (r.curRec and r.curRec.item.defId == r.altDef.id) and string.format(" [EQUIPPED T%d]", aCurT) or string.format(" [IN BAG T%d · READY]", aCurT)
+					end
+					altLine = string.format("⭐ 2nd Best (Farmable): %s (%s)%s\nStats: %s\nGet #2: %s",
+						r.altDef.name or r.altDef.id,
+						r.altDef.rarity or "Base",
+						altTag,
+						r.altStatsText ~= "" and r.altStatsText or "Base Stats",
+						tostring(r.altSrc or "Boss Chest / Drop")
+					)
 				end
-				addGuideCard(header, r.statusColor, bisTitle, line1, srcText)
+
+				addGuideCard(header, r.statusColor, bisTitle, line1 .. "\n" .. srcText, altLine)
 			end
 		end
 		if mode == "Missing Only" and shown == 0 then
