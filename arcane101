@@ -8236,7 +8236,7 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 		end
 	end
 
-	if not ignoreDelay and (now - (DungeonAuto.SeenSummaryAt or now)) < REPLAY_VOTE_DELAY then
+	if not ignoreDelay and (now - (DungeonAuto.SeenSummaryAt or now)) < 2.5 then
 		return
 	end
 
@@ -8308,7 +8308,7 @@ local function tryContinueAfterDeath(ignoreDelay)
 			return
 		end
 	end
-	if not ignoreDelay and (now - DungeonAuto.SeenFallenAt) < DEATH_CONTINUE_DELAY then
+	if not ignoreDelay and (now - DungeonAuto.SeenFallenAt) < 1.2 then
 		return
 	end
 
@@ -8330,12 +8330,25 @@ local function tryContinueAfterDeath(ignoreDelay)
 
 	if continueBtn then
 		fireGuiButton(continueBtn)
+		pcall(function()
+			VirtualUser:CaptureController()
+			VirtualUser:ClickButton1(Vector2.new(continueBtn.AbsolutePosition.X + continueBtn.AbsoluteSize.X / 2, continueBtn.AbsolutePosition.Y + continueBtn.AbsoluteSize.Y / 2))
+		end)
 	end
 
 	local mods = getGameMods()
 	if mods and mods.Net then
 		pcall(function()
 			mods.Net.fireServer("DeclineRevive")
+		end)
+	else
+		pcall(function()
+			local rem = ReplicatedStorage:FindFirstChild("Campaign")
+			rem = rem and rem:FindFirstChild("Remotes")
+			local dr = rem and rem:FindFirstChild("DeclineRevive")
+			if dr then
+				dr:FireServer()
+			end
 		end)
 	end
 	setDungeonStatus("FALLEN · DECLINED REVIVE")
@@ -9158,9 +9171,9 @@ task.spawn(function()
 			DungeonAuto.SeenFallenAt = os.clock()
 			DungeonAuto.DeclineAttempts = 0
 			DungeonAuto.LastDeclineReviveAt = 0
-			if DungeonAuto.AutoReplay or CombatAuto.Enabled then
+			if DungeonAuto.AutoReplay or CombatAuto.Enabled or DungeonAuto.AutoRequeue then
 				setDungeonStatus("FALLEN · CONTINUE IN 1.2s")
-				task.delay(DEATH_CONTINUE_DELAY, function()
+				task.delay(1.2, function()
 					tryContinueAfterDeath(true)
 				end)
 			end
@@ -13599,14 +13612,18 @@ end)
 		local mods = getGameMods(false)
 		if mods and mods.Net and type(mods.Net.onClientEvent) == "function" then
 			trackConnection(mods.Net.onClientEvent("ProfileChanged", function()
-				if State.Alive and GuideTab.Page.Visible and (os.clock() - lastAutoProfileAt) >= 1.5 then
-					lastAutoProfileAt = os.clock()
-					task.delay(0.25, function()
-						if State.Alive and GuideTab.Page.Visible then
-							renderGuide(false, false)
+				task.spawn(function()
+					pcall(function()
+						if State.Alive and GuideTab and GuideTab.Page and GuideTab.Page.Visible and (os.clock() - lastAutoProfileAt) >= 1.5 then
+							lastAutoProfileAt = os.clock()
+							task.delay(0.25, function()
+								if State.Alive and GuideTab and GuideTab.Page and GuideTab.Page.Visible then
+									renderGuide(false, false)
+								end
+							end)
 						end
 					end)
-				end
+				end)
 			end))
 		end
 	end)
