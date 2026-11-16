@@ -7665,7 +7665,8 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 
 	-- While AutoReplay is active and the run is replayable, NEVER fall through to ReturnToLobby
 	if DungeonAuto.AutoReplay and DungeonAuto.LastSummaryReplayable ~= false then
-		if DungeonAuto.ServerConfirmedReplayVote then
+		local attempts = DungeonAuto.ReplayAttempts or 0
+		if DungeonAuto.ServerConfirmedReplayVote and attempts >= 3 then
 			DungeonAuto.VotedSummaryGui = summaryGui
 			DungeonAuto.VotedCurrentSummary = true
 			setDungeonStatus("REPLAY VOTED · WAITING FOR PARTY")
@@ -7673,32 +7674,30 @@ local function tryVoteReplay(forceFire, ignoreDelay)
 		end
 
 		if replayBtn then
-			local btnTextLower = getSummaryBtnTextLower(replayBtn)
-			if string.find(btnTextLower, "replaying", 1, true) or string.find(btnTextLower, "voted", 1, true) then
-				DungeonAuto.VotedSummaryGui = summaryGui
-				DungeonAuto.VotedCurrentSummary = true
-				setDungeonStatus("REPLAY VOTED")
-				return
-			end
-
-			if (now - (DungeonAuto.LastReplayAttemptAt or 0)) >= 1.5 and (DungeonAuto.ReplayAttempts or 0) < 10 then
+			if (now - (DungeonAuto.LastReplayAttemptAt or 0)) >= 0.7 and attempts < 12 then
 				DungeonAuto.LastReplayAttemptAt = now
-				DungeonAuto.ReplayAttempts = (DungeonAuto.ReplayAttempts or 0) + 1
+				DungeonAuto.ReplayAttempts = attempts + 1
 				fireGuiButton(replayBtn)
 				pcall(function()
 					mods.Net.fireServer("RequestReplay")
 				end)
+				setDungeonStatus(string.format("REPLAY CLICK %d/4%s", math.min(4, attempts + 1), DungeonAuto.ServerConfirmedReplayVote and " · CONFIRMED" or ""))
+			elseif attempts >= 12 and DungeonAuto.ServerConfirmedReplayVote then
+				DungeonAuto.VotedSummaryGui = summaryGui
+				DungeonAuto.VotedCurrentSummary = true
+				setDungeonStatus("REPLAY VOTED")
 			end
 			return
 		end
 
 		-- Replay button not mounted yet: fire RequestReplay directly and wait (never return to lobby)
-		if (now - (DungeonAuto.LastReplayAttemptAt or 0)) >= 1.5 and (DungeonAuto.ReplayAttempts or 0) < 10 then
+		if (now - (DungeonAuto.LastReplayAttemptAt or 0)) >= 0.7 and attempts < 12 then
 			DungeonAuto.LastReplayAttemptAt = now
-			DungeonAuto.ReplayAttempts = (DungeonAuto.ReplayAttempts or 0) + 1
+			DungeonAuto.ReplayAttempts = attempts + 1
 			pcall(function()
 				mods.Net.fireServer("RequestReplay")
 			end)
+			setDungeonStatus(string.format("REPLAY REMOTE %d/4", math.min(4, attempts + 1)))
 		end
 		return
 	end
