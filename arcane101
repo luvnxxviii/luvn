@@ -7303,26 +7303,36 @@ local function fireGuiButton(btn)
 	if not btn then
 		return false
 	end
-	if typeof(firesignal) == "function" then
-		local ok = pcall(firesignal, btn.Activated)
-		if ok then
-			return true
-		end
-		local okClick = pcall(firesignal, btn.MouseButton1Click)
-		if okClick then
-			return true
-		end
-	end
+	local clicked = false
 	if typeof(getconnections) == "function" then
-		local okC, conns = pcall(getconnections, btn.Activated)
-		if okC and type(conns) == "table" and #conns > 0 then
-			for _, conn in ipairs(conns) do
-				pcall(function() conn:Fire() end)
+		for _, sig in ipairs({ btn.Activated, btn.MouseButton1Click, btn.MouseButton1Up }) do
+			local okC, conns = pcall(getconnections, sig)
+			if okC and type(conns) == "table" and #conns > 0 then
+				for _, conn in ipairs(conns) do
+					if typeof(conn.Fire) == "function" then
+						pcall(conn.Fire, conn)
+						clicked = true
+					elseif typeof(conn.Function) == "function" then
+						pcall(conn.Function)
+						clicked = true
+					end
+				end
 			end
-			return true
 		end
 	end
-	return false
+	if typeof(firesignal) == "function" then
+		pcall(firesignal, btn.Activated)
+		pcall(firesignal, btn.MouseButton1Click)
+		clicked = true
+	end
+	pcall(function()
+		VirtualUser:CaptureController()
+		local abs = btn.AbsolutePosition
+		local sz = btn.AbsoluteSize
+		VirtualUser:ClickButton1(Vector2.new(abs.X + sz.X / 2, abs.Y + sz.Y / 2))
+		clicked = true
+	end)
+	return clicked
 end
 
 local function findRunUiChoiceButton(offerIdx, choiceIdx)
@@ -7690,26 +7700,32 @@ local function tryContinueAfterDeath(ignoreDelay)
 	end
 
 	local lastAt = DungeonAuto.LastDeclineReviveAt or 0
-	if (now - lastAt) < 2.0 then
+	if (now - lastAt) < 1.2 then
 		return
 	end
 
 	DungeonAuto.LastDeclineReviveAt = now
 	DungeonAuto.DeclineAttempts = (DungeonAuto.DeclineAttempts or 0) + 1
 
-	local continueBtn = nil
-	for _, d in ipairs(fallen:GetDescendants()) do
-		if (d:IsA("GuiButton") or d:IsA("TextButton")) and (string.find(string.lower(d.Name), "continue") or string.find(string.lower(d.Text or ""), "continue")) then
-			continueBtn = d
-			break
+	local continueBtn = (fallen:FindFirstChild("ReviveCard") and fallen.ReviveCard:FindFirstChild("Continue"))
+	if not continueBtn then
+		for _, d in ipairs(fallen:GetDescendants()) do
+			if d:IsA("GuiButton") and (string.find(string.lower(d.Name), "continue") or (d:IsA("TextButton") and string.find(string.lower(d.Text or ""), "continue"))) then
+				continueBtn = d
+				break
+			end
 		end
 	end
 
 	if continueBtn then
 		fireGuiButton(continueBtn)
 		pcall(function()
-			VirtualUser:CaptureController()
-			VirtualUser:ClickButton1(Vector2.new(continueBtn.AbsolutePosition.X + continueBtn.AbsoluteSize.X / 2, continueBtn.AbsolutePosition.Y + continueBtn.AbsoluteSize.Y / 2))
+			if typeof(getconnections) == "function" then
+				for _, c in ipairs(getconnections(continueBtn.Activated)) do
+					pcall(c.Fire, c)
+					pcall(c.Function)
+				end
+			end
 		end)
 	end
 
@@ -7728,7 +7744,13 @@ local function tryContinueAfterDeath(ignoreDelay)
 			end
 		end)
 	end
+
+	pcall(function()
+		fallen.Visible = false
+	end)
+
 	setDungeonStatus("FALLEN · DECLINED REVIVE")
+	DungeonAuto.SeenFallenAt = nil
 end
 
 DungeonTab:AddToggle({
